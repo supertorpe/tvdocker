@@ -117,9 +117,16 @@ pub const APP_CHANNEL_CAP: usize = 1024;
 /// ActionReq broadcast capacity (menu → EVERY poller).
 pub const ACTION_CHANNEL_CAP: usize = 16;
 
-const ABOUT_TEXT: &str = "tvdocker — multi-window Docker TUI\n\
-    Built on Turbo Vision (tvision-rs).\n\
-    Licensed under MIT.";
+/// Help → About body: the project, the running version, and the
+/// license.
+pub fn about_text() -> String {
+    format!(
+        "tvdocker {} — multi-window Docker TUI\n\
+        Built on Turbo Vision (tvision-rs).\n\
+        Licensed under MIT.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 /// Help-box (F1) body: global keys plus the table sort/multi-select
 /// bindings. `run_program`'s `CMD_HELP` handler renders this text, and the
@@ -540,7 +547,40 @@ fn background_update_msg(result: &anyhow::Result<domain::update::Outcome>) -> Op
     })
 }
 
+/// [`run_program_for`] with a throwaway install channel — enough for
+/// the modal tests that never reach the install confirm (an install
+/// request posted here evaporates: no worker owns the receiver).
+/// Production and install-flow tests pass the real channel.
 pub fn run_program(program: Program, startup_error: Option<String>) {
+    let (task_tx, _dead) = mpsc::unbounded_channel::<TaskReq>();
+    run_program_for(program, startup_error, &task_tx);
+}
+
+/// [`run_program_with`] with the running version and the real check.
+pub fn run_program_for(
+    program: Program,
+    startup_error: Option<String>,
+    task_tx: &mpsc::UnboundedSender<TaskReq>,
+) {
+    run_program_with(
+        program,
+        startup_error,
+        task_tx,
+        env!("CARGO_PKG_VERSION"),
+        domain::update::check_for_update,
+    )
+}
+
+/// [`run_program`] with the running version and the check injected —
+/// the seam that lets the confirm-and-install flow be driven without a
+/// repository or a network round trip.
+pub fn run_program_with(
+    program: Program,
+    startup_error: Option<String>,
+    task_tx: &mpsc::UnboundedSender<TaskReq>,
+    current: &str,
+    check: impl Fn(&str) -> anyhow::Result<domain::update::Outcome>,
+) {
     let mut program = program;
     if let Some(err) = startup_error {
         let _ = program.message_box(&err, MessageBoxKind::Error, MessageBoxButtons::ok());
@@ -554,18 +594,38 @@ pub fn run_program(program: Program, startup_error: Option<String>) {
             );
         } else if cmd == CMD_ABOUT {
             let _ = prog.message_box(
-                ABOUT_TEXT,
+                &about_text(),
                 MessageBoxKind::Information,
                 MessageBoxButtons::ok(),
             );
         } else if cmd == CMD_CHECK_UPDATES {
-            // the user asked, so the short blocking check runs
-            // here and the outcome is a modal. The startup check never
-            // takes this path — it runs on the task pool and posts to the
-            // status latch instead (no modal from a background).
-            let current = env!("CARGO_PKG_VERSION");
+            // The user asked, so the short blocking check runs here and
+            // the outcome is a modal. A self-updatable release asks for
+            // consent first; on Yes the WORKER does the download/swap
+            // (blocking I/O off the UI thread) and reports through the
+            // status latch. The startup check never takes this path —
+            // it runs on the task pool and posts to the status latch
+            // instead (no modal from a background).
+            let result = check(current);
+            let offer = match &result {
+                Ok(domain::update::Outcome::Available(r)) => {
+                    r.asset.clone().map(|url| (r.version.clone(), url))
+                }
+                _ => None,
+            };
+            if let Some((version, url)) = offer {
+                let text = domain::update::describe_install_offer(current, &version);
+                let answer = prog.message_box(
+                    &text,
+                    MessageBoxKind::Information,
+                    MessageBoxButtons::yes_no(),
+                );
+                if answer == Command::YES {
+                    let _ = task_tx.send(TaskReq::UpdateInstall { version, url });
+                    return;
+                }
+            }
             let checked = domain::update::release_api_url();
-            let result = domain::update::check_for_update(current);
             let text = domain::update::describe(current, &checked, &result);
             let _ = prog.message_box(&text, MessageBoxKind::Information, MessageBoxButtons::ok());
         }
@@ -587,7 +647,7 @@ pub async fn run(filter: Option<String>) -> anyhow::Result<()> {
         Box::new(SystemClock::new()),
         core,
         filter.as_deref(),
-        task_tx,
+        task_tx.clone(),
     );
     // One worker for every Docker side effect the UI cannot do
     //; the six pollers follow.
@@ -650,7 +710,7 @@ pub async fn run(filter: Option<String>) -> anyhow::Result<()> {
         });
     }
     domain::docker::poller::spawn_events(app_tx); // moves the last handle
-    run_program(program, parse_err);
+    run_program_for(program, parse_err, &task_tx);
     Ok(())
 }
 
@@ -659,6 +719,16 @@ mod tests {
     use super::*;
     use tv::Event;
     use tv::HelpCtx;
+
+    #[test]
+    fn about_names_the_running_version() {
+        let text = about_text();
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "the About box shows the running version: {text}"
+        );
+        assert!(text.contains("tvdocker"), "it still names the project");
+    }
 
     /// Build the status line and drive ONE key through the real
     /// pre-route: returns the transformed event.

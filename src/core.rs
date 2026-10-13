@@ -162,6 +162,10 @@ pub enum TaskReq {
         run: u64,
         config: crate::domain::config::LlmConfig,
     },
+    /// Download the release archive and replace the running binary
+    /// (HOST-MUTATING — never driven by a hermetic worker test past a
+    /// refused connection). The worker reports via the status latch.
+    UpdateInstall { version: String, url: String },
 }
 
 /// One buffered event: `seq` is assigned at ingest and never

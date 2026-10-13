@@ -1,5 +1,6 @@
-//! Release checking (parity row "Self-update" · §6 modal dialog ·
-//! §12 "Help → Check for updates… + optional background startup check").
+//! Release checking and self-update (parity row "Self-update" · §6
+//! modal dialog · §12 "Help → Check for updates… + optional background
+//! startup check").
 //!
 //! Ported from tvdocker's `update.rs`. Two deliberate departures from the
 //! upstream implementation, each pinned by its own test below: versions
@@ -8,20 +9,18 @@
 //! target is still reported — pointing at the release page — rather than
 //! being reported as "up to date".
 //!
-//! Downloading and replacing the running binary is deliberately NOT
-//! implemented: the spec's user-facing promise is a *check* ("Check for
-//! updates…"), no repository exists yet to download from, and swapping out
-//! a running executable is destructive and untestable here.
+//! When the release HAS an asset for this target, the check dialog
+//! becomes a Yes/No install offer: on Yes the task worker downloads the
+//! archive, extracts it, and replaces the running binary (the
+//! copy-to-`<exe>.new` + `rename` swap, same as oh-my-docker), then
+//! reports through the status latch — restart tvdocker to apply.
 use anyhow::Context as _;
 use std::time::Duration;
 
-/// Where releases are looked up.
+/// Where releases are looked up and downloaded from.
 ///
-/// **Placeholder.** The project has no GitHub repository yet —
-/// calls this "set as a code constant when the repository is created",
-/// which is exactly what this is. Swap the constant when the repo exists;
-/// `the_release_url_names_the_placeholder_repository` pins it so the swap is
-/// a deliberate, visible edit.
+/// Pinned by `the_release_url_names_the_repository` so changing it is a
+/// deliberate, visible edit.
 pub const REPOSITORY: &str = "https://github.com/supertorpe/tvdocker";
 
 /// The human-facing releases page for [`REPOSITORY`] (what a reader is sent
@@ -32,9 +31,8 @@ pub fn latest_release_url() -> String {
 
 /// The endpoint [`check_for_update`] asks : GitHub's **API**, which
 /// answers JSON — the human `/releases/latest` page answers HTML and would
-/// never parse. Derived from [`REPOSITORY`] so swapping the placeholder for
-/// a real repository swaps the endpoint too, and so `describe` can show
-/// exactly what was asked.
+/// never parse. Derived from [`REPOSITORY`] so it stays in one place, and
+/// so `describe` can show exactly what was asked.
 pub fn release_api_url() -> String {
     let slug = REPOSITORY
         .strip_prefix("https://github.com/")
@@ -125,6 +123,10 @@ pub struct Release {
     pub version: String,
     /// The asset for this target, or the release page when there is none.
     pub download_url: String,
+    /// The asset URL only when this target HAS a downloadable archive —
+    /// `Some` is what makes the confirm-and-install flow possible; a
+    /// page fallback leaves it `None`.
+    pub asset: Option<String>,
 }
 
 /// What a check decided.
@@ -217,7 +219,8 @@ pub fn release_from(current: &str, json: &serde_json::Value) -> Option<Release> 
         });
     Some(Release {
         version: version.to_string(),
-        download_url: asset.unwrap_or(page),
+        download_url: asset.clone().unwrap_or(page),
+        asset,
     })
 }
 
@@ -274,11 +277,151 @@ pub fn check_on_startup(configured: Option<bool>) -> bool {
     configured.unwrap_or(false)
 }
 
+/// The released binary's file name(s) inside an extracted archive.
+fn binary_names() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["tvdocker.exe"]
+    } else {
+        &["tvdocker"]
+    }
+}
+
+/// Depth-first search for the released binary in the extracted archive
+/// tree (the release packs a staging dir around it).
+pub fn find_binary(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if let Some(found) = find_binary(&path) {
+                return Some(found);
+            }
+        } else if path
+            .file_name()
+            .is_some_and(|n| binary_names().iter().any(|want| n == *want))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Blocking download of one release asset.
+///
+/// The connect timeout matches the check's, but the global timeout is
+/// generous — the check's 5-second agent would abort a real archive
+/// mid-flight. Transient 5xx/network failures retry three times before
+/// giving up; the failure always names the URL.
+pub fn download(url: &str) -> anyhow::Result<Vec<u8>> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(3)))
+        .timeout_global(Some(Duration::from_secs(300)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut last = "connection refused".to_string();
+    for attempt in 0..3 {
+        match agent
+            .get(url)
+            .header("User-Agent", "tvdocker")
+            .call()
+            .map_err(|e| e.to_string())
+        {
+            Ok(resp) if resp.status().as_u16() < 500 => {
+                return Ok(resp.into_body().read_to_vec()?);
+            }
+            Ok(resp) => last = format!("HTTP {}", resp.status()),
+            Err(e) => last = e,
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    anyhow::bail!("{last} — download failed after 3 attempts: {url}")
+}
+
+/// Unpack the downloaded archive with the system `tar`/`unzip` (the
+/// same tools oh-my-docker relies on; both ship everywhere the
+/// releases target).
+fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    let status = if archive.extension().is_some_and(|e| e == "zip") {
+        std::process::Command::new("unzip")
+            .args([
+                "-o",
+                &archive.to_string_lossy(),
+                "-d",
+                &dest.to_string_lossy(),
+            ])
+            .status()
+    } else {
+        std::process::Command::new("tar")
+            .args([
+                "-xzf",
+                &archive.to_string_lossy(),
+                "-C",
+                &dest.to_string_lossy(),
+            ])
+            .status()
+    }?;
+    if !status.success() {
+        anyhow::bail!("archive extraction failed");
+    }
+    Ok(())
+}
+
+/// Download the release for `version` and replace the running binary.
+pub fn perform_update(version: &str, url: &str) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating the running binary")?;
+    perform_update_into(&exe, &std::env::temp_dir(), version, url, download)
+}
+
+/// [`perform_update`] with the environment-dependent halves injected:
+/// the binary to replace, the scratch root, and the fetch. The swap
+/// itself is the copy-to-`<exe>.new` + `rename` idiom — atomic on Linux
+/// even while the binary runs (the old inode lives until the process
+/// exits); on Windows the rename fails and the error surfaces, same as
+/// oh-my-docker.
+pub fn perform_update_into(
+    current_exe: &std::path::Path,
+    temp_root: &std::path::Path,
+    version: &str,
+    url: &str,
+    fetch: impl Fn(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let temp_dir = temp_root.join(format!("tvdocker_update_{version}_{unique}"));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir)?;
+    let ext = if url.ends_with(".zip") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    let archive = temp_dir.join(format!("archive.{ext}"));
+
+    let data = fetch(url).with_context(|| format!("downloading {url}"))?;
+    std::fs::write(&archive, &data).context("staging the archive")?;
+    let extracted = temp_dir.join("extracted");
+    std::fs::create_dir_all(&extracted)?;
+    extract_archive(&archive, &extracted).context("extracting the release archive")?;
+
+    let binary = find_binary(&extracted)
+        .ok_or_else(|| anyhow::anyhow!("tvdocker binary not found in the archive"))?;
+    let staged = current_exe.with_extension("new");
+    let _ = std::fs::remove_file(&staged);
+    std::fs::copy(&binary, &staged).context("staging the new binary")?;
+    std::fs::rename(&staged, current_exe).context("replacing the running binary")?;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
 /// The `Help → Check for updates…` dialog body.
 ///
 /// Total over the result: a failed check reports its cause rather than
 /// looking like "up to date", and the endpoint that was asked is always
-/// shown (the repository is a placeholder until one exists).
+/// shown.
 pub fn describe(current: &str, checked: &str, result: &anyhow::Result<Outcome>) -> String {
     match result {
         Ok(Outcome::Available(r)) => format!(
@@ -297,7 +440,7 @@ pub fn describe(current: &str, checked: &str, result: &anyhow::Result<Outcome>) 
 
 /// The status-latch text for the background check (background
 /// outcomes go to the latch, never a modal). `None` means say nothing — a
-/// placeholder repository that has published nothing is not news.
+/// repository that has published nothing is not news.
 pub fn status_text(current: &str, result: &anyhow::Result<Outcome>) -> Option<String> {
     match result {
         Ok(Outcome::Available(r)) => Some(format!(
@@ -308,6 +451,26 @@ pub fn status_text(current: &str, result: &anyhow::Result<Outcome>) -> Option<St
         Ok(Outcome::NoReleaseYet) => None,
         Err(e) => Some(format!("Update check failed: {e:#}")),
     }
+}
+
+/// The Yes/No question shown when the check found a self-updatable
+/// release — consent names both versions and the restart consequence.
+pub fn describe_install_offer(current: &str, version: &str) -> String {
+    format!(
+        "tvdocker {current} → {version}.\n\n\
+         Download and install this update now? tvdocker will be \
+         replaced on disk and must be restarted to apply it."
+    )
+}
+
+/// The status-latch text after a successful install.
+pub fn install_done_text(version: &str) -> String {
+    format!("Updated to tvdocker {version} — restart tvdocker to apply")
+}
+
+/// The latched error for a failed install.
+pub fn install_failed_text(e: &anyhow::Error) -> String {
+    format!("Update failed: {e:#}")
 }
 
 #[cfg(test)]
@@ -345,6 +508,7 @@ mod tests {
             "the asset URL, not the tag page: {}",
             got.download_url
         );
+        assert_eq!(got.asset, Some(got.download_url.clone()), "self-updatable");
     }
 
     #[test]
@@ -373,6 +537,10 @@ mod tests {
             got.download_url.contains("/releases/"),
             "falls back to the release page: {}",
             got.download_url
+        );
+        assert!(
+            got.asset.is_none(),
+            "no asset for this target ⇒ not self-updatable"
         );
     }
 
@@ -403,14 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn the_release_url_names_the_placeholder_repository() {
-        // No GitHub repo exists for this project yet (calls this an
-        // implementation-time detail). This pins the placeholder so swapping
-        // in the real repository is a deliberate, visible edit.
+    fn the_release_url_names_the_repository() {
+        // Changing where releases are looked up is a deliberate, visible
+        // edit — this pins the exact constant.
         assert_eq!(
             latest_release_url(),
             "https://github.com/supertorpe/tvdocker/releases/latest",
-            "update REPOSITORY when the project gets a real repository"
+            "update REPOSITORY deliberately if the project ever moves"
         );
         assert_eq!(REPOSITORY, "https://github.com/supertorpe/tvdocker");
     }
@@ -479,16 +646,15 @@ mod tests {
         );
         assert!(
             status_text("0.1.0", &Ok(Outcome::NoReleaseYet)).is_none(),
-            "a placeholder repository with no releases is not news"
+            "no releases is not news"
         );
         let err = status_text("0.1.0", &Err(anyhow::anyhow!("timeout"))).expect("errors surface");
         assert!(err.contains("timeout"), "{err}");
     }
 
     /// GitHub serves the HUMAN release page (HTML) at `/releases/latest` and
-    /// JSON at the API. Asking the web page makes every check fail to parse
-    /// the moment `REPOSITORY` points at a repo that exists — it only looks
-    /// correct today because the placeholder 404s before any parsing.
+    /// JSON at the API. Asking the web page would make every check fail to
+    /// parse; the JSON endpoint is the contract this code relies on.
     #[test]
     fn the_release_endpoint_is_the_api_not_the_web_page() {
         assert_eq!(
@@ -531,10 +697,10 @@ mod tests {
         );
     }
 
-    /// The real network path — needs a repository that exists. Not run in CI
-    /// (the project has no GitHub repo yet, so this would 404 by design).
+    /// The real network path. Kept ignored so the suite stays hermetic;
+    /// run it locally with `cargo test -- --ignored`.
     #[test]
-    #[ignore = "needs a GitHub repository"]
+    #[ignore = "hits the network"]
     fn live_check_against_the_repository() {
         let out =
             check_for_update(env!("CARGO_PKG_VERSION")).expect("the request completes or errors");
@@ -542,5 +708,169 @@ mod tests {
             Outcome::Available(r) => assert!(!r.version.is_empty()),
             Outcome::UpToDate | Outcome::NoReleaseYet => {}
         }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tvdocker-fb-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn find_binary_locates_the_release_binary_in_the_extracted_tree() {
+        // The archive holds a staging dir (`tvdocker_{version}_{target}/`)
+        // with the binary inside it — one level deep.
+        let root = scratch("nested");
+        let staged = root.join("tvdocker_0.2.0_x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&staged).expect("staging dir");
+        std::fs::write(staged.join("tvdocker"), b"bin").expect("binary");
+        std::fs::write(staged.join("README.md"), b"# tvdocker").expect("readme");
+        assert_eq!(
+            find_binary(&root).as_deref(),
+            Some(staged.join("tvdocker").as_path()),
+            "the binary, not the readme beside it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_binary_returns_none_when_the_archive_has_no_binary() {
+        let root = scratch("empty");
+        std::fs::write(root.join("README.md"), b"# tvdocker").expect("readme");
+        assert_eq!(find_binary(&root), None, "no binary to install");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Build a release-shaped archive (staging dir + binary inside) and
+    /// return its bytes — the shape `.github/workflows` publishes.
+    #[cfg(unix)]
+    fn release_archive(inner: &str, binary: Option<&[u8]>) -> Vec<u8> {
+        let stage = scratch(&format!("stage-{inner}"));
+        let tree = stage.join(format!("tvdocker_9.9.9_{}", target_triple()));
+        std::fs::create_dir_all(&tree).expect("staging dir");
+        std::fs::write(tree.join("README.md"), inner).expect("readme");
+        if let Some(bytes) = binary {
+            std::fs::write(tree.join("tvdocker"), bytes).expect("binary");
+        }
+        let archive = stage.join("archive.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                archive.to_str().unwrap(),
+                "-C",
+                stage.to_str().unwrap(),
+                tree.file_name().unwrap().to_str().unwrap(),
+            ])
+            .status()
+            .expect("tar runs");
+        assert!(status.success(), "tar packs the staging dir");
+        let bytes = std::fs::read(&archive).expect("archive bytes");
+        std::fs::remove_dir_all(&stage).ok();
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perform_update_downloads_extracts_and_swaps_the_running_binary() {
+        let root = scratch("swap");
+        let exe = root.join("tvdocker");
+        std::fs::write(&exe, b"OLD").expect("running binary");
+        let bytes = release_archive("staged", Some(b"NEW"));
+        perform_update_into(
+            &exe,
+            &root,
+            "9.9.9",
+            "http://example/archive.tar.gz",
+            |_| Ok(bytes.clone()),
+        )
+        .expect("the update installs");
+        assert_eq!(
+            std::fs::read(&exe).expect("exe"),
+            b"NEW",
+            "the running binary is the new one"
+        );
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .expect("root readable")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(left, vec![exe.clone()], "only the swapped binary remains");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_download_leaves_the_running_binary_untouched() {
+        let root = scratch("dl-fail");
+        let exe = root.join("tvdocker");
+        std::fs::write(&exe, b"OLD").expect("running binary");
+        let err = perform_update_into(&exe, &root, "9.9.9", "http://example/a.tar.gz", |_| {
+            Err(anyhow::anyhow!("connection refused"))
+        })
+        .expect_err("a failed download is an error");
+        assert!(
+            format!("{err:#}").contains("http://example/a.tar.gz"),
+            "the URL is named in the cause: {err:#}"
+        );
+        assert_eq!(std::fs::read(&exe).expect("exe"), b"OLD", "untouched");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_without_the_binary_installs_nothing() {
+        let root = scratch("no-bin");
+        let exe = root.join("tvdocker");
+        std::fs::write(&exe, b"OLD").expect("running binary");
+        let bytes = release_archive("readme only", None);
+        let err = perform_update_into(&exe, &root, "9.9.9", "http://example/a.tar.gz", |_| {
+            Ok(bytes.clone())
+        })
+        .expect_err("no binary to install");
+        assert!(
+            format!("{err:#}").contains("binary not found"),
+            "the cause says why: {err:#}"
+        );
+        assert_eq!(std::fs::read(&exe).expect("exe"), b"OLD", "untouched");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The transport path, pinned without a repository: port 9 (discard)
+    /// on loopback refuses instantly, so the failure must surface — with
+    /// the URL — instead of hanging or returning empty bytes.
+    #[test]
+    fn download_reports_failure_rather_than_hanging() {
+        let err = download("http://127.0.0.1:9/archive.tar.gz")
+            .expect_err("connection refused is an error");
+        assert!(
+            format!("{err:#}").contains("http://127.0.0.1:9/archive.tar.gz"),
+            "the URL is named: {err:#}"
+        );
+    }
+
+    #[test]
+    fn the_install_offer_names_both_versions_and_asks_for_consent() {
+        let text = describe_install_offer("0.1.0", "0.2.0");
+        assert!(text.contains("0.1.0"), "the running version: {text}");
+        assert!(text.contains("0.2.0"), "the new version: {text}");
+        assert!(
+            text.contains('?'),
+            "it is a question, not a statement: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("restart"),
+            "consent is informed — the swap needs a restart: {text}"
+        );
+    }
+
+    #[test]
+    fn the_install_result_names_the_version_and_the_restart() {
+        let done = install_done_text("0.2.0");
+        assert!(done.contains("0.2.0"), "{done}");
+        assert!(done.to_lowercase().contains("restart"), "{done}");
+
+        let failed = install_failed_text(&anyhow::anyhow!("connection refused"));
+        assert!(failed.contains("failed"), "{failed}");
+        assert!(failed.contains("connection refused"), "{failed}");
     }
 }

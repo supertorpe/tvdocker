@@ -46,7 +46,7 @@ Right-click a row for the **context menu** (Details/Logs/Shell, Start/Stop, Dele
 
 Opening an item already on screen focuses it instead of duplicating it, windows cascade (+2/+1) and shrink to fit, and each keeps its own filter (`Esc` clears selection → filter → close). `Ctrl+A` selects the filtered rows; the status line shows the focused window's contextual shortcuts and hides them under `F10`.
 
-The **File** menu also carries **Check for updates…** — a GitHub release lookup whose wiring is **frozen** for now (it still points at a placeholder repository; see `src/domain/update.rs`).
+The **Help** menu also carries **Check for updates…** — a GitHub release lookup against this repository (`src/domain/update.rs`). When the release has an asset for your platform, the dialog offers to download and install it: the archive is fetched, unpacked, and the running binary is replaced on disk — restart tvdocker to apply. Without a matching asset the dialog points at the release page instead. The optional startup check (`check_updates = true`) only latches a status-line notice; it never installs.
 
 ## Releasing
 
@@ -63,7 +63,7 @@ linux `x86_64`/`aarch64`/`armv7`/`i686` (gnu) and `x86_64`/`aarch64` (musl), mac
 
 3.  **`checksums`** writes `SHA256SUMS.txt`, then **`create-release`** makes a **draft** release and uploads the archives.
 
-The assets are named `tvdocker_<version>_<target-triple>.<ext>` (`.tar.gz` everywhere except `.zip` for Windows) — the layout `src/domain/update.rs` already looks for, so the update check will find them once its repository is configured. The workflow mirrors oh-my-docker's release mechanism (`.github/workflows/release.yml` there) so both projects ship the same platform set.
+The assets are named `tvdocker_<version>_<target-triple>.<ext>` (`.tar.gz` everywhere except `.zip` for Windows) — the layout `src/domain/update.rs` looks for, so **Check for updates…** finds, downloads, and installs them. The workflow mirrors oh-my-docker's release mechanism (`.github/workflows/release.yml` there) so both projects ship the same platform set.
 
 Re-run it manually from a `v*` tag (Actions → Release → Run workflow); the tag name becomes the release name *and* the version in the asset names.
 

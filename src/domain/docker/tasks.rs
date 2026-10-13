@@ -154,6 +154,9 @@ pub fn spawn_task_worker(
                 } => {
                     shell::spawn_shell(id, shell, user, workdir, out_tx, input_rx, resize_rx);
                 }
+                TaskReq::UpdateInstall { version, url } => {
+                    spawn_install(app_tx.clone(), version, url);
+                }
                 TaskReq::ExplorerList { key, target, path } => {
                     let outcome = list_for(&target, &path).await;
                     let what = format!("list {path}");
@@ -663,6 +666,28 @@ fn spawn_diagnostics(app_tx: Sender<AppMsg>, id: String, run: u64, config: LlmCo
     });
 }
 
+/// Download + swap the running binary, reporting through the status
+/// latch — the download/extract/swap runs on the blocking pool so the
+/// UI never freezes mid-install.
+fn spawn_install(app_tx: Sender<AppMsg>, version: String, url: String) {
+    let announced = version.clone();
+    tokio::spawn(async move {
+        let joined = tokio::task::spawn_blocking(move || {
+            crate::domain::update::perform_update(&version, &url)
+        })
+        .await;
+        let outcome = match joined {
+            Ok(result) => result,
+            Err(join) => Err(anyhow::anyhow!("update task: {join}")),
+        };
+        let msg = match outcome {
+            Ok(()) => AppMsg::Status(crate::domain::update::install_done_text(&announced)),
+            Err(e) => AppMsg::TaskError(crate::domain::update::install_failed_text(&e)),
+        };
+        let _ = app_tx.send(msg).await;
+    });
+}
+
 /// Count one failure; announce the reconnect state exactly once when
 /// the streak threshold is crossed.
 async fn note_logs_failure(
@@ -724,6 +749,31 @@ mod tests {
             matches!(msg, AppMsg::TaskError(_)),
             "§10: background errors are messages, not modals: {msg:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn update_install_failure_surfaces_as_a_latched_error_naming_the_url() {
+        // The real arm: perform_update against loopback port 9 (discard)
+        // — refused instantly, retried, then reported. Host-mutating only
+        // if a binary were actually fetched, which never happens here.
+        let (_app_tx, mut app_rx, _action_tx, _action_rx, task_tx) = worker();
+        task_tx
+            .send(TaskReq::UpdateInstall {
+                version: "9.9.9".into(),
+                url: "http://127.0.0.1:9/archive.tar.gz".into(),
+            })
+            .expect("worker alive");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(15), app_rx.recv())
+            .await
+            .expect("worker answered")
+            .expect("channel open");
+        match msg {
+            AppMsg::TaskError(text) => {
+                assert!(text.contains("Update failed"), "{text}");
+                assert!(text.contains("127.0.0.1:9"), "the URL: {text}");
+            }
+            other => panic!("a failed install is a latched error, not {other:?}"),
+        }
     }
 
     #[tokio::test]
