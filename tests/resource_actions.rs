@@ -1,0 +1,680 @@
+#![forbid(unsafe_code)]
+//! Action flows through the real pump:
+//! right-click targeting, delete confirmation, the shell round trip,
+//! the column picker, F2 → Logs.
+//!
+//! **Modal tests drive `app::run_program`, not bare `pump_once`.** tvision-rs
+//! answers a view's `request_message_box`/`request_exec_view` by stashing the
+//! built dialog into `Program::pending_modal`, which only the private
+//! `pump_and_drive` (run under `run_app`) executes — `pump_once` leaves it
+//! pending forever, so the box would never appear. The pattern is
+//! `tests/chrome.rs::f1_help_documents_the_table_sort_keys`: pre-queue every
+//! key, end with two `QUIT`s (one closes the modal, one ends `run_app`), then
+//! assert. An open modal *swallows* its keys, which is what proves it existed.
+mod common;
+
+use common::{SharedClock, container_state, pump, screen_text};
+use std::cell::RefCell;
+use std::rc::Rc;
+use tv::Command;
+use tv::event::{Event, Key, KeyModifiers, MouseButtons, MouseEvent};
+use tv::{HeadlessBackend, HeadlessHandle, Point, Program};
+use tvdocker::app;
+use tvdocker::core::{AppCore, AppMsg, TaskReq};
+use tvdocker::domain::docker::containers::ContainerSummary;
+
+type TaskRx = tokio::sync::mpsc::UnboundedReceiver<TaskReq>;
+
+/// End a `run_program` drive: the first QUIT closes the modal that is
+/// currently up, the second ends `run_app`.
+fn quit_twice(screen: &HeadlessHandle) {
+    screen.push_event(Event::Command(Command::QUIT));
+    screen.push_event(Event::Command(Command::QUIT));
+}
+
+fn image_row(id: &str, repo: &str, tag: &str) -> tvdocker::domain::docker::images::ImageEntry {
+    tvdocker::domain::docker::images::ImageEntry {
+        id: id.into(),
+        repository: repo.into(),
+        tag: tag.into(),
+        size: 1_000,
+    }
+}
+
+fn network_row(id: &str, name: &str) -> tvdocker::domain::docker::networks::NetworkEntry {
+    tvdocker::domain::docker::networks::NetworkEntry {
+        id: id.into(),
+        name: name.into(),
+        driver: "bridge".into(),
+        scope: "local".into(),
+        subnet: String::new(),
+        gateway: String::new(),
+        containers: 0,
+    }
+}
+
+fn volume_row(name: &str) -> tvdocker::domain::docker::volumes::VolumeEntry {
+    tvdocker::domain::docker::volumes::VolumeEntry {
+        name: name.into(),
+        driver: "local".into(),
+        mountpoint: format!("/var/lib/docker/volumes/{name}/_data"),
+        size: 1_000,
+    }
+}
+
+/// Real `build()` so the desktop owns a REAL task channel whose
+/// receiver this test keeps — every action asserts on the `TaskReq`s.
+fn start(rows: Vec<ContainerSummary>) -> (Program, HeadlessHandle, Rc<RefCell<AppCore>>, TaskRx) {
+    // Hermetic: F4's shell dialog reads/writes the config, so point it at a
+    // temp file — never the developer's real `~/.config/tvdocker/`.
+    common::isolate_config();
+    let (backend, screen) = HeadlessBackend::new(80, 25);
+    let (shared, _clock) = SharedClock::new(0);
+    let core = Rc::new(RefCell::new(AppCore::new()));
+    core.borrow_mut().apply(AppMsg::Containers(rows));
+    let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut program, _app_tx, _action_tx) = app::build(
+        Box::new(backend),
+        Box::new(shared),
+        Rc::clone(&core),
+        None,
+        task_tx,
+    );
+    pump(&mut program, 5); // startup + status priming (chords precedent)
+    (program, screen, core, task_rx)
+}
+
+fn two_rows() -> Vec<ContainerSummary> {
+    vec![
+        container_state("id-alpha", "webalpha", "running"),
+        container_state("id-beta", "webbeta", "exited"),
+    ]
+}
+
+/// Right-click a point in **absolute** screen coordinates.
+///
+/// The window sits at `Rect(2,1,78,23)` *inside* the desktop, which the
+/// startup factory insets by one row for the menu bar — so on screen the
+/// frame starts at y=2: title 2, info 3, filter 4, header 5, row1 6,
+/// row2 7. (An off-by-one here silently targets the row above.)
+fn right_click(screen: &HeadlessHandle, x: i32, y: i32) {
+    screen.push_event(Event::MouseDown(MouseEvent {
+        position: Point::new(x, y),
+        buttons: MouseButtons {
+            right: true,
+            ..MouseButtons::default()
+        },
+        ..MouseEvent::default()
+    }));
+}
+
+#[test]
+fn right_click_menu_targets_the_clicked_row() {
+    let (mut program, screen, _core, mut task_rx) = start(two_rows());
+    right_click(&screen, 12, 7); // absolute y=7 ⇒ ROW 2 (webbeta, exited)
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Details") && text.contains("Delete") && text.contains("start"),
+        "context menu open, and it is built from ROW 2's state (exited ⇒ start): {text:?}"
+    );
+    // Hot letter 'd' → Details (menus are hot-letter scoped,).
+    screen.push_key(Key::Char('d'), KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-beta", "targets the clicked row"),
+        _ => panic!("Inspect task for the clicked row"),
+    }
+    // The Details window opened for the clicked row (its info row still
+    // reads "Loading…" — the inspect payload comes from the worker, which
+    // this harness does not run; the rendered payload is
+    // `views::details`'s own test).
+    let text = screen_text(&screen);
+    assert!(text.contains("Details"), "details window opened: {text:?}");
+    assert!(
+        text.contains("Loading container details"),
+        "loading state: {text:?}"
+    );
+}
+
+#[test]
+fn enter_opens_details_for_the_cursor_row() {
+    let (mut program, screen, _core, mut task_rx) = start(two_rows());
+    screen.push_key(Key::Enter, KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-alpha", "cursor row"),
+        _ => panic!("Inspect task"),
+    }
+    let text = screen_text(&screen);
+    assert!(text.contains("Details"), "details window opened: {text:?}");
+    // No worker runs in this harness, so the payload is still empty — the
+    // window must be in loading state (its rendered state
+    // with data is covered by `views::details`'s own tests).
+    assert!(
+        text.contains("Loading container details"),
+        "loading state until the inspect answers: {text:?}"
+    );
+}
+
+#[test]
+fn details_reopens_after_being_closed() {
+    let (mut program, screen, _core, mut task_rx) = start(two_rows());
+    screen.push_key(Key::Enter, KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-alpha"),
+        _ => panic!("Inspect task"),
+    }
+    assert!(screen_text(&screen).contains("Details"), "opened");
+
+    // Close the focused Details window. Its Drop clears the slot's open
+    // flag, so the next Enter must build a FRESH window — before the fix
+    // the stale flag + dead ViewId turned Enter into a silent no-op.
+    screen.push_event(Event::Command(Command::CLOSE));
+    pump(&mut program, 5);
+    assert!(
+        !screen_text(&screen).contains("Details"),
+        "closed: {:?}",
+        screen_text(&screen)
+    );
+
+    screen.push_key(Key::Enter, KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-alpha", "re-inspected"),
+        _ => panic!("Inspect task on reopen"),
+    }
+    assert!(
+        screen_text(&screen).contains("Details"),
+        "reopened: {:?}",
+        screen_text(&screen)
+    );
+}
+
+#[test]
+fn each_container_keeps_its_own_details_window() {
+    let (mut program, screen, _core, mut task_rx) = start(two_rows());
+    // Row 1 → Details.
+    screen.push_key(Key::Enter, KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-alpha"),
+        _ => panic!("Inspect task"),
+    }
+    // Refocus Containers (its open-or-focus command), move to row 2 and
+    // open its Details too — without closing the first.
+    screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
+    pump(&mut program, 3);
+    screen.push_key(Key::Down, KeyModifiers::default());
+    pump(&mut program, 2);
+    screen.push_key(Key::Enter, KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-beta", "row 2"),
+        _ => panic!("Inspect task for row 2"),
+    }
+    // Two windows are alive: closing the focused one leaves the first.
+    // A singleton would have re-targeted the lone window and then removed
+    // it leaving nothing to focus next. Cycle focus (F6 → NEXT) to the
+    // surviving Details window and read its loading row.
+    screen.push_event(Event::Command(Command::CLOSE));
+    pump(&mut program, 5);
+    screen.push_event(Event::Command(Command::NEXT));
+    pump(&mut program, 5);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Details — webalpha") && text.contains("Loading container details"),
+        "the first container's Details window survives: {text:?}"
+    );
+}
+
+#[test]
+fn delete_confirm_no_sends_nothing() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // Delete opens the confirm box; the box then SWALLOWS Down (the cursor
+    // must not move) and answers 'n'. Both the swallowed key and the empty
+    // channel are what prove the box was really up.
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_key(Key::Down, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::NO));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        task_rx.try_recv().is_err(),
+        "No ⇒ nothing is queued for the worker"
+    );
+    let text = screen_text(&screen);
+    assert!(
+        text.contains(">webalpha"),
+        "the confirm box swallowed Down (cursor never moved): {text:?}"
+    );
+}
+
+#[test]
+fn delete_confirm_yes_removes_exactly_the_targets() {
+    // Single: the cursor row only.
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveContainer { id }) if id == "id-alpha"
+        ),
+        "exactly the cursor row"
+    );
+    assert!(task_rx.try_recv().is_err(), "one target ⇒ one request");
+
+    // Batch: Space-select both rows (Review Focus #3).
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    screen.push_key(Key::Char(' '), KeyModifiers::default());
+    screen.push_key(Key::Down, KeyModifiers::default());
+    screen.push_key(Key::Char(' '), KeyModifiers::default());
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    let mut got = Vec::new();
+    while let Ok(TaskReq::RemoveContainer { id }) = task_rx.try_recv() {
+        got.push(id);
+    }
+    got.sort();
+    assert_eq!(got, vec!["id-alpha", "id-beta"], "exactly the selection");
+}
+
+#[test]
+fn a_cancelled_images_delete_does_not_stain_the_next_delete() {
+    // Review Focus #4: cancel an IMAGES delete (drops targets AND kind)…
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![image_row(
+        "sha256:aaa",
+        "nginx",
+        "1.27",
+    )]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    pump(&mut program, 3);
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::NO));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(task_rx.try_recv().is_err(), "cancelled ⇒ nothing queued");
+
+    // …then a CONTAINERS delete must still send RemoveContainer.
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveContainer { id }) if id == "id-alpha"
+        ),
+        "the kind is re-derived per action, never inherited"
+    );
+}
+
+#[test]
+fn f2_opens_a_logs_window_and_starts_one_session() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    screen.push_key(Key::F(2), KeyModifiers::default());
+    pump(&mut program, 5);
+    assert!(
+        screen_text(&screen).contains("Logs — webalpha"),
+        "logs window for the cursor row: {}",
+        screen_text(&screen)
+    );
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::StartLogs { id, .. }) if id == "id-alpha"
+        ),
+        "one session started"
+    );
+    assert!(
+        core.borrow().logs.contains_key("id-alpha"),
+        "the desktop created the session buffer FIRST"
+    );
+    // Second F2 → focus, NO second session.
+    screen.push_key(Key::F(2), KeyModifiers::default());
+    pump(&mut program, 4);
+    assert!(task_rx.try_recv().is_err(), "open-or-focus, not reopen");
+}
+
+#[test]
+fn shell_submit_sends_the_dialog_values_for_the_pending_container() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // an UNEDITED submit must never touch the user's config
+    // file — not even to create it. Snapshot it around the round trip.
+    let cfg = tvdocker::domain::config::TvdockerConfig::path();
+    let cfg_before = std::fs::read_to_string(&cfg).ok();
+    // F4 opens the config dialog (modal ⇒ run_program), then the dialog
+    // is confirmed with `Command::OK` — the idiom tvision-rs's own tests
+    // use to drive a modal from a pre-queued event stream. A live human
+    // Enter DOES submit (the idle pass re-targets the status line to the
+    // modal's NO_CONTEXT ctx — see
+    // dialogs::shell_form_tests::both_dialogs_report_no_help_ctx…), but
+    // this pre-queued stream never idles between events, so the status
+    // line still holds the Containers def and a raw Enter would be
+    // pre-routed to CMD_REQ_DETAILS instead of reaching the dialog.
+    // Submitted
+    // UNEDITED so `save_if_changed` sees no delta — the test must never
+    // write the user's real config.
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    match task_rx.try_recv() {
+        Ok(TaskReq::StartShell {
+            id,
+            shell,
+            user,
+            workdir,
+            ..
+        }) => {
+            assert_eq!(id, "id-alpha", "the pending container");
+            let prefill = tvdocker::views::dialogs::ShellForm::prefill("webalpha", "img");
+            assert_eq!(shell, prefill.shell, "chain value");
+            assert_eq!(user, prefill.user);
+            assert_eq!(workdir, prefill.workdir);
+        }
+        _ => panic!("StartShell task — the dialog must have opened and submitted"),
+    }
+    assert!(
+        screen_text(&screen).contains("shell @ webalpha"),
+        "PTY window opened: {}",
+        screen_text(&screen)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).ok(),
+        cfg_before,
+        "an unedited submit must never touch the user's config"
+    );
+}
+
+#[test]
+fn shell_cancel_sends_nothing() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // The SAME F4 path as the submit test — paired, so the empty channel
+    // here proves Esc cancelled rather than the dialog never opening.
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_key(Key::Esc, KeyModifiers::default());
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(task_rx.try_recv().is_err(), "cancel ⇒ no exec");
+    assert!(!screen_text(&screen).contains("shell @"), "no window");
+}
+
+#[test]
+fn column_picker_applies_only_on_ok() {
+    // Phase 1 — Ctrl+O, toggle NAME, CANCEL. The dialog swallows Space
+    // (the table would otherwise select the cursor row), which is the
+    // observable proof it was open; the column must stay.
+    let (program, screen, _core, _task_rx) = start(two_rows());
+    screen.push_key(
+        Key::Char('o'),
+        KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+    );
+    screen.push_key(Key::Char(' '), KeyModifiers::default());
+    screen.push_key(Key::Esc, KeyModifiers::default());
+    quit_twice(&screen);
+    app::run_program(program, None);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("NAME"),
+        "cancel ⇒ the column stays (Review Focus #5): {text:?}"
+    );
+    assert!(
+        !text.contains('*'),
+        "the picker dialog swallowed Space — no row got selected: {text:?}"
+    );
+
+    // Phase 2 — again, toggle, APPLY with Enter.
+    let (program, screen, _core, _task_rx) = start(two_rows());
+    screen.push_key(
+        Key::Char('o'),
+        KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+    );
+    screen.push_key(Key::Char(' '), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    let text = screen_text(&screen);
+    assert!(!text.contains("NAME"), "OK ⇒ NAME hidden: {text:?}");
+    assert!(text.contains("IMAGE"), "the other columns stay");
+}
+
+#[test]
+fn images_del_batch_removes_exactly_the_selection() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![
+        image_row("sha256:aaa", "nginx", "1.27"),
+        image_row("sha256:bbb", "redis", "7"),
+    ]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    pump(&mut program, 3);
+    screen.push_key(Key::Char(' '), KeyModifiers::default());
+    screen.push_key(Key::Down, KeyModifiers::default());
+    screen.push_key(Key::Char(' '), KeyModifiers::default());
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    let mut got = Vec::new();
+    while let Ok(TaskReq::RemoveImage { id }) = task_rx.try_recv() {
+        got.push(id);
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["sha256:aaa", "sha256:bbb"],
+        "exactly the selection"
+    );
+}
+
+#[test]
+fn networks_del_confirms_then_sends_remove_network() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut()
+        .apply(AppMsg::Networks(vec![network_row("net1", "bridge")]));
+    screen.push_event(Event::Command(app::CMD_OPEN_NETWORKS));
+    pump(&mut program, 3);
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveNetwork { id }) if id == "net1"
+        ),
+        "the network row id travels to the worker"
+    );
+}
+
+#[test]
+fn volumes_menu_delete_sends_remove_volume() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut()
+        .apply(AppMsg::Volumes(vec![volume_row("data")]));
+    screen.push_event(Event::Command(app::CMD_OPEN_VOLUMES));
+    pump(&mut program, 3);
+    // Right-click the row, hot-letter 'x' → Delete.
+    right_click(&screen, 12, 7); // the cascaded window sits one row lower
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('x'), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveVolume { name }) if name == "data"
+        ),
+        "volumes are keyed by NAME"
+    );
+}
+
+#[test]
+fn images_menu_prune_confirms_and_queues_prune_once() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![image_row(
+        "sha256:aaa",
+        "nginx",
+        "1.27",
+    )]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    pump(&mut program, 3);
+    right_click(&screen, 12, 7); // the cascaded window sits one row lower
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('p'), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(task_rx.try_recv(), Ok(TaskReq::PruneImages)),
+        "one prune request"
+    );
+    assert!(task_rx.try_recv().is_err(), "exactly one");
+}
+
+#[test]
+fn images_menu_dangling_confirms_and_queues_the_sweep_once() {
+    // Pin the dangling desktop flow (not just the menu label); mirror
+    // the prune test. No worker runs in this harness, so the
+    // host-mutating sweep never executes — only the queued request is
+    // asserted.
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![image_row(
+        "sha256:aaa",
+        "nginx",
+        "1.27",
+    )]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    pump(&mut program, 3);
+    right_click(&screen, 12, 7); // the cascaded window sits one row lower
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('d'), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(task_rx.try_recv(), Ok(TaskReq::RemoveDanglingImages)),
+        "one sweep request"
+    );
+    assert!(task_rx.try_recv().is_err(), "exactly one");
+}
+
+#[test]
+fn images_f2_opens_the_run_form_and_submits_its_values() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![image_row(
+        "sha256:aaa",
+        "nginx",
+        "1.27",
+    )]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    // The status def switches on an IDLE pass; measured: the Images def
+    // ("F2 Run…") lands at the 6th pump after the open command (the same
+    // settling the chrome.rs chords tests pin).
+    pump(&mut program, 6);
+    let last = screen_text(&screen)
+        .lines()
+        .last()
+        .unwrap_or("")
+        .to_string();
+    assert!(last.contains("F2 Run…"), "Images def active: {last}");
+    screen.push_key(Key::F(2), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    match task_rx.try_recv() {
+        Ok(TaskReq::RunContainer { opts }) => {
+            assert_eq!(opts.image, "nginx:1.27", "repository:tag from the row");
+            assert_eq!(opts.cmd, "", "unedited form");
+        }
+        Ok(TaskReq::Inspect { .. }) => panic!("wrong variant: Inspect"),
+        Ok(TaskReq::RemoveContainer { .. }) => panic!("wrong variant: RemoveContainer"),
+        Ok(TaskReq::SetContainerState { .. }) => panic!("wrong variant: SetContainerState"),
+        Ok(TaskReq::StartLogs { .. }) => panic!("wrong variant: StartLogs"),
+        Ok(TaskReq::StartShell { .. }) => panic!("wrong variant: StartShell"),
+        Ok(_) => panic!("wrong variant: other"),
+        Err(_) => panic!("RunContainer task (channel empty)"),
+    }
+    assert!(task_rx.try_recv().is_err(), "exactly one");
+}
+
+#[test]
+fn run_submit_unedited_never_writes_the_config() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    let cfg = tvdocker::domain::config::TvdockerConfig::path();
+    let before = std::fs::read_to_string(&cfg).ok();
+    core.borrow_mut().apply(AppMsg::Images(vec![image_row(
+        "sha256:aaa",
+        "nginx",
+        "1.27",
+    )]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    // The Images def lands at pump 6 (measured — see images_f2…). At
+    // pump 3 F2 would hit the stale Containers def and open Logs
+    // instead, making every assertion below VACUOUS (reviewer finding 2).
+    pump(&mut program, 6);
+    let last = screen_text(&screen)
+        .lines()
+        .last()
+        .unwrap_or("")
+        .to_string();
+    assert!(last.contains("F2 Run…"), "Images def active: {last}");
+    screen.push_key(Key::F(2), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    quit_twice(&screen);
+    app::run_program(program, None);
+    // The form really opened and submitted — this is the run path.
+    assert!(
+        matches!(task_rx.try_recv(), Ok(TaskReq::RunContainer { .. })),
+        "the run form opened and submitted (the config assertion is not vacuous)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).ok(),
+        before,
+        "an unedited submit must never touch the user's config"
+    );
+    // The NON-virgin no-write cases (existing config, missing entry,
+    // workdir preservation) are pinned by the pure `persist_row` unit
+    // tests — this shared per-process config must stay untouched.
+}
+
+#[test]
+fn run_form_esc_sends_nothing() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![image_row(
+        "sha256:aaa",
+        "nginx",
+        "1.27",
+    )]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    pump(&mut program, 6); // the Images def lands at pump 6 (measured)
+    screen.push_key(Key::F(2), KeyModifiers::default());
+    // The form SWALLOWS Esc (the modal gate) — the swallowed key is what
+    // proves it was really up; without the form, Esc would close the
+    // Images window instead.
+    screen.push_key(Key::Esc, KeyModifiers::default());
+    quit_twice(&screen);
+    app::run_program(program, None);
+    assert!(task_rx.try_recv().is_err(), "cancel ⇒ no run");
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Images"),
+        "the Images window SURVIVED — Esc was swallowed by the run form \
+         (without the form, Esc's chain closes the active window): {text:?}"
+    );
+}

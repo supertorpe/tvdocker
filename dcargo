@@ -1,0 +1,47 @@
+#!/bin/sh
+# Build/test tvdocker inside the pinned container.
+# NEVER invoke a host toolchain:  ./dcargo <cargo args...>
+set -eu
+cd "$(dirname "$0")"
+mkdir -p .cache/rustup
+
+# The image uses rustup's minimal profile (no rustfmt/clippy). Copy the
+# image toolchain into the mounted rustup dir ONCE, then components added
+# below persist across container runs.
+if [ ! -e .cache/rustup/settings.toml ]; then
+    docker run --rm -v "$PWD/.cache/rustup:/copy" rust:slim-bookworm \
+        sh -c 'cp -a /usr/local/rustup/. /copy/'
+fi
+
+ENVS=""
+if [ -n "${INSTA_UPDATE:-}" ]; then
+    ENVS="-e INSTA_UPDATE=${INSTA_UPDATE}"
+fi
+
+TTY=""
+if [ -t 0 ] && [ -t 1 ]; then
+    TTY="-it -e TERM=${TERM:-xterm-256color}"
+fi
+
+DOCKER_SOCK=""
+if [ -S /var/run/docker.sock ]; then
+    DOCKER_SOCK="-v /var/run/docker.sock:/var/run/docker.sock --group-add $(stat -c %g /var/run/docker.sock)"
+fi
+
+CONFIG=""
+if [ -d "${HOME}/.config/tvdocker" ]; then
+    CONFIG="-e HOME=${HOME} -v ${HOME}/.config/tvdocker:${HOME}/.config/tvdocker"
+fi
+
+exec docker run --rm \
+    -u "$(id -u):$(id -g)" \
+    $ENVS \
+    $TTY \
+    $DOCKER_SOCK \
+    $CONFIG \
+    -v "$PWD:/volume" \
+    -v "$PWD/.cache:/usr/local/cargo/registry" \
+    -v "$PWD/.cache/rustup:/usr/local/rustup" \
+    -w /volume \
+    rust:slim-bookworm \
+    sh -c 'rustup component add rustfmt clippy >/dev/null 2>&1 || true; exec cargo "$@"' _ "$@"

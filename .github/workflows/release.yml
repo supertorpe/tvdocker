@@ -1,0 +1,95 @@
+name: Release
+
+# This workflow builds and packages tvdocker for multiple platforms.
+#
+# For macOS code signing and notarization, configure these GitHub repository secrets:
+# - APPLE_DEVELOPER_CERTIFICATE_P12: Base64-encoded .p12 certificate file
+# - APPLE_DEVELOPER_CERTIFICATE_PASSWORD: Password for the .p12 file
+# - APPLE_ID_ISSUER_ID: App Store Connect API issuer ID
+# - APPLE_ID_KEY_ID: App Store Connect API key ID
+# - APPLE_ID_KEY: App Store Connect API key content (.p8 file contents)
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+env:
+  RUST_BACKTRACE: 1
+  PKG_NAME: tvdocker
+
+jobs:
+  # Build all platforms using shared workflow
+  build:
+    uses: ./.github/workflows/build-platforms.yml
+    with:
+      version: ${{ github.ref_name }}
+
+  checksums:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          find . -maxdepth 1 -type f -name "tvdocker_*" -exec sha256sum {} \; | tee SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: artifacts/SHA256SUMS.txt
+
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    needs: [build, checksums]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+
+          # Create the release
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --draft \
+            --generate-notes
+
+          # Upload all build artifacts (archive files only)
+          find artifacts -maxdepth 2 -type f -name "tvdocker_*" | while read -r artifact; do
+            gh release upload "$TAG" "$artifact" --clobber
+          done
+
+          # Upload checksums
+          gh release upload "$TAG" "artifacts/SHA256SUMS.txt" --clobber

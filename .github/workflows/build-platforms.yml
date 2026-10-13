@@ -1,0 +1,240 @@
+name: Build Platforms
+
+# Reusable workflow for building tvdocker on all platforms.
+# Called by release.yml via workflow_call
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string for archive naming (e.g., 0.3.0)'
+        type: string
+        required: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  PKG_NAME: tvdocker
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    name: build-${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - linux-x64-gnu
+          - linux-aarch64-gnu
+          - linux-armv7-gnueabihf
+          - linux-i686-gnu
+          - linux-x64-musl
+          - linux-aarch64-musl
+          - macos-x64
+          - macos-aarch64
+          - windows-x64
+          - windows-x86
+        include:
+          # Linux GNU (dynamic linking)
+          - os: ubuntu-22.04
+            build: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            ext: ''
+            archive: tar.gz
+            cross: false
+          - os: ubuntu-22.04
+            build: linux-aarch64-gnu
+            target: aarch64-unknown-linux-gnu
+            ext: ''
+            archive: tar.gz
+            cross: true
+          - os: ubuntu-22.04
+            build: linux-armv7-gnueabihf
+            target: armv7-unknown-linux-gnueabihf
+            ext: ''
+            archive: tar.gz
+            cross: true
+          - os: ubuntu-22.04
+            build: linux-i686-gnu
+            target: i686-unknown-linux-gnu
+            ext: ''
+            archive: tar.gz
+            cross: false
+
+          # Linux MUSL (static linking)
+          - os: ubuntu-22.04
+            build: linux-x64-musl
+            target: x86_64-unknown-linux-musl
+            ext: ''
+            archive: tar.gz
+            cross: true
+          - os: ubuntu-24.04-arm
+            build: linux-aarch64-musl
+            target: aarch64-unknown-linux-musl
+            ext: ''
+            archive: tar.gz
+            cross: false # Fixed: Native build on ARM runner instead of cross-compiling via Docker
+
+          # macOS
+          - os: macos-14
+            build: macos-x64
+            target: x86_64-apple-darwin
+            ext: ''
+            archive: tar.gz
+            cross: false
+          - os: macos-14
+            build: macos-aarch64
+            target: aarch64-apple-darwin
+            ext: ''
+            archive: tar.gz
+            cross: false
+
+          # Windows
+          - os: windows-latest
+            build: windows-x64
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+            archive: zip
+            cross: false
+          - os: windows-latest
+            build: windows-x86
+            target: i686-pc-windows-msvc
+            ext: .exe
+            archive: zip
+            cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross
+
+      - name: Install musl target tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Setup Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        uses: ./.github/actions/setup-linux-deps
+
+      - name: Set aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Set i686 linker
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          echo "CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build binary
+        uses: ./.github/actions/build-binary
+        with:
+          target: ${{ matrix.target }}
+          cargo-command: ${{ matrix.cross && 'cross' || 'cargo' }}
+          ext: ${{ matrix.ext }}
+
+      - name: Set clean version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: echo "VERSION=${VERSION#v}" >> $GITHUB_ENV
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${PKG_NAME}${{ matrix.ext }}"
+
+          STAGING="${PKG_NAME}_${VERSION}_${{ matrix.target }}"
+          ARCHIVE_NAME="${STAGING}.${{ matrix.archive }}"
+
+          mkdir -p "dist/$STAGING"
+
+          cp "$BINARY" "dist/$STAGING/"
+          cp README.md "dist/$STAGING/" 2>/dev/null || true
+          cp LICENSE "dist/$STAGING/" 2>/dev/null || true
+
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$ARCHIVE_NAME" "$STAGING"
+          else
+            tar czf "$ARCHIVE_NAME" "$STAGING"
+          fi
+          cd ..
+
+          echo "ASSET=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/${{ env.ASSET }}
+          if-no-files-found: error
+
+  package-macos-universal:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download macOS build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-x86_64-apple-darwin
+          path: artifacts/amd64
+
+      - name: Download aarch64 build artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-aarch64-apple-darwin
+          path: artifacts/arm64
+
+      - name: Set clean version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: echo "VERSION=${VERSION#v}" >> $GITHUB_ENV
+
+      - name: Extract x86_64 and aarch64 binaries
+        shell: bash
+        run: |
+          # Find and extract the two macOS artifacts
+          AMD64_ARCHIVE=$(find artifacts/amd64 -name "*.tar.gz" | head -1)
+          ARM64_ARCHIVE=$(find artifacts/arm64 -name "*.tar.gz" | head -1)
+
+          mkdir -p /tmp/amd64 /tmp/arm64
+          tar xzf "$AMD64_ARCHIVE" -C /tmp/amd64
+          tar xzf "$ARM64_ARCHIVE" -C /tmp/arm64
+
+          # Create universal binary
+          UNIVERSAL="${PKG_NAME}_${VERSION}_universal-apple-darwin"
+          mkdir -p "dist/$UNIVERSAL"
+
+          lipo -create \
+            /tmp/amd64/*/tvdocker \
+            /tmp/arm64/*/tvdocker \
+            -output "dist/$UNIVERSAL/${PKG_NAME}"
+
+          cp README.md "dist/$UNIVERSAL/" 2>/dev/null || true
+          cp LICENSE "dist/$UNIVERSAL/" 2>/dev/null || true
+
+          cd dist
+          tar czf "${UNIVERSAL}.tar.gz" "$UNIVERSAL"
+          cd ..
+
+      - name: Upload universal macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-universal-apple-darwin
+          path: dist/${{ env.PKG_NAME }}_${{ env.VERSION }}_universal-apple-darwin.tar.gz
+          if-no-files-found: error

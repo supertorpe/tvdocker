@@ -1,0 +1,23 @@
+name: 'Build Binary'
+description: 'Build binary for a specific target'
+
+inputs:
+  target:
+    description: 'Rust target triple (e.g., x86_64-unknown-linux-gnu)'
+    required: true
+  cargo-command:
+    description: 'Cargo command to use (cargo or cross)'
+    required: false
+    default: 'cargo'
+  ext:
+    description: 'Binary extension (.exe for Windows)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build binary
+      shell: bash
+      run: |
+        ${{ inputs.cargo-command }} build --release --target ${{ inputs.target }}

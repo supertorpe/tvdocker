@@ -1,0 +1,22 @@
+[package]
+name = "tvdocker"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-window Docker TUI built on Turbo Vision (tvision-rs)"
+license = "MIT"
+repository = "https://github.com/supertorpe/tvdocker"
+
+[dependencies]
+tv = { package = "tvision-rs", version = "0.16" }
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-util", "time"] }
+bollard = "0.18"
+ureq = { version = "3", features = ["json"] }
+futures-util = "0.3"
+vt100 = "0.16"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
+tar = "0.4"
+fuzzy-matcher = "0.3.7"
+chrono = "0.4"
+serde_json = "1"
