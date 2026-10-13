@@ -119,7 +119,7 @@ pub const ACTION_CHANNEL_CAP: usize = 16;
 
 const ABOUT_TEXT: &str = "tvdocker — multi-window Docker TUI\n\
     Built on Turbo Vision (tvision-rs).\n\
-    Licensed under MIT — see NOTICE for attributions.";
+    Licensed under MIT.";
 
 /// Help-box (F1) body: global keys plus the table sort/multi-select
 /// bindings. `run_program`'s `CMD_HELP` handler renders this text, and the

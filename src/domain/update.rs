@@ -22,7 +22,7 @@ use std::time::Duration;
 /// which is exactly what this is. Swap the constant when the repo exists;
 /// `the_release_url_names_the_placeholder_repository` pins it so the swap is
 /// a deliberate, visible edit.
-pub const REPOSITORY: &str = "https://github.com/tvdocker/tvdocker";
+pub const REPOSITORY: &str = "https://github.com/supertorpe/tvdocker";
 
 /// The human-facing releases page for [`REPOSITORY`] (what a reader is sent
 /// to when there is no asset for this target).
@@ -319,7 +319,7 @@ mod tests {
     fn payload(tag: &str, asset: Option<&str>) -> serde_json::Value {
         let mut v = serde_json::json!({
             "tag_name": tag,
-            "html_url": "https://github.com/tvdocker/tvdocker/releases/tag/placeholder",
+            "html_url": "https://github.com/supertorpe/tvdocker/releases/tag/placeholder",
             "assets": [],
         });
         if let Some(name) = asset {
@@ -327,7 +327,7 @@ mod tests {
                 {
                     "name": name,
                     "browser_download_url":
-                        "https://github.com/tvdocker/tvdocker/releases/download/placeholder/x"
+                        "https://github.com/supertorpe/tvdocker/releases/download/placeholder/x"
                 }
             ]);
         }
@@ -409,10 +409,10 @@ mod tests {
         // in the real repository is a deliberate, visible edit.
         assert_eq!(
             latest_release_url(),
-            "https://github.com/tvdocker/tvdocker/releases/latest",
+            "https://github.com/supertorpe/tvdocker/releases/latest",
             "update REPOSITORY when the project gets a real repository"
         );
-        assert_eq!(REPOSITORY, "https://github.com/tvdocker/tvdocker");
+        assert_eq!(REPOSITORY, "https://github.com/supertorpe/tvdocker");
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
         let none = describe("0.1.0", &latest_release_url(), &Ok(Outcome::NoReleaseYet));
         assert!(none.contains("No releases"), "{none}");
         assert!(
-            none.contains("tvdocker/tvdocker"),
+            none.contains("supertorpe/tvdocker"),
             "names the repository it asked: {none}"
         );
     }
@@ -493,7 +493,7 @@ mod tests {
     fn the_release_endpoint_is_the_api_not_the_web_page() {
         assert_eq!(
             release_api_url(),
-            "https://api.github.com/repos/tvdocker/tvdocker/releases/latest"
+            "https://api.github.com/repos/supertorpe/tvdocker/releases/latest"
         );
         assert!(
             latest_release_url().starts_with("https://github.com/"),
