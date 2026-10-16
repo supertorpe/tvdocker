@@ -15,4 +15,6 @@ pub mod settings;
 pub mod shell;
 pub mod statistics;
 pub mod status;
+pub mod theme_editor;
+pub mod theme_picker;
 pub mod volumes;
