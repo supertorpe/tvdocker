@@ -2,7 +2,7 @@
 //! `keymap()` and its input-module dependency were NOT ported — the
 //! `[keybindings]` overrides are tvdocker's own (settings).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tv::{Key, KeyEvent, KeyModifiers};
@@ -108,83 +108,58 @@ pub struct ContainerShellConfig {
     pub workdir: Option<String>,
 }
 
-/// Column visibility per table (shown by the column pickers). All default
-/// to visible.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ContainerColumns {
-    pub show_name: bool,
-    pub show_image: bool,
-    pub show_state: bool,
-    pub show_ports: bool,
+/// One column's persisted layout — the shape of the upstream `ColumnState`
+/// (see [`ColumnLayoutCfg::to_states`] / [`ColumnLayoutCfg::from_states`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnLayoutEntry {
+    pub column: usize,
+    pub order: usize,
+    pub width: i32,
+    pub flex: u16,
+    pub fixed: bool,
+    pub hidden: bool,
 }
 
-impl Default for ContainerColumns {
-    fn default() -> Self {
+/// One table's persisted column layout: read back at window build
+/// ([`column_layout`](TvdockerConfig::column_layout)) and rewritten on
+/// `TABLE_COLUMNS_CHANGED`, so order / width / flex / fixed / hidden survive a
+/// restart. (Replaces the vestigial per-table `*Columns` show/hide structs.)
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnLayoutCfg {
+    pub layout: Vec<ColumnLayoutEntry>,
+}
+
+impl ColumnLayoutCfg {
+    /// Snapshot a table's layout (upstream `Table::column_layout`) for saving.
+    pub fn from_states(states: &[tv::ColumnState]) -> Self {
         Self {
-            show_name: true,
-            show_image: true,
-            show_state: true,
-            show_ports: true,
+            layout: states
+                .iter()
+                .map(|s| ColumnLayoutEntry {
+                    column: s.column,
+                    order: s.order,
+                    width: s.width,
+                    flex: s.flex,
+                    fixed: s.fixed,
+                    hidden: s.hidden,
+                })
+                .collect(),
         }
     }
-}
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ImageColumns {
-    pub show_repository: bool,
-    pub show_tag: bool,
-    pub show_id: bool,
-    pub show_size: bool,
-}
-
-impl Default for ImageColumns {
-    fn default() -> Self {
-        Self {
-            show_repository: true,
-            show_tag: true,
-            show_id: true,
-            show_size: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct NetworkColumns {
-    pub show_name: bool,
-    pub show_id: bool,
-    pub show_driver: bool,
-    pub show_scope: bool,
-    pub show_ipam: bool,
-}
-
-impl Default for NetworkColumns {
-    fn default() -> Self {
-        Self {
-            show_name: true,
-            show_id: true,
-            show_driver: true,
-            show_scope: true,
-            show_ipam: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct VolumeColumns {
-    pub show_name: bool,
-    pub show_driver: bool,
-    pub show_mountpoint: bool,
-    pub show_size: bool,
-}
-
-impl Default for VolumeColumns {
-    fn default() -> Self {
-        Self {
-            show_name: true,
-            show_driver: true,
-            show_mountpoint: true,
-            show_size: true,
-        }
+    /// The states to hand to `Table::set_column_layout` at window build.
+    pub fn to_states(&self) -> Vec<tv::ColumnState> {
+        self.layout
+            .iter()
+            .map(|e| tv::ColumnState {
+                column: e.column,
+                order: e.order,
+                width: e.width,
+                flex: e.flex,
+                fixed: e.fixed,
+                hidden: e.hidden,
+            })
+            .collect()
     }
 }
 
@@ -336,14 +311,10 @@ pub struct TvdockerConfig {
     pub keybindings: Keybindings,
     #[serde(default)]
     pub polling: PollingIntervals,
+    /// Per-table column layout, keyed by a stable table id ("containers",
+    /// "images", "explorer.host", …). Absent ⇒ the built-in column defaults.
     #[serde(default)]
-    pub container_columns: ContainerColumns,
-    #[serde(default)]
-    pub image_columns: ImageColumns,
-    #[serde(default)]
-    pub network_columns: NetworkColumns,
-    #[serde(default)]
-    pub volume_columns: VolumeColumns,
+    pub column_layouts: BTreeMap<String, ColumnLayoutCfg>,
     #[serde(default = "default_true")]
     pub mouse: bool,
     #[serde(default)]
@@ -366,10 +337,7 @@ impl Default for TvdockerConfig {
             check_updates: None,
             keybindings: Default::default(),
             polling: Default::default(),
-            container_columns: Default::default(),
-            image_columns: Default::default(),
-            network_columns: Default::default(),
-            volume_columns: Default::default(),
+            column_layouts: Default::default(),
             mouse: true,
             llm: None,
             theme: None,
@@ -473,6 +441,32 @@ impl TvdockerConfig {
     pub fn set_theme_in_file(path: &Path, name: &str) -> Result<(), String> {
         let text = std::fs::read_to_string(path).unwrap_or_default();
         let out = rewrite_theme_line(&text, name);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, out).map_err(|e| e.to_string())
+    }
+
+    /// Read one table's persisted column layout, if any.
+    pub fn column_layout(&self, key: &str) -> Option<&ColumnLayoutCfg> {
+        self.column_layouts.get(key)
+    }
+
+    /// Rewrite ONLY the `[column_layouts.<key>]` block in `path`, byte-
+    /// preserving everything else — the same line-edit contract as
+    /// [`set_theme_in_file`](Self::set_theme_in_file) (comments and
+    /// hand-formatting are the user's). `Err(String)` is shown to the user
+    /// verbatim.
+    pub fn set_column_layout_in_file(
+        path: &Path,
+        key: &str,
+        cfg: &ColumnLayoutCfg,
+    ) -> Result<(), String> {
+        if !valid_layout_key(key) {
+            return Err(format!("{key:?} is not a usable table key"));
+        }
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let out = replace_column_layout_block(&text, key, cfg);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -670,6 +664,93 @@ pub fn replace_theme_table(text: &str, name: &str, def: &crate::domain::theme::T
         }
     };
     let block: Vec<String> = theme_table_text(name, def)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut out_lines = kept;
+    for (i, line) in block.into_iter().enumerate() {
+        out_lines.insert(at + i, line);
+    }
+    let mut out = out_lines.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if had_trailing_nl && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Is `key` safe as a `[column_layouts.<key>]` table key? Bare keys (ASCII
+/// letters, digits, `_`, `-`, `.`) keep the file readable. `.` is allowed so
+/// ids like `explorer.host` work; the writer quotes such a key TOML-style.
+pub fn valid_layout_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The TOML block for one table's column layout: the `[column_layouts.<key>]`
+/// header plus a `layout` array, one inline table per column (stored order).
+pub fn column_layout_table_text(key: &str, cfg: &ColumnLayoutCfg) -> String {
+    let k = toml_key(key);
+    let mut out = format!("[column_layouts.{k}]\n");
+    if cfg.layout.is_empty() {
+        out.push_str("layout = []\n");
+        return out;
+    }
+    out.push_str("layout = [\n");
+    for e in &cfg.layout {
+        out.push_str(&format!(
+            "  {{ column = {}, order = {}, width = {}, flex = {}, fixed = {}, hidden = {} }},\n",
+            e.column, e.order, e.width, e.flex, e.fixed, e.hidden
+        ));
+    }
+    out.push_str("]\n");
+    out
+}
+
+/// Replace `key`'s `[column_layouts.<key>]` block in `text` (or append it),
+/// leaving every other byte alone. Modeled on [`replace_theme_table`], so it
+/// shares that helper's behaviour: the block *and one trailing blank line* are
+/// replaced, and everything else — comments, ordering, other tables — is
+/// untouched.
+pub fn replace_column_layout_block(text: &str, key: &str, cfg: &ColumnLayoutCfg) -> String {
+    let parent = format!("[column_layouts.{}]", toml_key(key));
+    let had_trailing_nl = text.is_empty() || text.ends_with('\n');
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if had_trailing_nl && lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let mut skipping = false;
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    let mut insert_at = None;
+    for line in lines {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            let head = t.find(']').map(|i| &t[..=i]).unwrap_or("");
+            let ours = head == parent;
+            if ours && insert_at.is_none() {
+                insert_at.get_or_insert(kept.len());
+            }
+            skipping = ours;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let at = match insert_at {
+        Some(at) => at,
+        None => {
+            if !kept.is_empty() && !kept.last().is_some_and(|l| l.trim().is_empty()) {
+                kept.push(String::new());
+            }
+            kept.len()
+        }
+    };
+    let block: Vec<String> = column_layout_table_text(key, cfg)
         .lines()
         .map(str::to_string)
         .collect();
@@ -976,7 +1057,10 @@ mod tests {
         assert_eq!(c.polling.statistics_ms, 2000);
         assert_eq!(c.polling.images_ms, 10000);
         assert!(c.mouse, "mouse enabled by default");
-        assert!(c.container_columns.show_name, "columns default to visible");
+        assert!(
+            c.column_layouts.is_empty(),
+            "no persisted column layout by default"
+        );
     }
 
     #[test]
@@ -1464,5 +1548,157 @@ mod tests {
         assert!(!valid_theme_name("he said \"hi\""));
         assert!(!valid_theme_name(&"x".repeat(65)));
         assert!(!valid_theme_name("line\nbreak"));
+    }
+
+    fn layout_entry(column: usize, order: usize, width: i32) -> ColumnLayoutEntry {
+        ColumnLayoutEntry {
+            column,
+            order,
+            width,
+            flex: 0,
+            fixed: false,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn column_layout_block_replaces_only_itself() {
+        let text = "# mine\nmouse = true\n\n[column_layouts.containers]\n\
+                    layout = [\n  { column = 9, order = 9, width = 1, flex = 7, fixed = true, hidden = true },\n]\n\n\
+                    [themes.x]\nbackground = \"#000000\"\n";
+        let cfg = ColumnLayoutCfg {
+            layout: vec![layout_entry(0, 1, 20), layout_entry(1, 0, 12)],
+        };
+        let out = replace_column_layout_block(text, "containers", &cfg);
+        let expected = "# mine\nmouse = true\n\n[column_layouts.containers]\nlayout = [\n  { column = 0, order = 1, width = 20, flex = 0, fixed = false, hidden = false },\n  { column = 1, order = 0, width = 12, flex = 0, fixed = false, hidden = false },\n]\n[themes.x]\nbackground = \"#000000\"\n";
+        assert_eq!(out, expected, "only the block changes, themes untouched");
+    }
+
+    #[test]
+    fn column_layout_block_appends_when_absent() {
+        let text = "# hi\nmouse = true\n";
+        let cfg = ColumnLayoutCfg {
+            layout: vec![layout_entry(3, 0, 7)],
+        };
+        let out = replace_column_layout_block(text, "images", &cfg);
+        let expected = "# hi\nmouse = true\n\n[column_layouts.images]\nlayout = [\n  { column = 3, order = 0, width = 7, flex = 0, fixed = false, hidden = false },\n]\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn column_layout_of_no_entries_is_an_empty_array() {
+        let out =
+            replace_column_layout_block("mouse = true\n", "volumes", &ColumnLayoutCfg::default());
+        assert_eq!(
+            out,
+            "mouse = true\n\n[column_layouts.volumes]\nlayout = []\n"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_column_layout_parses_and_the_rest_survives() {
+        let path = tmpfile(
+            "theme = \"dark\"\n\n[column_layouts.containers]\nlayout = [\n  { column = 0, order = 1, width = 16, flex = 2, fixed = false, hidden = true },\n]\n",
+        );
+        let (c, err) = TvdockerConfig::load_from(&path);
+        assert_eq!(err, None);
+        let cfg = c.column_layout("containers").expect("parsed");
+        assert_eq!(
+            cfg.layout,
+            vec![ColumnLayoutEntry {
+                column: 0,
+                order: 1,
+                width: 16,
+                flex: 2,
+                fixed: false,
+                hidden: true,
+            }]
+        );
+        assert_eq!(c.theme.as_deref(), Some("dark"), "the rest still parses");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_column_layout_in_file_is_byte_preserving_and_reloadable() {
+        let path = tmpfile("mouse = true\n\n[themes.x]\nbackground = \"#000000\"\n");
+        let cfg = ColumnLayoutCfg {
+            layout: vec![layout_entry(0, 0, 20)],
+        };
+        TvdockerConfig::set_column_layout_in_file(&path, "containers", &cfg).expect("write");
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            back,
+            "mouse = true\n\n[themes.x]\nbackground = \"#000000\"\n\n[column_layouts.containers]\nlayout = [\n  { column = 0, order = 0, width = 20, flex = 0, fixed = false, hidden = false },\n]\n"
+        );
+        // It parses back, and a dotted key is quoted (explorer.host).
+        let (c, err) = TvdockerConfig::load_from(&path);
+        assert_eq!(err, None);
+        assert_eq!(c.column_layout("containers"), Some(&cfg));
+        TvdockerConfig::set_column_layout_in_file(&path, "explorer.host", &cfg).expect("write");
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            back.contains("[column_layouts.\"explorer.host\"]"),
+            "dotted key quoted: {back:?}"
+        );
+        assert_eq!(
+            TvdockerConfig::load_from(&path)
+                .0
+                .column_layout("explorer.host"),
+            Some(&cfg)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_column_layout_in_file_rejects_unusable_keys() {
+        let path = tmpfile("mouse = true\n");
+        let cfg = ColumnLayoutCfg::default();
+        for bad in ["", "bad key", "bad\"key", "bad\nkey"] {
+            assert!(
+                TvdockerConfig::set_column_layout_in_file(&path, bad, &cfg).is_err(),
+                "{bad:?} rejected"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mouse = true\n",
+            "nothing written"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_malformed_column_layout_block_is_not_fatal() {
+        let path = tmpfile("[column_layouts.containers]\nlayout = [ { column = } ]\n");
+        let (c, err) = TvdockerConfig::load_from(&path);
+        assert!(err.is_some(), "the parse error is surfaced");
+        assert_eq!(c.column_layout("containers"), None, "defaults, no panic");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn column_layout_maps_to_and_from_upstream_states() {
+        let states = vec![
+            tv::ColumnState {
+                column: 2,
+                order: 0,
+                width: 8,
+                flex: 1,
+                fixed: true,
+                hidden: false,
+            },
+            tv::ColumnState {
+                column: 0,
+                order: 1,
+                width: 20,
+                flex: 0,
+                fixed: false,
+                hidden: true,
+            },
+        ];
+        let cfg = ColumnLayoutCfg::from_states(&states);
+        assert_eq!(cfg.layout[0].column, 2);
+        assert!(cfg.layout[1].hidden);
+        assert_eq!(cfg.to_states(), states, "round trip");
     }
 }
