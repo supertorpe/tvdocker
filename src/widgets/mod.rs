@@ -10,8 +10,10 @@ pub mod text_pane;
 pub use filter_bar::FilterBar;
 pub use log_view::LogView;
 pub use pane::{
-    CompactIds, CompactRects, CompactWindow, PaneIds, PaneRects, PaneWindow, build_compact_window,
-    build_pane_window, compact_rects, pane_rects,
+    CompactIds, CompactRects, CompactWindow, PaneIds, PaneRects, PaneWindow, ScrollIds,
+    ScrollRects, ScrollStatusIds, ScrollStatusRects, ScrollStatusWindow, ScrollWindow,
+    build_compact_window, build_pane_window, build_scroll_status_window, build_scroll_window,
+    compact_rects, pane_rects, scroll_rects, scroll_status_rects,
 };
 pub use shared_line::SharedLine;
 pub use table::{Align, Column, Table, TableRow};
