@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use tv::status::StatusItemsBuilder;
 use tv::{
     Command, CrosstermBackend, Key, KeyEvent, KeyModifiers, Menu, MenuBar, MessageBoxButtons,
-    MessageBoxKind, Program, Rect, StatusDef, StatusLine, SystemClock, Theme, View, alt,
+    MessageBoxKind, Program, Rect, StatusDef, StatusLine, SystemClock, View, alt,
 };
 
 use crate::core::{ActionReq, AppCore, AppMsg, TaskReq};
@@ -105,6 +105,15 @@ pub const CMD_COLUMNS: Command = Command::custom("tvdocker.columns");
 pub const CMD_RELOAD_STATUS: Command = Command::custom("tvdocker.reload_status");
 /// Open the Settings window (settings), or focus it if already open.
 pub const CMD_SETTINGS: Command = Command::custom("tvdocker.settings");
+/// Open the theme picker (Options ▸ Themes…). The *selection* is minted per
+/// name inside the picker — `Command` is a `&'static str`, so the modal hands
+/// the chosen name back instead of posting one command per theme.
+pub const CMD_THEMES: Command = Command::custom("tvdocker.themes");
+/// Open the palette editor (Options ▸ Edit colors…). The edited working copy
+/// comes back through `Program::exec_view_with`, then the handler applies it
+/// and offers "save as theme" (tvision's own editor has no read-back, so its
+/// output could never be persisted).
+pub const CMD_THEME_EDITOR: Command = Command::custom("tvdocker.theme_edit");
 /// The Settings window's save key (F2 — the "the action for this window"
 /// convention; Logs uses F7, Images F2).
 pub const CMD_SETTINGS_SAVE: Command = Command::custom("tvdocker.settings_save");
@@ -452,7 +461,10 @@ pub fn init_menu_bar(r: Rect) -> Option<Box<dyn View>> {
         })
         // Settings (settings): one window, focused if already open.
         .submenu("~O~ptions", alt('o'), |m| {
-            m.command("~S~ettings…", CMD_SETTINGS)
+            m.command("~T~hemes…", CMD_THEMES)
+                .command("~E~dit colors…", CMD_THEME_EDITOR)
+                .separator()
+                .command("~S~ettings…", CMD_SETTINGS)
         })
         .submenu("~H~elp", alt('h'), |m| {
             m.command("~S~hortcuts", CMD_HELP)
@@ -461,6 +473,123 @@ pub fn init_menu_bar(r: Rect) -> Option<Box<dyn View>> {
         })
         .build();
     Some(Box::new(MenuBar::new(r, menu)))
+}
+
+/// Options ▸ Themes… : run the picker modally, then — only on OK — install
+/// the chosen palette and persist `theme = "…"` in the config file.
+///
+/// `run_app`'s closure is the one place that holds `&mut Program`, which is
+/// where `set_theme` lives (a View cannot reach it — same reason
+/// `Program::theme_editor()` is a `Program` method). The picker itself never
+/// applies anything: it previews from the entry's own [`Theme`], so an Esc
+/// needs no undo.
+fn open_theme_picker(prog: &mut Program) {
+    use crate::domain::theme;
+    use crate::views::theme_picker::{ThemeEntry, ThemePickerDialog, picker_rect};
+
+    let (cfg, _) = crate::domain::config::TvdockerConfig::load();
+    let current = cfg.theme.clone().unwrap_or_else(|| "classic".into());
+    let entries = theme::theme_names(&cfg.themes)
+        .into_iter()
+        .map(|name| {
+            let summary = theme::summary_for(&cfg.themes, &name);
+            ThemeEntry::new(name.clone(), theme::resolve(&cfg.themes, &name), summary)
+        })
+        .collect();
+    let bounds = picker_rect(prog.desktop_rect());
+    let picked = prog.exec_view_with(
+        Box::new(ThemePickerDialog::new(bounds, entries, &current)),
+        |modal, cmd| {
+            if cmd == Command::OK {
+                modal
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<ThemePickerDialog>())
+                    .and_then(|p| p.selected().map(str::to_string))
+            } else {
+                None
+            }
+        },
+    );
+    let Some(name) = picked else {
+        return; // Esc: the active theme was never touched
+    };
+    prog.set_theme(theme::resolve(&cfg.themes, &name));
+    if let Err(e) = crate::domain::config::TvdockerConfig::set_theme_in_file(
+        &crate::domain::config::TvdockerConfig::path(),
+        &name,
+    ) {
+        let _ = prog.message_box(
+            &format!("Theme applied — but the config file could not be updated:\n{e}"),
+            MessageBoxKind::Warning,
+            MessageBoxButtons::ok(),
+        );
+    }
+}
+
+/// Options ▸ Edit colors… : edit a WORKING copy of the palette, install it,
+/// then offer to keep it as a named theme (blank name = this session only).
+///
+/// tvision's own `Program::theme_editor()` would apply an edit too, but
+/// `Program::theme` is private with no getter — there would be no way to read
+/// the result back and write it to the config, which is why the editor itself
+/// lives in `views/theme_editor.rs`.
+fn edit_colors(prog: &mut Program) {
+    use crate::domain::config::TvdockerConfig;
+    use crate::domain::theme;
+    use crate::views::theme_editor::{ThemeEditorDialog, editor_rect};
+
+    let (cfg, _) = TvdockerConfig::load();
+    let current = cfg.theme.clone().unwrap_or_else(|| "classic".into());
+    let working = theme::resolve(&cfg.themes, &current);
+    let bounds = editor_rect(prog.desktop_rect());
+    let edited = prog.exec_view_with(
+        Box::new(ThemeEditorDialog::new(bounds, working)),
+        |modal, cmd| {
+            if cmd == Command::OK {
+                modal
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<ThemeEditorDialog>())
+                    .map(|d| d.theme())
+            } else {
+                None
+            }
+        },
+    );
+    let Some(edited) = edited else {
+        return; // Esc: the live palette was never touched
+    };
+    prog.set_theme(edited.clone());
+
+    // Keep it? An empty name leaves the palette for this session only. A
+    // CUSTOM theme keeps its own name in the prompt (OK then re-saves the
+    // edits in place); presets prompt blank so a stray OK can't silently
+    // fork one.
+    let prefill = if cfg.themes.contains_key(&current) {
+        current.clone()
+    } else {
+        String::new()
+    };
+    let (cmd, name) = prog.input_box(
+        "Save as theme",
+        "Name (blank = this session only)",
+        &prefill,
+        32,
+    );
+    if cmd != Command::OK {
+        return;
+    }
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    let def = theme::theme_to_def(&edited);
+    if let Err(e) = crate::domain::config::save_theme_as(&TvdockerConfig::path(), &name, &def) {
+        let _ = prog.message_box(
+            &format!("Palette applied — but it could not be saved:\n{e}"),
+            MessageBoxKind::Warning,
+            MessageBoxButtons::ok(),
+        );
+    }
 }
 
 /// `Program::new` with the plain status line. `desktop_fn` is `FnOnce`
@@ -485,14 +614,13 @@ pub fn program_with_status(
     desktop_fn: impl FnOnce(Rect) -> Option<Box<dyn View>>,
     status_fn: impl FnOnce(Rect) -> Option<Box<dyn View>>,
 ) -> Program {
-    Program::new(
-        backend,
-        clock,
-        Theme::classic_blue(),
-        desktop_fn,
-        status_fn,
-        init_menu_bar,
-    )
+    // The theme comes from `theme =` / `[themes.*]` — same config read the
+    // status line already does for `[keybindings]`. An unset or unknown
+    // selection resolves to `classic`, the stock tvision palette.
+    let (cfg, _) = crate::domain::config::TvdockerConfig::load();
+    let selection = cfg.theme.as_deref().unwrap_or("classic");
+    let theme = crate::domain::theme::resolve(&cfg.themes, selection);
+    Program::new(backend, clock, theme, desktop_fn, status_fn, init_menu_bar)
 }
 
 /// Build the running program: dynamic status + Containers desktop +
@@ -598,6 +726,14 @@ pub fn run_program_with(
                 MessageBoxKind::Information,
                 MessageBoxButtons::ok(),
             );
+        } else if cmd == CMD_THEMES {
+            // Options ▸ Themes… — a modal picker; Enter installs the chosen
+            // palette AND persists `theme = "…"` (Esc changes nothing).
+            open_theme_picker(prog);
+        } else if cmd == CMD_THEME_EDITOR {
+            // Options ▸ Edit colors… — author over a working copy, install it,
+            // then offer to keep it as a named theme.
+            edit_colors(prog);
         } else if cmd == CMD_CHECK_UPDATES {
             // The user asked, so the short blocking check runs here and
             // the outcome is a modal. A self-updatable release asks for
