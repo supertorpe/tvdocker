@@ -2,55 +2,29 @@
 //! volumes, networks, ports, labels; scrollable"): one window PER
 //! container over `AppCore::details` — Enter re-inspects, the window
 //! renders its own container's latest payload (amended
-//! for ×N).
+//! for ×N). The body is a non-following `LogView` with a right-edge
+//! vertical scroll bar; there is no status row, so the loading state
+//! lives in the body itself.
 
 use crate::core::AppCore;
 use crate::widgets::LogView;
-use crate::widgets::pane::CompactWindow;
+use crate::widgets::pane::ScrollWindow;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tv::{Context, DrawCtx, Rect, Role, View, ViewState, delegate};
+use tv::{Context, Rect, View, ViewState, delegate};
 
 /// Window-menu number for Details.
 const WINDOW_NUMBER: i16 = 7;
 
-/// The status row: live name + scroll hint, or the loading state.
-struct DetailsInfoView {
-    st: ViewState,
-    core: Rc<RefCell<AppCore>>,
-    id: String,
-}
+/// Body text while no inspect payload is cached (there is no status row).
+const LOADING: &str = " Loading container details…";
 
-impl View for DetailsInfoView {
-    fn state(&self) -> &ViewState {
-        &self.st
-    }
-    fn state_mut(&mut self) -> &mut ViewState {
-        &mut self.st
-    }
-    fn draw(&mut self, ctx: &mut DrawCtx) {
-        let core = self.core.borrow();
-        let line = match core.details.get(&self.id) {
-            None => " Loading container details…".to_string(),
-            Some(d) => format!(
-                " {} · {} lines · ↑↓ PgUp/PgDn scroll",
-                d.name,
-                d.lines.len()
-            ),
-        };
-        ctx.put_str(0, 0, &line, ctx.style(Role::Info));
-    }
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-}
-
-/// The Details window: `CompactWindow` (status row + body, no search
-/// line) whose body is a non-following `LogView` — a document, scrolled
-/// with the standard keys. One per container; `open` is cleared on drop
-/// so the slot can reopen it.
+/// The Details window: `ScrollWindow` (body + right scroll bar, no search
+/// or status line) whose body is a non-following `LogView` — a document,
+/// scrolled with the standard keys. One per container; `open` is cleared
+/// on drop so the slot can reopen it.
 pub struct DetailsWindow {
-    win: CompactWindow,
+    win: ScrollWindow,
     core: Rc<RefCell<AppCore>>,
     id: String,
     last_rev: u64,
@@ -66,28 +40,20 @@ pub fn build(
     name: &str,
     open: Rc<RefCell<bool>>,
 ) -> DetailsWindow {
-    let mut win = CompactWindow::new(
+    let mut win = ScrollWindow::new(
         bounds,
         format!("Details — {name}"),
         WINDOW_NUMBER,
-        Box::new(DetailsInfoView {
-            st: ViewState::new(Rect::new(0, 0, 1, 1)),
-            core: Rc::clone(&core),
-            id: id.to_string(),
-        }),
-        |rect| {
-            let mut log = LogView::new(rect, None);
+        |rect, bar| {
+            let mut log = LogView::new(rect, bar);
             log.set_follow(false); // no tail on a document
             Box::new(log)
         },
     );
     let last_rev = core.borrow().details_rev;
-    if let Some(d) = core.borrow().details.get(id)
-        && let Some(log) = log_mut(&mut win)
-    {
-        for line in &d.lines {
-            log.push_line(line.clone());
-        }
+    let payload = core.borrow().details.get(id).map(|d| d.lines.clone());
+    if let Some(log) = log_mut(&mut win) {
+        load_body(log, payload);
     }
     DetailsWindow {
         win,
@@ -98,7 +64,21 @@ pub fn build(
     }
 }
 
-fn log_mut(win: &mut CompactWindow) -> Option<&mut LogView> {
+/// Replace the body with `payload` (the cached inspect lines), or with the
+/// loading line when there is none.
+fn load_body(log: &mut LogView, payload: Option<Vec<String>>) {
+    log.clear();
+    match payload {
+        Some(lines) => {
+            for line in lines {
+                log.push_line(line);
+            }
+        }
+        None => log.push_line(LOADING),
+    }
+}
+
+fn log_mut(win: &mut ScrollWindow) -> Option<&mut LogView> {
     let body = win.ids().body;
     win.window_mut()
         .child_mut(body)
@@ -122,9 +102,6 @@ impl View for DetailsWindow {
     fn state_mut(&mut self) -> &mut ViewState {
         self.win.state_mut()
     }
-    fn draw(&mut self, ctx: &mut DrawCtx) {
-        self.win.draw(ctx);
-    }
 
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut Context) {
         self.win.handle_event(ev, ctx);
@@ -132,20 +109,20 @@ impl View for DetailsWindow {
         let rev = self.core.borrow().details_rev;
         if rev != self.last_rev {
             self.last_rev = rev;
-            let lines: Vec<String> = {
-                let core = self.core.borrow();
-                core.details
-                    .get(&self.id)
-                    .map(|d| d.lines.clone())
-                    .unwrap_or_default()
-            };
+            let payload = self
+                .core
+                .borrow()
+                .details
+                .get(&self.id)
+                .map(|d| d.lines.clone());
             if let Some(log) = log_mut(&mut self.win) {
-                log.clear();
-                for line in lines {
-                    log.push_line(line);
-                }
-                log.sync(ctx);
+                load_body(log, payload);
             }
+        }
+        // Publish the content length to the scroll bar (follow is off, so this
+        // never moves the viewport).
+        if let Some(log) = log_mut(&mut self.win) {
+            log.sync(ctx);
         }
     }
 

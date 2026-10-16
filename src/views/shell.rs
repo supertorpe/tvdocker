@@ -1,10 +1,10 @@
 //! The Shell/PTY window: the probe's wiring as
-//! a window — `CompactWindow` (status row + terminal) plus the `Bridge`
-//! that drains `PtyMsg` into `PtyState`. Closing the window drops the
-//! receiver, which tears the worker's exec down by itself.
+//! a window — `ScrollStatusWindow` (status row + terminal with right scroll bar)
+//! plus the `Bridge` that drains `PtyMsg` into `PtyState`. Closing the window
+//! drops the receiver, which tears the worker's exec down by itself.
 
 use crate::bridge::Bridge;
-use crate::widgets::CompactWindow;
+use crate::widgets::ScrollStatusWindow;
 use crate::widgets::pty::{PtyMsg, PtyPhase, PtyState, PtyView, SCROLLBACK_LINES, StatusView};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,7 +25,7 @@ pub fn build(
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
     resize_tx: watch::Sender<(u16, u16)>,
     out_rx: mpsc::Receiver<PtyMsg>,
-) -> (CompactWindow, Rc<RefCell<PtyState>>) {
+) -> (ScrollStatusWindow, Rc<RefCell<PtyState>>) {
     let state = Rc::new(RefCell::new(PtyState {
         parser: vt100::Parser::new(24, 80, SCROLLBACK_LINES),
         note: "starting…".to_string(),
@@ -35,12 +35,20 @@ pub fn build(
     let for_status = Rc::clone(&state);
     let for_view = Rc::clone(&state);
     let for_bridge = Rc::clone(&state);
-    let mut win = CompactWindow::new(
+    let mut win = ScrollStatusWindow::new(
         bounds,
         format!("shell @ {container}"),
         WINDOW_NUMBER,
         Box::new(StatusView::new(Rect::new(0, 0, 1, 1), for_status)),
-        move |rect| Box::new(PtyView::new(rect, for_view, input_tx, resize_tx)),
+        move |rect, bar| {
+            let mut view = PtyView::new(rect, for_view, input_tx, resize_tx);
+            // Link the scrollbar the scroll+status layout inserted. The body
+            // follows the live bottom; Shift+↑↓/PgUp/PgDn/Home/End, the wheel
+            // and this bar drive the scrollback, while the BARE navigation
+            // keys keep going to the shell as ANSI input.
+            view.set_v_scroll_bar(bar);
+            Box::new(view)
+        },
     );
     // The drain: a zero-area child INSIDE this window (auto-removed
     // with it — unlike the probe's desktop-level sibling, which would
