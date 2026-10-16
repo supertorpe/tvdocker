@@ -7,30 +7,7 @@ use tv::{
     Scroller, StateFlag, Style, View, ViewId, ViewState,
 };
 
-/// Column alignment inside its cell.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Align {
-    Left,
-    Right,
-}
-
-/// One column definition: label, preferred width, alignment.
-#[derive(Clone)]
-pub struct Column {
-    pub label: String,
-    pub width: i32,
-    pub align: Align,
-}
-
-impl Column {
-    pub fn new(label: impl Into<String>, width: i32, align: Align) -> Self {
-        Self {
-            label: label.into(),
-            width,
-            align,
-        }
-    }
-}
+use super::resource_table::{Align, Column};
 
 /// One display row: a stable id (selection/cursor identity,) plus
 /// cell text; optional style for state coloring.
