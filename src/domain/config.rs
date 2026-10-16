@@ -348,6 +348,13 @@ pub struct TvdockerConfig {
     pub mouse: bool,
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+    /// The selected theme's name; `None` = the built-in `classic`.
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// User-defined themes, keyed by name. A name that matches a preset
+    /// (`classic`/`dark`/`light`/`terminal`) replaces that preset.
+    #[serde(default)]
+    pub themes: HashMap<String, crate::domain::theme::ThemeDef>,
 }
 
 impl Default for TvdockerConfig {
@@ -365,7 +372,18 @@ impl Default for TvdockerConfig {
             volume_columns: Default::default(),
             mouse: true,
             llm: None,
+            theme: None,
+            themes: Default::default(),
         }
+    }
+}
+
+impl TvdockerConfig {
+    /// `(field, problem)` for every bad theme colour/role and for a `theme =`
+    /// selection that names nothing — the keybindings reporting contract, so
+    /// the Settings window lists them beside the binding problems.
+    pub fn validate_themes(&self) -> Vec<(String, String)> {
+        crate::domain::theme::validate(&self.themes, &self.theme)
     }
 }
 
@@ -443,6 +461,250 @@ impl TvdockerConfig {
         let text = self.to_toml().map_err(|e| e.to_string())?;
         std::fs::write(&path, text).map_err(|e| e.to_string())
     }
+
+    /// Persist ONLY the top-level `theme = "…"` line, leaving the rest of the
+    /// file byte-identical. The Settings window edits this file as raw text
+    /// (comments and hand-formatting are the user's), so a full re-serialize
+    /// here would silently destroy them — [`save`](Self::save) is the
+    /// programmatic path for *structured* saves, this one is a line edit.
+    ///
+    /// Call [`rewrite_theme_line`] for the text transformation; this wrapper
+    /// only reads, creates the directory, and writes.
+    pub fn set_theme_in_file(path: &Path, name: &str) -> Result<(), String> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let out = rewrite_theme_line(&text, name);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, out).map_err(|e| e.to_string())
+    }
+}
+
+/// Is this line a top-level `theme = …` assignment? (`themes`, `theme_extra`
+/// and commented-out lines are NOT.)
+fn is_theme_assignment(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("theme") else {
+        return false;
+    };
+    if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    rest.trim_start().starts_with('=')
+}
+
+/// The pure half of [`TvdockerConfig::set_theme_in_file`]:
+///
+/// * only the ROOT section (before the first `[table]` header) is searched,
+///   so `theme` can never be written *inside* `[containers]`;
+/// * an existing line keeps its indentation and its trailing comment, and
+///   only the value is replaced;
+/// * a missing line is inserted after the last non-blank root line (or at the
+///   very top when the file opens with a table);
+/// * everything else — blank lines, tables, comments — is untouched, and the
+///   presence/absence of a final newline is preserved.
+pub fn rewrite_theme_line(text: &str, name: &str) -> String {
+    let had_trailing_nl = text.is_empty() || text.ends_with('\n');
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if had_trailing_nl && lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let root_end = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let quoted = format!("theme = \"{name}\"");
+    if let Some(i) = lines[..root_end]
+        .iter()
+        .position(|l| is_theme_assignment(l))
+    {
+        let old = lines[i].clone();
+        let indent: String = old.chars().take_while(|c| c.is_whitespace()).collect();
+        // Keep whatever follows the value's closing quote (a trailing note).
+        let suffix = match old.find('=').and_then(|eq| {
+            let after = &old[eq + 1..];
+            after
+                .find('"')
+                .and_then(|o| after[o + 1..].find('"').map(|c| eq + 1 + o + 1 + c + 1))
+        }) {
+            Some(pos) => &old[pos..],
+            None => "",
+        };
+        lines[i] = format!("{indent}{quoted}{suffix}");
+    } else {
+        // Group with the other ROOT KEYS: after the last key assignment (so a
+        // trailing comment block that documents the next table keeps its
+        // table). A line that OPENS a construct (`foo = [` / `= {`) is not a
+        // safe neighbour — inserting under it would land inside the array —
+        // so those are skipped, as are comments. Fall back to the last
+        // non-blank line, then the top of the file.
+        let keys = lines[..root_end].iter().rposition(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && l.contains('=') && !t.ends_with(['[', ',', ':'])
+        });
+        let at = keys.map(|i| i + 1).unwrap_or_else(|| {
+            lines[..root_end]
+                .iter()
+                .rposition(|l| !l.trim().is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        });
+        lines.insert(at, quoted);
+    }
+    let mut out = lines.join("\n");
+    if had_trailing_nl {
+        out.push('\n');
+    }
+    out
+}
+
+/// A TOML bare key when the name allows it, otherwise a quoted key.
+fn toml_key(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        name.to_string()
+    } else {
+        toml_string(name)
+    }
+}
+
+/// A TOML basic string (our data is ASCII — escapes quotes and backslashes).
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Is `name` safe to write both as a table key and as `theme = "…"`? Empty,
+/// quoted, or containing a control character would corrupt the selection
+/// line, so the caller validates before writing.
+pub fn valid_theme_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && !trimmed.contains('"')
+        && !trimmed.chars().any(char::is_control)
+}
+
+/// The TOML block defining `name`: the slot table (only when the def carries
+/// slots) plus the role-override table, roles sorted so output is stable.
+/// `[themes.x.roles]` alone is enough when there are no slots — TOML creates
+/// the parent table implicitly.
+pub fn theme_table_text(name: &str, def: &crate::domain::theme::ThemeDef) -> String {
+    let key = toml_key(name);
+    let slots: [(&str, &Option<String>); 10] = [
+        ("background", &def.background),
+        ("foreground", &def.foreground),
+        ("border", &def.border),
+        ("accent", &def.accent),
+        ("surface", &def.surface),
+        ("muted", &def.muted),
+        ("error", &def.error),
+        ("warning", &def.warning),
+        ("info", &def.info),
+        ("success", &def.success),
+    ];
+    let mut out = String::new();
+    if slots.iter().any(|(_, v)| v.is_some()) {
+        out.push_str(&format!("[themes.{key}]\n"));
+        for (slot, value) in slots {
+            if let Some(value) = value {
+                out.push_str(&format!("{slot} = {}\n", toml_string(value)));
+            }
+        }
+    }
+    if !def.roles.is_empty() {
+        out.push_str(&format!("[themes.{key}.roles]\n"));
+        let mut names: Vec<&String> = def.roles.keys().collect();
+        names.sort();
+        for name in names {
+            out.push_str(&format!(
+                "{} = {}\n",
+                toml_key(name),
+                toml_string(&def.roles[name])
+            ));
+        }
+    }
+    out
+}
+
+/// Replace `name`'s block in `text` (or append it), leaving every other byte
+/// alone. The block spans `[themes.<key>]` AND its `[themes.<key>.roles]`
+/// sub-table — a header's trailing comment or spaces are tolerated.
+pub fn replace_theme_table(text: &str, name: &str, def: &crate::domain::theme::ThemeDef) -> String {
+    let key = toml_key(name);
+    let parent = format!("[themes.{key}]");
+    let roles = format!("[themes.{key}.roles]");
+    let had_trailing_nl = text.is_empty() || text.ends_with('\n');
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if had_trailing_nl && lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let mut skipping = false;
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    let mut insert_at = None;
+    for line in lines {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            let head = t.find(']').map(|i| &t[..=i]).unwrap_or("");
+            let ours = head == parent || head == roles;
+            if ours && insert_at.is_none() {
+                insert_at.get_or_insert(kept.len());
+            }
+            skipping = ours;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    // Replace IN PLACE (a comment above the block keeps documenting it);
+    // append at the end when the theme is new — with a blank line so the new
+    // table doesn't weld itself onto the last root key.
+    let at = match insert_at {
+        Some(at) => at,
+        None => {
+            if !kept.is_empty() && !kept.last().is_some_and(|l| l.trim().is_empty()) {
+                kept.push(String::new());
+            }
+            kept.len()
+        }
+    };
+    let block: Vec<String> = theme_table_text(name, def)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut out_lines = kept;
+    for (i, line) in block.into_iter().enumerate() {
+        out_lines.insert(at + i, line);
+    }
+    let mut out = out_lines.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if had_trailing_nl && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Persist an authored theme in one pass: write (or replace) its
+/// `[themes.<name>]` block AND point the selection at it. Same byte-
+/// preservation contract as [`TvdockerConfig::set_theme_in_file`].
+pub fn save_theme_as(
+    path: &Path,
+    name: &str,
+    def: &crate::domain::theme::ThemeDef,
+) -> Result<(), String> {
+    if !valid_theme_name(name) {
+        return Err(format!("{name:?} is not a usable theme name"));
+    }
+    let name = name.trim();
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let out = rewrite_theme_line(&replace_theme_table(&text, name, def), name);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())
 }
 
 /// Parse one `[keybindings]` string into a `KeyEvent` (settings).
@@ -955,5 +1217,252 @@ mod tests {
             notes.contains(&"keybindings.open_logs → F8".to_string()),
             "a single-chord override reports its chord: {notes:?}"
         );
+    }
+
+    #[test]
+    fn themes_and_selection_deserialize_from_toml() {
+        let path = tmpfile(
+            "theme = \"dracula\"\n\
+             [themes.dracula]\n\
+             background = \"#282a36\"\n\
+             foreground = \"#f8f8f2\"\n\
+             [themes.dracula.roles]\n\
+             ListNormal = \"#f8f8f2/#282a36\"\n",
+        );
+        let (cfg, err) = TvdockerConfig::load_from(&path);
+        assert_eq!(err, None, "clean file");
+        assert_eq!(cfg.theme.as_deref(), Some("dracula"));
+        let def = cfg.themes.get("dracula").expect("theme def parsed");
+        assert_eq!(def.background.as_deref(), Some("#282a36"));
+        assert_eq!(
+            def.roles.get("ListNormal").map(String::as_str),
+            Some("#f8f8f2/#282a36")
+        );
+        assert!(cfg.validate_themes().is_empty(), "a sane file is clean");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn defaults_have_no_selection_and_no_problems() {
+        let cfg = TvdockerConfig::default();
+        assert_eq!(cfg.theme, None, "unset ⇒ classic");
+        assert!(cfg.themes.is_empty());
+        assert!(cfg.validate_themes().is_empty());
+    }
+
+    #[test]
+    fn validate_themes_lists_field_level_problems() {
+        let mut cfg = TvdockerConfig {
+            theme: Some("ghost".into()),
+            ..Default::default()
+        };
+        let def = crate::domain::theme::ThemeDef {
+            background: Some("bogus".into()),
+            ..Default::default()
+        };
+        cfg.themes.insert("mine".into(), def);
+        let problems = cfg.validate_themes();
+        let fields: Vec<&str> = problems.iter().map(|(f, _)| f.as_str()).collect();
+        assert!(fields.contains(&"themes.mine.background"), "{fields:?}");
+        assert!(fields.contains(&"theme"), "dangling selection: {fields:?}");
+    }
+
+    #[test]
+    fn rewrite_replaces_the_value_and_keeps_comment_indent_and_the_rest() {
+        let text =
+            "# my config\n  theme = \"dark\"   # the dark one\nfoo = 1\n\n[mouse]\nx = true\n";
+        let out = rewrite_theme_line(text, "light");
+        assert_eq!(
+            out,
+            "# my config\n  theme = \"light\"   # the dark one\nfoo = 1\n\n[mouse]\nx = true\n",
+            "only the value changes — byte-identical elsewhere"
+        );
+    }
+
+    #[test]
+    fn rewrite_inserts_at_the_end_of_the_root_section() {
+        let text = "check_updates = true\n\n# a note\n\n[containers]\nbash = \"zsh\"\n";
+        let out = rewrite_theme_line(text, "dark");
+        assert_eq!(
+            out,
+            "check_updates = true\ntheme = \"dark\"\n\n# a note\n\n[containers]\nbash = \"zsh\"\n",
+            "after the last non-blank root line, before the table"
+        );
+    }
+
+    #[test]
+    fn rewrite_ignores_lookalikes_and_keeps_a_file_without_a_final_newline() {
+        // `themes`, commented lines and a table-scoped lookalike must NOT be
+        // mistaken for the selection; a file that ends without a newline stays
+        // that way.
+        let text = "# theme = \"old\"\nthemes = 1\n\n[containers]\ntheme = \"inner\"";
+        let out = rewrite_theme_line(text, "dark");
+        assert_eq!(
+            out,
+            "# theme = \"old\"\nthemes = 1\ntheme = \"dark\"\n\n[containers]\ntheme = \"inner\"",
+            "only a real root assignment counts; no trailing newline invented"
+        );
+        assert!(!out.ends_with('\n'), "trailing newline preserved as absent");
+    }
+
+    #[test]
+    fn rewrite_handles_a_file_that_opens_with_a_table_and_an_empty_file() {
+        assert_eq!(
+            rewrite_theme_line("[containers]\nbash = \"zsh\"\n", "dark"),
+            "theme = \"dark\"\n[containers]\nbash = \"zsh\"\n"
+        );
+        assert_eq!(rewrite_theme_line("", "dark"), "theme = \"dark\"\n");
+        assert_eq!(
+            rewrite_theme_line("theme = \"a\"", "b"),
+            "theme = \"b\"",
+            "single line, no final newline"
+        );
+    }
+
+    #[test]
+    fn rewrite_never_lands_inside_a_multi_line_value() {
+        // `extras = [` opens an array: a neighbour right under it would be a
+        // syntax error, so the writer walks past it to the previous key.
+        let text = "mouse = true\nextras = [\n  \"a\",\n]\n\n[containers]\nbash = \"zsh\"\n";
+        assert_eq!(
+            rewrite_theme_line(text, "dark"),
+            "mouse = true\ntheme = \"dark\"\nextras = [\n  \"a\",\n]\n\n[containers]\nbash = \"zsh\"\n"
+        );
+    }
+
+    #[test]
+    fn set_theme_in_file_writes_only_the_selection_line() {
+        let path = tmpfile("mouse = true\n\n[containers]\nbash = \"zsh\"\n");
+        TvdockerConfig::set_theme_in_file(&path, "dark").expect("write");
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            back,
+            "mouse = true\ntheme = \"dark\"\n\n[containers]\nbash = \"zsh\"\n"
+        );
+        // Second write replaces, never duplicates.
+        TvdockerConfig::set_theme_in_file(&path, "light").expect("write");
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            back,
+            "mouse = true\ntheme = \"light\"\n\n[containers]\nbash = \"zsh\"\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn def(slots: bool, roles: &[(&str, &str)]) -> crate::domain::theme::ThemeDef {
+        let mut d = crate::domain::theme::ThemeDef::default();
+        if slots {
+            d.background = Some("#101010".into());
+            d.foreground = Some("#eeeeee".into());
+        }
+        for (k, v) in roles {
+            d.roles.insert((*k).to_string(), (*v).to_string());
+        }
+        d
+    }
+
+    #[test]
+    fn theme_table_text_emits_slots_then_sorted_roles() {
+        let text = theme_table_text(
+            "mine",
+            &def(
+                true,
+                &[("ListNormal", "#fff/#000"), ("FrameActive", "#a/#b")],
+            ),
+        );
+        assert_eq!(
+            text,
+            "[themes.mine]\nbackground = \"#101010\"\nforeground = \"#eeeeee\"\n\
+             [themes.mine.roles]\nFrameActive = \"#a/#b\"\nListNormal = \"#fff/#000\"\n",
+            "slots first, roles sorted: {text:?}"
+        );
+        // A roles-only def needs no parent header (TOML implies it).
+        let roles_only = theme_table_text("solo", &def(false, &[("Shadow", "#000/#111")]));
+        assert_eq!(roles_only, "[themes.solo.roles]\nShadow = \"#000/#111\"\n");
+        // A name that is not a bare key gets quoted.
+        assert!(
+            theme_table_text("my theme!", &def(false, &[("Shadow", "#0/#1")]))
+                .starts_with("[themes.\"my theme!\".roles]"),
+            "quoted key"
+        );
+    }
+
+    #[test]
+    fn a_theme_block_parses_back_as_a_theme_def() {
+        let block = theme_table_text("parsed", &def(true, &[("ListNormal", "#fff/#000")]));
+        let doc = format!("mouse = true\n{block}");
+        let cfg: TvdockerConfig = toml::from_str(&doc).expect("the block is valid TOML");
+        let d = cfg.themes.get("parsed").expect("theme parsed");
+        assert_eq!(d.background.as_deref(), Some("#101010"));
+        assert_eq!(
+            d.roles.get("ListNormal").map(String::as_str),
+            Some("#fff/#000")
+        );
+        assert!(cfg.validate_themes().is_empty(), "clean: {block:?}");
+    }
+
+    #[test]
+    fn replace_theme_table_touches_only_the_named_block() {
+        let text = "# fave\nmouse = true\n\n[themes.a]\nbackground = \"#000000\"\n\n\
+                    [themes.a.roles]\nShadow = \"#1/#2\"\n\n[themes.b]\nbackground = \"#ffffff\"\n";
+        let out = replace_theme_table(text, "a", &def(false, &[("ListNormal", "#fff/#000")]));
+        assert_eq!(
+            out,
+            "# fave\nmouse = true\n\n[themes.a.roles]\nListNormal = \"#fff/#000\"\n\
+             [themes.b]\nbackground = \"#ffffff\"\n",
+            "a replaced in place, b and the comment byte-identical: {out:?}"
+        );
+        assert!(!out.contains("#000000"), "the old slot is gone");
+    }
+
+    #[test]
+    fn save_theme_as_appends_block_and_selection_and_is_idempotent() {
+        let path = tmpfile("# hi\nmouse = true\n");
+        let d = def(false, &[("ListNormal", "#fff/#000")]);
+        save_theme_as(&path, "authored", &d).expect("write");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            first,
+            "# hi\nmouse = true\ntheme = \"authored\"\n\n[themes.authored.roles]\n\
+             ListNormal = \"#fff/#000\"\n",
+            "selection in the root section, block appended after a blank line: {first:?}"
+        );
+        // Second save replaces, never duplicates.
+        save_theme_as(
+            &path,
+            "authored",
+            &def(false, &[("Shadow", "#333333/#444444")]),
+        )
+        .expect("rewrite");
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(!second.contains("ListNormal"), "old roles gone: {second:?}");
+        assert!(
+            second.contains("Shadow = \"#333333/#444444\""),
+            "new roles: {second:?}"
+        );
+        assert_eq!(
+            second.matches("theme = ").count(),
+            1,
+            "one selection line: {second:?}"
+        );
+        // And the file still parses clean.
+        let (cfg, err) = TvdockerConfig::load_from(&path);
+        assert_eq!(err, None, "round trip parses");
+        assert_eq!(cfg.theme.as_deref(), Some("authored"));
+        assert!(cfg.validate_themes().is_empty());
+        // A bad name never writes.
+        assert!(save_theme_as(&path, "bad\"name", &d).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn valid_theme_names_are_short_and_quotable() {
+        assert!(valid_theme_name("midnight"));
+        assert!(valid_theme_name("My Theme 2"));
+        assert!(!valid_theme_name(""));
+        assert!(!valid_theme_name("   "));
+        assert!(!valid_theme_name("he said \"hi\""));
+        assert!(!valid_theme_name(&"x".repeat(65)));
+        assert!(!valid_theme_name("line\nbreak"));
     }
 }

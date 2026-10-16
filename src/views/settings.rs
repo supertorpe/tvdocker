@@ -90,6 +90,9 @@ impl SettingsWindow {
         problems.extend(crate::domain::config::validate_keybindings(
             &cfg.keybindings,
         ));
+        // Bad theme colours/roles and a `theme =` naming nothing are reported
+        // exactly like a bad binding — a typo must never silently do nothing.
+        problems.extend(cfg.validate_themes());
         let notes = crate::domain::config::keybinding_notes(&cfg.keybindings);
         let mut core = self.core.borrow_mut();
         if let Some(err) = parse_err {
