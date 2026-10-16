@@ -3,7 +3,7 @@
 //! bounded-channel policy, CLI filter prefill, ActionReq round trip.
 mod common;
 
-use common::{SharedClock, container_state, pump, screen_text};
+use common::{SharedClock, close_modal_and_quit, container_state, pump, screen_text};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Event, Key, KeyModifiers};
@@ -197,18 +197,16 @@ fn startup_error_shows_a_message_box_before_the_app_runs() {
     // capture). What IS observable: the open modal SWALLOWS Tab+'q' —
     // without the box, Tab would move focus from the table (initial) to the
     // filter and 'q' would replace the "type to filter" placeholder.
-    // Enter dismisses, and TWO QUITs are queued because the modal's
-    // blocking pump reads everything still queued in its own pass and a
-    // QUIT that ends the modal is discarded by exec's end_state
-    // save/restore (framework 0.16), so only the second one reaches
-    // run_app (a single QUIT spun run_app forever on a headless backend —
-    // pump order verified by instrumenting the framework).
+    // The box is up before the loop (run_program_with shows it directly), so
+    // its blocking pump reads Tab+'q' (swallowed) and then the close: on 0.17
+    // Enter does NOT dismiss a box (a non-default button ignores
+    // Command::DEFAULT and its activation timer never fires on a still clock)
+    // and a QUIT delivered while the box is up is dropped — so close it with a
+    // command it handles, then QUIT ends run_app (`common::close_modal_and_quit`).
     let (program, screen, _clock, _core, _app, _act) = start(None);
     screen.push_key(Key::Tab, KeyModifiers::default()); // would focus filter
     screen.push_key(Key::Char('q'), KeyModifiers::default()); // would filter
-    screen.push_key(Key::Enter, KeyModifiers::default()); // dismiss the box
-    screen.push_event(tv::event::Event::Command(tv::Command::QUIT));
-    screen.push_event(tv::event::Event::Command(tv::Command::QUIT));
+    close_modal_and_quit(&screen);
     app::run_program(program, Some("Config parse error: bad.toml".into()));
     let text = screen_text(&screen);
     assert!(

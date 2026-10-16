@@ -13,7 +13,7 @@
 //! assert. An open modal *swallows* its keys, which is what proves it existed.
 mod common;
 
-use common::{SharedClock, container_state, pump, screen_text};
+use common::{SharedClock, close_modal_and_quit, container_state, pump, screen_text};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::Command;
@@ -24,13 +24,6 @@ use tvdocker::core::{AppCore, AppMsg, TaskReq};
 use tvdocker::domain::docker::containers::ContainerSummary;
 
 type TaskRx = tokio::sync::mpsc::UnboundedReceiver<TaskReq>;
-
-/// End a `run_program` drive: the first QUIT closes the modal that is
-/// currently up, the second ends `run_app`.
-fn quit_twice(screen: &HeadlessHandle) {
-    screen.push_event(Event::Command(Command::QUIT));
-    screen.push_event(Event::Command(Command::QUIT));
-}
 
 fn image_row(id: &str, repo: &str, tag: &str) -> tvdocker::domain::docker::images::ImageEntry {
     tvdocker::domain::docker::images::ImageEntry {
@@ -238,7 +231,7 @@ fn delete_confirm_no_sends_nothing() {
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_key(Key::Down, KeyModifiers::default());
     screen.push_event(Event::Command(Command::NO));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         task_rx.try_recv().is_err(),
@@ -257,7 +250,7 @@ fn delete_confirm_yes_removes_exactly_the_targets() {
     let (program, screen, _core, mut task_rx) = start(two_rows());
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(
@@ -275,7 +268,7 @@ fn delete_confirm_yes_removes_exactly_the_targets() {
     screen.push_key(Key::Char(' '), KeyModifiers::default());
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     let mut got = Vec::new();
     while let Ok(TaskReq::RemoveContainer { id }) = task_rx.try_recv() {
@@ -298,7 +291,7 @@ fn a_cancelled_images_delete_does_not_stain_the_next_delete() {
     pump(&mut program, 3);
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::NO));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(task_rx.try_recv().is_err(), "cancelled ⇒ nothing queued");
 
@@ -306,7 +299,7 @@ fn a_cancelled_images_delete_does_not_stain_the_next_delete() {
     let (program, screen, _core, mut task_rx) = start(two_rows());
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(
@@ -365,7 +358,7 @@ fn shell_submit_sends_the_dialog_values_for_the_pending_container() {
     // write the user's real config.
     screen.push_key(Key::F(4), KeyModifiers::default());
     screen.push_event(Event::Command(Command::OK));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     match task_rx.try_recv() {
         Ok(TaskReq::StartShell {
@@ -402,7 +395,7 @@ fn shell_cancel_sends_nothing() {
     // here proves Esc cancelled rather than the dialog never opening.
     screen.push_key(Key::F(4), KeyModifiers::default());
     screen.push_key(Key::Esc, KeyModifiers::default());
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(task_rx.try_recv().is_err(), "cancel ⇒ no exec");
     assert!(!screen_text(&screen).contains("shell @"), "no window");
@@ -423,7 +416,7 @@ fn column_picker_applies_only_on_ok() {
     );
     screen.push_key(Key::Char(' '), KeyModifiers::default());
     screen.push_key(Key::Esc, KeyModifiers::default());
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     let text = screen_text(&screen);
     assert!(
@@ -446,7 +439,7 @@ fn column_picker_applies_only_on_ok() {
     );
     screen.push_key(Key::Char(' '), KeyModifiers::default());
     screen.push_event(Event::Command(Command::OK));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     let text = screen_text(&screen);
     assert!(!text.contains("NAME"), "OK ⇒ NAME hidden: {text:?}");
@@ -467,7 +460,7 @@ fn images_del_batch_removes_exactly_the_selection() {
     screen.push_key(Key::Char(' '), KeyModifiers::default());
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     let mut got = Vec::new();
     while let Ok(TaskReq::RemoveImage { id }) = task_rx.try_recv() {
@@ -490,7 +483,7 @@ fn networks_del_confirms_then_sends_remove_network() {
     pump(&mut program, 3);
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(
@@ -513,7 +506,7 @@ fn volumes_menu_delete_sends_remove_volume() {
     pump(&mut program, 3);
     screen.push_key(Key::Char('x'), KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(
@@ -538,7 +531,7 @@ fn images_menu_prune_confirms_and_queues_prune_once() {
     pump(&mut program, 3);
     screen.push_key(Key::Char('p'), KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(task_rx.try_recv(), Ok(TaskReq::PruneImages)),
@@ -565,7 +558,7 @@ fn images_menu_dangling_confirms_and_queues_the_sweep_once() {
     pump(&mut program, 3);
     screen.push_key(Key::Char('d'), KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(task_rx.try_recv(), Ok(TaskReq::RemoveDanglingImages)),
@@ -595,7 +588,7 @@ fn images_f2_opens_the_run_form_and_submits_its_values() {
     assert!(last.contains("F2 Run…"), "Images def active: {last}");
     screen.push_key(Key::F(2), KeyModifiers::default());
     screen.push_event(Event::Command(Command::OK));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     match task_rx.try_recv() {
         Ok(TaskReq::RunContainer { opts }) => {
@@ -636,7 +629,7 @@ fn run_submit_unedited_never_writes_the_config() {
     assert!(last.contains("F2 Run…"), "Images def active: {last}");
     screen.push_key(Key::F(2), KeyModifiers::default());
     screen.push_event(Event::Command(Command::OK));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     // The form really opened and submitted — this is the run path.
     assert!(
@@ -668,7 +661,7 @@ fn run_form_esc_sends_nothing() {
     // proves it was really up; without the form, Esc would close the
     // Images window instead.
     screen.push_key(Key::Esc, KeyModifiers::default());
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(task_rx.try_recv().is_err(), "cancel ⇒ no run");
     let text = screen_text(&screen);

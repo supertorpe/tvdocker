@@ -6,11 +6,12 @@
 //! (pinned hermetically in `domain::docker::tasks`).
 //!
 //! **Modal tests drive `app::run_program_with`, not bare `pump_once`**
-//! (tests/resource_actions.rs documents why): pre-queue every key, end
-//! with two `QUIT`s (one closes the modal, one ends `run_app`).
+//! (tests/resource_actions.rs documents why): pre-queue every key, answer the
+//! box, then `close_modal_and_quit` (0.17: a QUIT is dropped while a box is up,
+//! and the check may show a second "result" box after the answer).
 mod common;
 
-use common::{SharedClock, pump, screen_text};
+use common::{SharedClock, close_modal_and_quit, pump, screen_text};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::Command;
@@ -79,8 +80,10 @@ fn drive_check(
     );
     screen.push_key(Key::Char('c'), KeyModifiers::default());
     screen.push_event(Event::Command(answer));
-    screen.push_event(Event::Command(Command::QUIT));
-    screen.push_event(Event::Command(Command::QUIT));
+    // 0.17: after the answer the check may show a SECOND box (the result
+    // "describe" modal on No / no-asset), and a QUIT is dropped while any box
+    // is up — so close a leftover box, then QUIT ends run_app.
+    close_modal_and_quit(screen);
     let check = move |_current: &str| Ok(outcome.clone());
     app::run_program_with(program, None, task_tx, "0.1.0", check);
 }

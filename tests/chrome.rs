@@ -4,7 +4,7 @@
 //! pump.
 mod common;
 
-use common::{SharedClock, pump, screen_text};
+use common::{SharedClock, close_modal_and_quit, dismiss_modal, pump, screen_text};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Event, Key, KeyModifiers};
@@ -175,9 +175,9 @@ fn f1_help_documents_the_table_sort_keys() {
     screen.push_key(Key::F(1), KeyModifiers::default());
     screen.push_key(Key::Tab, KeyModifiers::default()); // would focus filter
     screen.push_key(Key::Char('q'), KeyModifiers::default()); // would type
-    screen.push_key(Key::Enter, KeyModifiers::default()); // dismiss the box
-    screen.push_event(Event::Command(tv::Command::QUIT));
-    screen.push_event(Event::Command(tv::Command::QUIT));
+    // 0.17: the box is closed by a command it handles, then QUIT ends run_app
+    // (see `common::close_modal_and_quit`); Enter no longer dismisses it.
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     let text = screen_text(&screen);
     assert!(
@@ -187,8 +187,8 @@ fn f1_help_documents_the_table_sort_keys() {
 
     // Content half: the box body exactly as the CMD_HELP handler renders it.
     let (mut program, screen, _clock) = start();
-    screen.push_key(Key::Enter, KeyModifiers::default()); // dismiss
-    screen.push_event(Event::Command(tv::Command::QUIT)); // end the pump
+    // 0.17: close the box with a command it handles (see the first half).
+    dismiss_modal(&screen);
     let _ = program.message_box(
         app::SHORTCUTS_TEXT,
         MessageBoxKind::Information,

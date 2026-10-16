@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 use tv::event::{Event, Key, MouseWheel};
 use tv::{
-    Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, Style, View, ViewId,
-    ViewState, delegate,
+    Command, CommandSet, Context, DrawCtx, FieldValue, HelpCtx, Options, Point, Rect, Role,
+    Scroller, StateFlag, Style, View, ViewId, ViewState,
 };
 
 /// Column alignment inside its cell.
@@ -478,13 +478,114 @@ impl Table {
     }
 }
 
-#[delegate(to = scroller)]
 impl View for Table {
     fn state(&self) -> &ViewState {
         &self.st
     }
     fn state_mut(&mut self) -> &mut ViewState {
         &mut self.st
+    }
+
+    // The remaining View methods forward to the embedded `scroller`, exactly as
+    // the `#[delegate(to = scroller)]` expansion did before tvision-rs 0.17's
+    // guard required this impl to be written by hand: the Table keeps its own
+    // ViewState (header+body rect) distinct from the scroller's body rect.
+    // Throwaway: this file is deleted with the custom Table.
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.scroller.set_state(flag, enable, ctx);
+    }
+    fn valid(&mut self, cmd: Command, ctx: &mut Context) -> bool {
+        self.scroller.valid(cmd, ctx)
+    }
+    fn set_modal_answer(&mut self, cmd: Command) {
+        self.scroller.set_modal_answer(cmd)
+    }
+    fn value(&self) -> Option<FieldValue> {
+        self.scroller.value()
+    }
+    fn set_value(&mut self, v: FieldValue) {
+        self.scroller.set_value(v)
+    }
+    fn set_modal_data(&mut self, data: FieldValue) {
+        self.scroller.set_modal_data(data)
+    }
+    fn set_value_ctx(&mut self, v: FieldValue, ctx: &mut Context) {
+        self.scroller.set_value_ctx(v, ctx)
+    }
+    fn awaken(&mut self) {
+        self.scroller.awaken()
+    }
+    fn size_limits(&self, owner_size: Point) -> (Point, Point) {
+        self.scroller.size_limits(owner_size)
+    }
+    fn calc_bounds(&mut self, owner_size: Point, delta: Point) -> Rect {
+        self.scroller.calc_bounds(owner_size, delta)
+    }
+    fn cursor_request(&self) -> Option<Point> {
+        self.scroller.cursor_request()
+    }
+    fn caret_size(&self) -> u8 {
+        self.scroller.caret_size()
+    }
+    fn find_mut(&mut self, id: ViewId) -> Option<&mut dyn View> {
+        self.scroller.find_mut(id)
+    }
+    fn remove_descendant(&mut self, id: ViewId, ctx: &mut Context) -> bool {
+        self.scroller.remove_descendant(id, ctx)
+    }
+    fn focus_descendant(&mut self, id: ViewId, ctx: &mut Context) -> bool {
+        self.scroller.focus_descendant(id, ctx)
+    }
+    fn has_focusable_leaf(&self) -> bool {
+        self.scroller.has_focusable_leaf()
+    }
+    fn focus_to_edge(&mut self, backward: bool, ctx: &mut Context) -> bool {
+        self.scroller.focus_to_edge(backward, ctx)
+    }
+    fn reset_current(&mut self, ctx: &mut Context) {
+        self.scroller.reset_current(ctx)
+    }
+    fn settle_currency(&mut self, ctx: &mut Context) {
+        self.scroller.settle_currency(ctx)
+    }
+    fn set_visible_descendant(&mut self, id: ViewId, visible: bool, ctx: &mut Context) -> bool {
+        self.scroller.set_visible_descendant(id, visible, ctx)
+    }
+    fn number(&self) -> Option<i16> {
+        self.scroller.number()
+    }
+    fn grabs_focus_on_click(&self) -> bool {
+        self.scroller.grabs_focus_on_click()
+    }
+    fn select_window_num(&mut self, num: i16, ctx: &mut Context) -> bool {
+        self.scroller.select_window_num(num, ctx)
+    }
+    fn tile(&mut self, r: Rect) {
+        self.scroller.tile(r)
+    }
+    fn cascade(&mut self, r: Rect) {
+        self.scroller.cascade(r)
+    }
+    fn apply_scroll_sync(&mut self, h: Option<i32>, v: Option<i32>, ctx: &mut Context) {
+        self.scroller.apply_scroll_sync(h, v, ctx)
+    }
+    fn update_menu_commands(&mut self, cs: &CommandSet) {
+        self.scroller.update_menu_commands(cs)
+    }
+    fn set_menu_current(&mut self, current: Option<usize>) {
+        self.scroller.set_menu_current(current)
+    }
+    fn get_help_ctx(&self) -> HelpCtx {
+        self.scroller.get_help_ctx()
+    }
+    fn descendant_global_bounds(&self, id: ViewId, acc: Point) -> Option<Rect> {
+        self.scroller.descendant_global_bounds(id, acc)
+    }
+    fn set_indicator_value(&mut self, location: Point, modified: bool) {
+        self.scroller.set_indicator_value(location, modified)
+    }
+    fn apply_page_sync(&mut self, idx: usize, ctx: &mut Context) {
+        self.scroller.apply_page_sync(idx, ctx)
     }
 
     fn draw(&mut self, ctx: &mut DrawCtx) {

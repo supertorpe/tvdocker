@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Once;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tv::{Clock, HeadlessBackend, HeadlessHandle, ManualClock, Program};
+use tv::event::Event;
+use tv::{Clock, Command, HeadlessBackend, HeadlessHandle, ManualClock, Program};
 use tvdocker::domain::config::TvdockerConfig;
 use tvdocker::domain::docker::containers::ContainerSummary;
 
@@ -70,6 +71,26 @@ pub fn pump(program: &mut Program, n: usize) {
     for _ in 0..n {
         program.pump_once();
     }
+}
+
+/// Dismiss whatever modal is up, the tvision-rs 0.17 way.
+///
+/// 0.17 changed modal key/command routing: *a modal dialog alone receives keys
+/// and commands*, so `Command::QUIT` is **dropped** while a box is open (the
+/// program-level quit catch does not run). The 0.16 test idiom — pre-queue two
+/// `QUIT`s and let the first close the modal — now spins `run_app` forever.
+/// A modal is closed only by a command it handles: `Dialog` ends the modal on
+/// `OK`/`CANCEL`/`YES`/`NO`, and `CANCEL` is always valid (never vetoed).
+pub fn dismiss_modal(screen: &HeadlessHandle) {
+    screen.push_event(Event::Command(Command::CANCEL));
+}
+
+/// End a `run_program`/`run_program_with` drive: close the modal (if any) with
+/// a command it handles, then send the `QUIT` that ends `run_app`. See
+/// [`dismiss_modal`] for why a lone `QUIT` is not enough on 0.17.
+pub fn close_modal_and_quit(screen: &HeadlessHandle) {
+    dismiss_modal(screen);
+    screen.push_event(Event::Command(Command::QUIT));
 }
 
 /// A running container row with no ports — the seed most harnesses use.

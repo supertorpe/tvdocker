@@ -1,10 +1,7 @@
 //! Tail-following log viewport with hard memory caps .
 use std::collections::VecDeque;
 use tv::event::{Event, Key, MouseWheel};
-use tv::{
-    Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, View, ViewId, ViewState,
-    delegate,
-};
+use tv::{Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, View, ViewId, delegate};
 
 /// Max stored bytes per line (/ deviation #3); longer lines are
 /// cut on a char boundary and suffixed with `…`.
@@ -102,7 +99,6 @@ fn truncate_to(s: &str, max: usize) -> String {
 /// Tail-following log viewport . Vertical bar id is owned by the
 /// window; the view is inserted and brokers bar events (ListViewer pattern).
 pub struct LogView {
-    st: ViewState,
     scroller: Scroller,
     lines: VecDeque<String>,
     capacity: usize,
@@ -116,16 +112,15 @@ impl LogView {
     pub const DEFAULT_CAPACITY: usize = 10_000;
 
     pub fn new(bounds: Rect, v_bar: Option<ViewId>) -> Self {
-        let mut st = ViewState::new(bounds);
+        let mut scroller = Scroller::new(bounds, None, v_bar);
         // Interactive: `Options::default()` is selectable:false (decorative).
-        st.options = Options {
+        scroller.state_mut().options = Options {
             selectable: true,
             first_click: true,
             ..Options::default()
         };
         Self {
-            st,
-            scroller: Scroller::new(bounds, None, v_bar),
+            scroller,
             lines: VecDeque::new(),
             capacity: Self::DEFAULT_CAPACITY,
             follow: true,
@@ -183,7 +178,7 @@ impl LogView {
     }
 
     fn visible(&self) -> usize {
-        self.st.size.y.max(0) as usize
+        self.scroller.state().size.y.max(0) as usize
     }
 
     /// Publish the limit; when following, jump to the tail .
@@ -210,17 +205,10 @@ impl LogView {
 
 #[delegate(to = scroller)]
 impl View for LogView {
-    fn state(&self) -> &ViewState {
-        &self.st
-    }
-    fn state_mut(&mut self) -> &mut ViewState {
-        &mut self.st
-    }
-
     fn draw(&mut self, ctx: &mut DrawCtx) {
         let normal = ctx.style(Role::ScrollerNormal);
-        ctx.fill(self.st.get_extent(), ' ', normal);
-        let w = self.st.size.x.max(0) as usize;
+        ctx.fill(self.scroller.state().get_extent(), ' ', normal);
+        let w = self.scroller.state().size.x.max(0) as usize;
         let vis = self.visible();
         let off = self.scroller.delta.y.max(0) as usize;
         let selected = ctx.style(Role::ScrollerSelected);
@@ -253,12 +241,12 @@ impl View for LogView {
         if let Event::Broadcast { command, source } = &*ev {
             let own = source.is_some() && *source == self.v_bar;
             if own && *command == Command::SCROLL_BAR_CLICKED {
-                if let Some(id) = self.st.id() {
+                if let Some(id) = self.scroller.state().id() {
                     ctx.request_focus(id);
                 }
             } else if own
                 && *command == Command::SCROLL_BAR_CHANGED
-                && let Some(id) = self.st.id()
+                && let Some(id) = self.scroller.state().id()
             {
                 ctx.request_scroll_sync(id, None, self.v_bar);
             }
@@ -314,7 +302,6 @@ impl View for LogView {
     }
 
     fn change_bounds(&mut self, bounds: Rect) {
-        self.st.set_bounds(bounds);
         self.scroller.change_bounds(bounds);
     }
 

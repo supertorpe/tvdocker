@@ -3,7 +3,7 @@
 //! the window-owned Del confirm — through the real pump.
 mod common;
 
-use common::{container, pump, screen_text};
+use common::{close_modal_and_quit, container, pump, screen_text};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::Command;
@@ -30,11 +30,6 @@ fn start() -> (Program, HeadlessHandle, Rc<RefCell<AppCore>>, TaskRx) {
             .apply(AppMsg::Containers(vec![container("id-a", "webalpha")]));
     });
     (h.program, h.screen, h.core, h.task_rx)
-}
-
-fn quit_twice(screen: &HeadlessHandle) {
-    screen.push_event(Event::Command(Command::QUIT));
-    screen.push_event(Event::Command(Command::QUIT));
 }
 
 fn right_click(screen: &HeadlessHandle, x: i32, y: i32) {
@@ -123,7 +118,7 @@ fn explorer_del_confirm_queues_the_task_only_on_yes() {
     }
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_event(Event::Command(Command::YES));
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     assert!(
         matches!(task_rx.try_recv(), Ok(TaskReq::ExplorerDelete { ref paths, .. })
@@ -167,7 +162,7 @@ fn explorer_opens_with_the_host_table_focused() {
     pump(&mut program, 2);
     screen.push_key(Key::Enter, KeyModifiers::default());
     pump(&mut program, 2);
-    quit_twice(&screen);
+    close_modal_and_quit(&screen);
     app::run_program(program, None);
     let expected = format!("{}/sub", home.trim_end_matches('/'));
     assert!(
