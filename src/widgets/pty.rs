@@ -1,8 +1,11 @@
 //! VT100/ANSI helpers and views for the embedded shell window .
 use std::cell::RefCell;
 use std::rc::Rc;
-use tv::event::{Event, Key, KeyModifiers};
-use tv::{Command, Context, DrawCtx, Options, Rect, Role, View, ViewState};
+use tv::event::{Event, Key, KeyModifiers, MouseWheel};
+use tv::{
+    Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, StateFlag, View, ViewId,
+    ViewState,
+};
 
 /// F1–F12 → byte sequences (application/CSI as terminals expect).
 fn fkey_sequence(n: u8) -> Option<&'static [u8]> {
@@ -66,13 +69,13 @@ pub fn key_to_ansi(key: Key, mods: KeyModifiers) -> Option<Vec<u8>> {
 }
 
 /// Current screen contents as rows (draw path).
+///
+/// One entry PER GRID ROW — not `contents().lines()`, which merges a wrapped
+/// row into its continuation and would shift every line below it. The draw path
+/// relies on the 1:1 row↔line mapping to place the scrollback viewport.
 pub fn screen_lines(parser: &vt100::Parser) -> Vec<String> {
-    parser
-        .screen()
-        .contents()
-        .lines()
-        .map(str::to_string)
-        .collect()
+    let (rows, cols) = parser.screen().size();
+    parser.screen().rows(0, cols).take(rows as usize).collect()
 }
 
 /// Scrollback lines kept per shell session ("scrollback capped").
@@ -373,10 +376,11 @@ mod tests {
 #[cfg(test)]
 mod view_tests {
     use super::*;
-    use crate::testutil::{render_view, text};
+    use crate::testutil::{render_view, send_event, send_key_mods, text};
     use std::cell::RefCell;
     use std::rc::Rc;
     use tv::Rect;
+    use tv::event::MouseEvent;
 
     fn state_with(rows: u16, cols: u16, cursor_seq: &[u8]) -> Rc<RefCell<PtyState>> {
         let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -393,6 +397,41 @@ mod view_tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (resize_tx, _resize_rx) = tokio::sync::watch::channel((80u16, 24u16));
         PtyView::new(bounds, state, input_tx, resize_tx)
+    }
+
+    /// 20 lines on a 5-row screen: most of them end up in the scrollback.
+    fn scrolled_state() -> Rc<RefCell<PtyState>> {
+        let state = state_with(5, 20, b"");
+        {
+            let mut s = state.borrow_mut();
+            for i in 1..=20 {
+                s.parser.process(format!("line {i}\r\n").as_bytes());
+            }
+        }
+        state
+    }
+
+    fn shift() -> KeyModifiers {
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        }
+    }
+
+    /// The Bridge's "state changed" broadcast — the only Context the view has
+    /// outside key delivery.
+    fn refresh() -> Event {
+        Event::Broadcast {
+            command: crate::bridge::REFRESH,
+            source: None,
+        }
+    }
+
+    fn wheel(dir: MouseWheel) -> Event {
+        Event::MouseWheel(MouseEvent {
+            wheel: dir,
+            ..Default::default()
+        })
     }
 
     #[test]
@@ -449,6 +488,175 @@ mod view_tests {
         );
         assert!(!out.contains("[attached]"), "phase takes priority");
     }
+
+    #[test]
+    fn scrollback_depth_counts_what_scrolled_off_and_keeps_the_live_offset() {
+        let state = scrolled_state();
+        let mut s = state.borrow_mut();
+        let depth = s.scrollback_depth();
+        assert!(
+            depth >= 16,
+            "20 lines on a 5-row screen leave most of them off-screen: {depth}"
+        );
+        assert_eq!(
+            s.parser.screen().scrollback(),
+            0,
+            "the probe must restore the live offset"
+        );
+    }
+
+    #[test]
+    fn pty_view_scrolls_into_history_and_returns_to_the_live_screen() {
+        let state = scrolled_state();
+        let mut v = pty_view(Rect::new(0, 0, 20, 5), Rc::clone(&state));
+        let live = text(&render_view(20, 5, &mut v));
+        assert!(
+            live.contains("line 20"),
+            "live screen shows the newest line: {live:?}"
+        );
+
+        // The bar range is only reachable from an event — draw has no Context.
+        send_event(&mut v, refresh());
+        let depth = state.borrow_mut().scrollback_depth() as i32;
+        assert_eq!(
+            v.scroller.limit().y,
+            depth + 5,
+            "range = scrollback + rows on screen"
+        );
+
+        send_key_mods(&mut v, Key::Home, shift());
+        let top = text(&render_view(20, 5, &mut v));
+        assert!(top.contains("line 1"), "top of the scrollback: {top:?}");
+        assert!(
+            !top.contains("line 20"),
+            "the live screen scrolled away: {top:?}"
+        );
+        assert!(
+            !v.state().state.cursor_vis,
+            "no live cursor while parked in history"
+        );
+
+        send_key_mods(&mut v, Key::End, shift());
+        let back = text(&render_view(20, 5, &mut v));
+        assert!(
+            back.contains("line 20"),
+            "back on the live screen: {back:?}"
+        );
+        assert!(
+            v.state().state.cursor_vis,
+            "the cursor returns with the live screen"
+        );
+    }
+
+    #[test]
+    fn wheel_scrolls_the_scrollback_without_touching_the_shell() {
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, _resize_rx) = tokio::sync::watch::channel((80u16, 24u16));
+        let mut v = PtyView::new(
+            Rect::new(0, 0, 20, 5),
+            scrolled_state(),
+            input_tx,
+            resize_tx,
+        );
+        send_event(&mut v, refresh());
+        let before = v.scroller.delta.y;
+        assert!(before > 3, "there is history to scroll into: {before}");
+
+        send_event(&mut v, wheel(MouseWheel::Up));
+        assert_eq!(v.scroller.delta.y, before - 3, "wheel up = 3 lines");
+        assert!(!v.follow, "wheeling up un-follows the live screen");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the wheel is ours, not shell input"
+        );
+    }
+
+    #[test]
+    fn bare_navigation_keys_stay_shell_input_while_shift_scrolls() {
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, _resize_rx) = tokio::sync::watch::channel((80u16, 24u16));
+        let mut v = PtyView::new(
+            Rect::new(0, 0, 20, 5),
+            scrolled_state(),
+            input_tx,
+            resize_tx,
+        );
+
+        // Bare ↑ / PageUp belong to the shell (command history, less, …).
+        send_key_mods(&mut v, Key::Up, KeyModifiers::default());
+        assert_eq!(
+            input_rx.try_recv().expect("bare ↑ is shell input"),
+            b"\x1b[A".to_vec()
+        );
+        send_key_mods(&mut v, Key::PageUp, KeyModifiers::default());
+        assert_eq!(
+            input_rx.try_recv().expect("bare PageUp is shell input"),
+            b"\x1b[5~".to_vec()
+        );
+
+        // Shift+↑ scrolls the history instead and never reaches the shell.
+        send_event(&mut v, refresh());
+        let before = v.scroller.delta.y;
+        send_key_mods(&mut v, Key::Up, shift());
+        assert!(
+            v.scroller.delta.y < before,
+            "shift+↑ scrolls up: {} < {before}",
+            v.scroller.delta.y
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "shift+↑ is ours, not shell input"
+        );
+    }
+
+    #[test]
+    fn typing_while_scrolled_up_returns_to_the_live_screen() {
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, _resize_rx) = tokio::sync::watch::channel((80u16, 24u16));
+        let mut v = PtyView::new(
+            Rect::new(0, 0, 20, 5),
+            scrolled_state(),
+            input_tx,
+            resize_tx,
+        );
+        send_event(&mut v, refresh());
+
+        // Park in history.
+        send_key_mods(&mut v, Key::Home, shift());
+        assert!(!v.follow, "parked in history");
+        let out = text(&render_view(20, 5, &mut v));
+        assert!(!out.contains("line 20"), "history on screen: {out:?}");
+
+        // A keystroke pulls the viewport back to the live screen …
+        send_key_mods(&mut v, Key::Char('l'), KeyModifiers::default());
+        assert!(v.follow, "typing re-arms following");
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("the key still reaches the shell"),
+            b"l".to_vec()
+        );
+        let out = text(&render_view(20, 5, &mut v));
+        assert!(
+            out.contains("line 20"),
+            "live screen visible again: {out:?}"
+        );
+
+        // … and so does a paste.
+        send_key_mods(&mut v, Key::Home, shift());
+        assert!(!v.follow, "parked again");
+        send_event(&mut v, Event::Paste("ls\n".into()));
+        assert!(v.follow, "paste re-arms following");
+        assert_eq!(
+            input_rx.try_recv().expect("the paste reaches the shell"),
+            b"ls\n".to_vec()
+        );
+        let out = text(&render_view(20, 5, &mut v));
+        assert!(
+            out.contains("line 20"),
+            "live screen after the paste: {out:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +690,21 @@ impl PtyState {
             PtyMsg::Note(t) => self.note = t,
             PtyMsg::Phase(p) => self.phase = p,
         }
+    }
+
+    /// Lines that have scrolled off the top of the live screen .
+    ///
+    /// vt100 0.16 keeps the scrollback length private: the only door to it is
+    /// `set_scrollback`'s documented clamp ("the value … is clamped to the
+    /// actual size of the scrollback"). Probe with an over-large request, read
+    /// the clamped offset back, then restore the live position.
+    pub fn scrollback_depth(&mut self) -> usize {
+        let screen = self.parser.screen_mut();
+        let live = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let depth = screen.scrollback();
+        screen.set_scrollback(live);
+        depth
     }
 }
 
@@ -536,11 +759,23 @@ impl View for StatusView {
 
 /// The shell body: draws the vt100 grid + cursor, forwards keys to the exec
 /// stdin, and closes the window on the first key after exit .
+///
+/// The scrollback is exposed through a right-edge [`Scroller`]: Shift+↑↓ /
+/// PgUp / PgDn / Home / End, the mouse wheel and the bar drive it — the BARE
+/// navigation keys stay ANSI input (the shell needs ↑↓, PageUp, Home…).
+/// Typing or pasting while parked in history snaps back to the live screen.
 pub struct PtyView {
     st: ViewState,
     state: Rc<RefCell<PtyState>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
+    scroller: Scroller,
+    /// Viewport pinned to the live bottom. Cleared by any scroll-up; re-armed
+    /// by Shift+End, by reaching the end, or by the bar landing there.
+    follow: bool,
+    /// A bounds change must republish the bar range, but `change_bounds` has
+    /// no `Context` — flag it and publish from the next event (Table's C1).
+    limit_dirty: bool,
 }
 
 impl PtyView {
@@ -562,7 +797,84 @@ impl PtyView {
             state,
             input_tx,
             resize_tx,
+            scroller: Scroller::new(bounds, None, None),
+            follow: true,
+            limit_dirty: false,
         }
+    }
+
+    /// Link the window's right-edge scroll bar. The id only exists once the
+    /// layout inserted the bar, so the shell builder calls this right after
+    /// `new` — before insertion, hence the dirty flag instead of a
+    /// `set_limit`, which would need a `Context`.
+    pub fn set_v_scroll_bar(&mut self, v_bar: Option<ViewId>) {
+        self.scroller = Scroller::new(self.st.get_bounds(), None, v_bar);
+        self.limit_dirty = true;
+    }
+
+    /// Rows on screen in this view.
+    fn visible(&self) -> i32 {
+        self.st.size.y.max(0)
+    }
+
+    /// The scrollable buffer: everything scrolled off plus the rows on screen.
+    fn content_lines(&self) -> i32 {
+        self.state.borrow_mut().scrollback_depth() as i32 + self.visible()
+    }
+
+    /// Republish the range to the bar and the position to the viewport. Needs
+    /// a `Context`, so it runs from events (REFRESH / keys / resize) — never
+    /// from `draw`.
+    fn sync(&mut self, ctx: &mut Context) {
+        let total = self.content_lines();
+        self.scroller.set_limit(0, total, ctx);
+        let want = if self.follow {
+            (total - self.visible()).max(0)
+        } else {
+            self.scroller.delta.y
+        };
+        self.set_offset(want, ctx);
+        self.limit_dirty = false;
+    }
+
+    /// Move the viewport to an absolute first-line index (clamped) and push
+    /// the new position to the bar. Landing on the last page re-arms `follow`.
+    fn set_offset(&mut self, want: i32, ctx: &mut Context) {
+        let max = (self.scroller.limit().y - self.visible()).max(0);
+        let want = want.clamp(0, max);
+        self.follow = want >= max;
+        self.scroller.apply_delta(Point::new(0, want));
+        self.scroller.scroll_to(0, want, ctx);
+    }
+
+    /// Scroll by `delta` lines (negative = up).
+    fn scroll_by(&mut self, delta: i32, ctx: &mut Context) {
+        self.set_offset(self.scroller.delta.y.saturating_add(delta), ctx);
+    }
+
+    /// Typing while scrolled up snaps back to the live screen — the input and
+    /// its echo must stay visible, like in any other terminal. A no-op when
+    /// already following (so a plain keystroke costs nothing).
+    fn resume(&mut self, ctx: &mut Context) {
+        if !self.follow {
+            self.set_offset(i32::MAX, ctx);
+        }
+    }
+
+    /// Shift + navigation → viewport movement. Returns whether the key was a
+    /// scroll key, so the caller consumes it instead of typing it into the
+    /// shell.
+    fn scroll_key(&mut self, key: Key, ctx: &mut Context) -> bool {
+        match key {
+            Key::Up => self.scroll_by(-1, ctx),
+            Key::Down => self.scroll_by(1, ctx),
+            Key::PageUp => self.scroll_by(-self.visible().max(1), ctx),
+            Key::PageDown => self.scroll_by(self.visible().max(1), ctx),
+            Key::Home => self.set_offset(0, ctx),
+            Key::End => self.set_offset(i32::MAX, ctx),
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -592,30 +904,86 @@ impl View for PtyView {
             state.parser.screen_mut().set_size(dims.1, dims.0);
             let _ = self.resize_tx.send(dims);
         }
+        // The scroller addresses the buffer from the TOP (index of the first
+        // visible line); vt100 wants how far the window sits above the LIVE
+        // bottom: offset = depth - delta. Following is delta at the end, i.e.
+        // the live screen.
+        let depth = state.scrollback_depth() as i32;
+        let delta = if self.follow {
+            depth
+        } else {
+            self.scroller.delta.y.clamp(0, depth)
+        };
+        state
+            .parser
+            .screen_mut()
+            .set_scrollback((depth - delta) as usize);
+        self.scroller.apply_delta(Point::new(0, delta));
+        let live = delta == depth;
+        // vt100 windows the viewport for us — `contents()` already reflects
+        // the offset set above, so draw what it returns, row for row.
         for (i, line) in screen_lines(&state.parser)
             .iter()
-            .enumerate()
             .take(h as usize)
+            .enumerate()
         {
-            ctx.put_str(0, i as i32, line, style);
+            ctx.put_str(0, i as i32, line.as_str(), style);
         }
         // Hardware cursor : clamped to THIS view — the parser grid
         // can be stale relative to a just-shrunk window (round-2 bug 2).
+        // Scrolled into history there is no live row to blink on.
         let (row, col, hidden) = cursor_info(state.parser.screen());
         let clamped_col = col.min(dims.0.saturating_sub(1));
         let clamped_row = row.min(dims.1.saturating_sub(1));
         self.st
             .set_cursor(i32::from(clamped_col), i32::from(clamped_row));
-        self.st.state.cursor_vis = !hidden;
+        self.st.state.cursor_vis = !hidden && live;
+    }
+
+    /// Own flags must track focus — the hardware cursor is only placed for a
+    /// focused view with `cursor_vis` — so the embedded Scroller cannot take
+    /// this wholesale. It gets every flag EXCEPT `Focused`: forwarding that one
+    /// would make an uninserted scroller broadcast the focus pair with no
+    /// source. It is the half that shows/hides the bar (Scroller::set_state).
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.st.set_flag(flag, enable);
+        if flag != StateFlag::Focused {
+            self.scroller.set_state(flag, enable, ctx);
+        }
     }
 
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
+        // A resize left the bar range stale; publish before anything reads it.
+        if self.limit_dirty {
+            self.sync(ctx);
+        }
+        // Bar ↔ content: the embedded Scroller has no ViewId, so this
+        // inserted composite brokers the sync (ListViewer pattern). Broadcasts
+        // reach every sibling — consume NONE of them.
+        if let Event::Broadcast { command, source } = *ev {
+            let v_bar = self.scroller.v_scroll_bar();
+            let own = source.is_some() && source == v_bar;
+            if own && command == Command::SCROLL_BAR_CLICKED {
+                if let Some(id) = self.st.id() {
+                    ctx.request_focus(id);
+                }
+            } else if own && command == Command::SCROLL_BAR_CHANGED {
+                if let Some(id) = self.st.id() {
+                    ctx.request_scroll_sync(id, None, v_bar);
+                }
+            } else if command == crate::bridge::REFRESH {
+                // The Bridge just drained PTY bytes into `PtyState`: the
+                // scrollback grew, so republish the range — a `Context` lives
+                // here, and `draw` has none.
+                self.sync(ctx);
+            }
+            return;
+        }
         let exited = self.state.borrow().phase.is_finished();
         match ev {
             Event::KeyDown(ke) => {
                 let (key, mods) = (ke.key, ke.modifiers);
                 if exited {
-                    // closes on next keypress after exit.
                     ctx.post(Command::CLOSE);
                     ev.clear();
                     return;
@@ -623,7 +991,16 @@ impl View for PtyView {
                 // NOTE: no F10 guard — the status-line pre-route already
                 // turned F10/F1/F3/F5/F6 into commands before dispatch
                 // they never arrive as KeyDown.
+                // Shift + navigation scrolls the scrollback; the bare keys
+                // stay ANSI input (the shell needs ↑↓, PageUp, Home…).
+                if mods.shift && self.scroll_key(key, ctx) {
+                    ev.clear();
+                    return;
+                }
                 if let Some(bytes) = key_to_ansi(key, mods) {
+                    // Writing while parked in history pulls the viewport back
+                    // to the live screen first (resume, above).
+                    self.resume(ctx);
                     let _ = self.input_tx.send(bytes);
                     ev.clear();
                 }
@@ -635,13 +1012,48 @@ impl View for PtyView {
                     ev.clear();
                     return;
                 }
+                self.resume(ctx);
                 let _ = self.input_tx.send(bytes);
                 ev.clear();
+            }
+            Event::MouseWheel(m) => {
+                let delta = match m.wheel {
+                    MouseWheel::Up => -3,
+                    MouseWheel::Down => 3,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    self.scroll_by(delta, ctx);
+                    ev.clear();
+                }
             }
             // Event::Command and friends fall through to the window
             // (F3 close, F5 zoom, … keep working while the shell runs).
             _ => {}
         }
+    }
+
+    /// Bar drag → viewport. The bar's own value is NOT written back (the pump
+    /// already owns it; echoing it would re-arm the broker).
+    fn apply_scroll_sync(&mut self, _h: Option<i32>, v: Option<i32>, _ctx: &mut Context) {
+        let Some(v) = v else {
+            return;
+        };
+        let max = (self.scroller.limit().y - self.visible()).max(0);
+        let want = v.clamp(0, max);
+        self.follow = want >= max;
+        self.scroller.apply_delta(Point::new(0, want));
+    }
+
+    fn change_bounds(&mut self, bounds: Rect) {
+        self.st.set_bounds(bounds);
+        self.scroller.change_bounds(bounds);
+        self.limit_dirty = true;
+    }
+
+    fn on_bounds_changed(&mut self, ctx: &mut Context) {
+        self.scroller.on_bounds_changed(ctx);
+        self.sync(ctx);
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
