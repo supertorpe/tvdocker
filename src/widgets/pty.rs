@@ -773,9 +773,6 @@ pub struct PtyView {
     /// Viewport pinned to the live bottom. Cleared by any scroll-up; re-armed
     /// by Shift+End, by reaching the end, or by the bar landing there.
     follow: bool,
-    /// A bounds change must republish the bar range, but `change_bounds` has
-    /// no `Context` — flag it and publish from the next event (Table's C1).
-    limit_dirty: bool,
 }
 
 impl PtyView {
@@ -799,17 +796,15 @@ impl PtyView {
             resize_tx,
             scroller: Scroller::new(bounds, None, None),
             follow: true,
-            limit_dirty: false,
         }
     }
 
     /// Link the window's right-edge scroll bar. The id only exists once the
     /// layout inserted the bar, so the shell builder calls this right after
-    /// `new` — before insertion, hence the dirty flag instead of a
-    /// `set_limit`, which would need a `Context`.
+    /// `new` — before insertion; the range is published from the next event
+    /// (or from `on_bounds_changed`), where a `Context` is available.
     pub fn set_v_scroll_bar(&mut self, v_bar: Option<ViewId>) {
         self.scroller = Scroller::new(self.st.get_bounds(), None, v_bar);
-        self.limit_dirty = true;
     }
 
     /// Rows on screen in this view.
@@ -834,7 +829,6 @@ impl PtyView {
             self.scroller.delta.y
         };
         self.set_offset(want, ctx);
-        self.limit_dirty = false;
     }
 
     /// Move the viewport to an absolute first-line index (clamped) and push
@@ -953,10 +947,6 @@ impl View for PtyView {
     }
 
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
-        // A resize left the bar range stale; publish before anything reads it.
-        if self.limit_dirty {
-            self.sync(ctx);
-        }
         // Bar ↔ content: the embedded Scroller has no ViewId, so this
         // inserted composite brokers the sync (ListViewer pattern). Broadcasts
         // reach every sibling — consume NONE of them.
@@ -1048,7 +1038,6 @@ impl View for PtyView {
     fn change_bounds(&mut self, bounds: Rect) {
         self.st.set_bounds(bounds);
         self.scroller.change_bounds(bounds);
-        self.limit_dirty = true;
     }
 
     fn on_bounds_changed(&mut self, ctx: &mut Context) {
