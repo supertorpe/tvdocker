@@ -21,10 +21,19 @@ pub struct Node {
     pub entry: Option<Entry>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Tree {
     nodes: Vec<Node>,
     root: NodeId,
+}
+
+// Hand-written because the derived `Default` would build an empty arena
+// (`nodes: []`, `root: 0`) that violates the "0 is always the root"
+// invariant and panics on first use.
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tree {
@@ -110,6 +119,11 @@ impl Tree {
 
     /// Detach the node at `path` and its whole subtree. `false` when absent
     /// (idempotent — whiteouts may repeat).
+    ///
+    /// The detached nodes stay in the arena, so a stale `NodeId` still
+    /// resolves through `node()`/`path_of()` and returns plausible
+    /// pre-removal data instead of failing. Ids do NOT stay live across
+    /// removals: re-resolve paths with `get()` instead of holding ids.
     pub fn remove_path(&mut self, path: &str) -> bool {
         let Some(id) = self.get(path) else {
             return false;
@@ -134,6 +148,9 @@ impl Tree {
         false
     }
 
+    /// A node by id. Ids do not stay live across `remove_path`: a detached
+    /// node still resolves and returns stale pre-removal data, so re-resolve
+    /// with `get()` rather than holding ids across removals.
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id]
     }
@@ -259,6 +276,28 @@ mod tests {
         assert!(t.get("/etc/passwd").is_none());
         assert!(t.get("/etc/shadow").is_some());
         assert!(!t.remove_path("/etc/passwd"), "idempotent");
+    }
+
+    #[test]
+    fn remove_path_unlinks_the_newest_child_from_the_parent_head() {
+        let mut t = Tree::new();
+        t.add_path(file("/etc/passwd"));
+        t.add_path(file("/etc/shadow"));
+        let etc = t.get("/etc").unwrap();
+        let shadow = t.get("/etc/shadow").unwrap();
+        assert_eq!(
+            t.children(etc).first(),
+            Some(&shadow),
+            "newest child is first_child"
+        );
+        assert!(t.remove_path("/etc/shadow"));
+        assert!(t.get("/etc/shadow").is_none());
+        assert!(t.get("/etc/passwd").is_some());
+        assert_eq!(
+            t.children(etc),
+            vec![t.get("/etc/passwd").unwrap()],
+            "the parent's first_child chain is still walkable"
+        );
     }
 
     #[test]
