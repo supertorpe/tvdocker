@@ -653,6 +653,8 @@ impl View for ResourceWindow {
                 Some(crate::app::CMD_VOLUME_EXPLORER)
             } else if *cmd == crate::app::CMD_REQ_IMAGE_EXPLORER {
                 Some(crate::app::CMD_IMAGE_EXPLORER)
+            } else if *cmd == crate::app::CMD_REQ_IMAGE_LAYERS {
+                Some(crate::app::CMD_LAYERS)
             } else if *cmd == crate::app::CMD_REQ_SHELL {
                 Some(crate::app::CMD_SHELL_CONFIG)
             } else if *cmd == crate::app::CMD_REQ_DIAGNOSTICS {
@@ -705,6 +707,7 @@ impl View for ResourceWindow {
                         | crate::app::CMD_REQ_VOLUME_EXPLORER
                         | crate::app::CMD_REQ_DIAGNOSTICS
                         | crate::app::CMD_REQ_IMAGE_EXPLORER
+                        | crate::app::CMD_REQ_IMAGE_LAYERS
                 ) {
                     self.open_target()
                 } else {
@@ -1218,6 +1221,44 @@ mod tests {
         assert!(
             out.iter()
                 .any(|e| matches!(e, Event::Command(c) if *c == crate::app::CMD_IMAGE_EXPLORER)),
+            "the desktop's command was re-posted"
+        );
+    }
+
+    /// The Layers request mints the cursor row and re-posts the desktop's
+    /// opener command (the image-explorer two-hop, repeated).
+    #[test]
+    fn two_hop_image_layers_mints_the_cursor_row_and_posts_the_opener() {
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut().apply(AppMsg::Images(vec![
+            crate::domain::docker::images::ImageEntry {
+                id: "sha256:abc".into(),
+                repository: "alpine".into(),
+                tag: "latest".into(),
+                size: 1_000,
+            },
+        ]));
+        let mut w = crate::views::images::build(
+            Rc::clone(&core),
+            Rect::new(2, 1, 78, 23),
+            Rc::new(RefCell::new(true)),
+        );
+        let mut out = std::collections::VecDeque::new();
+        let mut timers = tv::TimerQueue::new();
+        let mut deferred: Vec<tv::Deferred> = Vec::new();
+        {
+            let mut ctx = Context::new(&mut out, &mut timers, 0, &mut deferred);
+            let mut ev = Event::Command(crate::app::CMD_REQ_IMAGE_LAYERS);
+            w.handle_event(&mut ev, &mut ctx);
+        }
+        assert_eq!(
+            core.borrow().pending_targets,
+            vec!["sha256:abc".to_string()],
+            "one cursor-row target"
+        );
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, Event::Command(c) if *c == crate::app::CMD_LAYERS)),
             "the desktop's command was re-posted"
         );
     }

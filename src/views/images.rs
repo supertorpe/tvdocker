@@ -64,6 +64,7 @@ pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
 pub fn context_menu(_core: &AppCore, _id: &str) -> Vec<(String, tv::Command)> {
     vec![
         ("~E~xplorer".to_string(), crate::app::CMD_REQ_IMAGE_EXPLORER),
+        ("~L~ayers…".to_string(), crate::app::CMD_REQ_IMAGE_LAYERS),
         ("~R~un…".to_string(), crate::app::CMD_REQ_RUN),
         ("~x~Remove".to_string(), crate::app::CMD_REQ_DELETE),
         (
@@ -126,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_binds_run_remove_dangling_and_prune() {
+    fn context_menu_binds_layers_run_remove_dangling_and_prune() {
         let core = crate::core::AppCore::new();
         let items = context_menu(&core, "sha256:aaa");
         let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
@@ -134,6 +135,7 @@ mod tests {
             labels,
             vec![
                 "~E~xplorer",
+                "~L~ayers…",
                 "~R~un…",
                 "~x~Remove",
                 "remove ~d~angling",
@@ -142,10 +144,11 @@ mod tests {
             "hot letters are unique within the menu "
         );
         assert_eq!(items[0].1, crate::app::CMD_REQ_IMAGE_EXPLORER);
-        assert_eq!(items[1].1, crate::app::CMD_REQ_RUN);
-        assert_eq!(items[2].1, crate::app::CMD_REQ_DELETE);
-        assert_eq!(items[3].1, crate::app::CMD_REQ_DANGLING);
-        assert_eq!(items[4].1, crate::app::CMD_REQ_PRUNE);
+        assert_eq!(items[1].1, crate::app::CMD_REQ_IMAGE_LAYERS);
+        assert_eq!(items[2].1, crate::app::CMD_REQ_RUN);
+        assert_eq!(items[3].1, crate::app::CMD_REQ_DELETE);
+        assert_eq!(items[4].1, crate::app::CMD_REQ_DANGLING);
+        assert_eq!(items[5].1, crate::app::CMD_REQ_PRUNE);
     }
 
     /// The Explorer entry exists and is the only `e`/`E` hotspot.

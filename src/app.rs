@@ -74,6 +74,10 @@ pub const CMD_VOLUME_EXPLORER: Command = Command::custom("tvdocker.volume_explor
 /// opener (hop 2).
 pub const CMD_REQ_IMAGE_EXPLORER: Command = Command::custom("tvdocker.req_image_explorer");
 pub const CMD_IMAGE_EXPLORER: Command = Command::custom("tvdocker.image_explorer");
+/// Layers from the Images window (image-layer explorer): `CMD_REQ_*` is
+/// the context-menu request (hop 1); `CMD_LAYERS` is the desktop's opener.
+pub const CMD_REQ_IMAGE_LAYERS: Command = Command::custom("tvdocker.req_image_layers");
+pub const CMD_LAYERS: Command = Command::custom("tvdocker.layers");
 /// Diagnostics: `CMD_REQ_*` is the context-menu request that
 /// rides the two-hop layer; `CMD_DIAGNOSTICS` is the desktop's opener.
 pub const CMD_REQ_DIAGNOSTICS: Command = Command::custom("tvdocker.req_diagnostics");
@@ -145,7 +149,7 @@ pub const SHORTCUTS_TEXT: &str = "\
     Containers: F2 Logs · F4 Shell · Ctrl+E Explorer ·\n\
     Enter Details · Del Delete (confirm);\n\
     F7 pauses log follow.\n\n\
-    Images: F2 Run · Ctrl+E Explorer · Del Remove ·\n\
+    Images: F2 Run · Ctrl+E Explorer · Ctrl+L Layers · Del Remove ·\n\
     menu: dangling/prune.\n\n\
     Networks: Del Delete.\n\
     Volumes: Enter Explorer · Del Delete.\n\
@@ -329,6 +333,16 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                         },
                     ),
                     CMD_REQ_IMAGE_EXPLORER,
+                )
+                .key_item(
+                    KeyEvent::new(
+                        Key::Char('l'),
+                        KeyModifiers {
+                            ctrl: true,
+                            ..KeyModifiers::default()
+                        },
+                    ),
+                    CMD_REQ_IMAGE_LAYERS,
                 )
                 .key_item(
                     KeyEvent::new(
@@ -1019,6 +1033,25 @@ mod tests {
         );
     }
 
+    /// `Ctrl+L` is the keyboard-only Layers route, bound in Images the way
+    /// `Ctrl+E` is bound there for the Explorer.
+    #[test]
+    fn ctrl_l_opens_the_layers_window_from_images() {
+        use crate::views::images;
+        let ctrl_l = Event::KeyDown(KeyEvent::new(
+            Key::Char('l'),
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            },
+        ));
+        assert_eq!(
+            transform(images::HELP_CTX, ctrl_l),
+            Event::Command(CMD_REQ_IMAGE_LAYERS),
+            "Ctrl+L in Images"
+        );
+    }
+
     /// The F1 box documents what the STATUS BAR cannot: hidden chords and
     /// window-local keys. It must not repeat the always-visible bar — that
     /// text is already on screen, and dropping it frees the room for chords
@@ -1028,6 +1061,10 @@ mod tests {
         assert!(
             SHORTCUTS_TEXT.contains("Ctrl+E Explorer"),
             "the keyboard-only explorer route is documented: {SHORTCUTS_TEXT}"
+        );
+        assert!(
+            SHORTCUTS_TEXT.contains("Ctrl+L Layers"),
+            "the keyboard-only layers route is documented: {SHORTCUTS_TEXT}"
         );
         for visible in [
             "F1 Help",

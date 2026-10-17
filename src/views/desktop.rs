@@ -68,6 +68,8 @@ pub struct TvdockerDesktop {
     slots: [Slot; 6],
     /// Explorer windows keyed by container id / volume name.
     explorer_slots: HashMap<String, Slot>,
+    /// Image-layer windows, keyed `"lay:<image id>"`.
+    layers_slots: HashMap<String, Slot>,
     /// Next cascade step (resource windows "open cascaded over
     /// the desktop").
     cascade: Cell<usize>,
@@ -401,6 +403,57 @@ impl TvdockerDesktop {
             .explorer_slots
             .entry(slot_key)
             .or_insert_with(Slot::new);
+        Self::record(slot, vid);
+    }
+
+    /// The image-layer window: keyed `lay:<image id>`, so a second invoke
+    /// focuses the existing window (the Explorer's slot discipline).
+    fn open_layers(&mut self, ctx: &mut Context) {
+        let Some(image_id) = self.core.borrow_mut().take_pending().into_iter().next() else {
+            return;
+        };
+        let slot_key = format!("lay:{image_id}");
+        if let Some(vid) = Self::open_id(
+            self.layers_slots
+                .entry(slot_key.clone())
+                .or_insert_with(Slot::new),
+        ) {
+            ctx.request_focus(vid);
+            return;
+        }
+        let bounds = self.next_bounds();
+        let open = Rc::clone(
+            &self
+                .layers_slots
+                .entry(slot_key.clone())
+                .or_insert_with(Slot::new)
+                .open,
+        );
+        let label = self
+            .core
+            .borrow()
+            .images
+            .iter()
+            .find(|i| i.id == image_id)
+            .map(|i| {
+                if i.repository.is_empty() {
+                    format!("{}…", &i.id[..12.min(i.id.len())])
+                } else {
+                    format!("{}:{}", i.repository, i.tag)
+                }
+            })
+            .unwrap_or_else(|| image_id.clone());
+        let mut win = crate::views::layers::build(
+            Rc::clone(&self.core),
+            bounds,
+            image_id,
+            label,
+            open,
+            self.task_tx.clone(),
+        );
+        win.request_initial_focus(ctx);
+        let vid = self.desktop.insert_and_focus(Box::new(win), ctx);
+        let slot = self.layers_slots.entry(slot_key).or_insert_with(Slot::new);
         Self::record(slot, vid);
     }
 
@@ -781,6 +834,11 @@ impl View for TvdockerDesktop {
                 ev.clear();
                 return;
             }
+            if *cmd == crate::app::CMD_LAYERS {
+                self.open_layers(ctx);
+                ev.clear();
+                return;
+            }
             if *cmd == crate::app::CMD_SETTINGS {
                 self.open_settings(ctx);
                 ev.clear();
@@ -896,6 +954,7 @@ pub fn containers_desktop(
         slots: std::array::from_fn(|_| Slot::new()),
         cascade: Cell::new(0),
         explorer_slots: HashMap::new(),
+        layers_slots: HashMap::new(),
         filter: filter.map(str::to_string),
         actions,
         task_tx,
