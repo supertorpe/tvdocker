@@ -7,6 +7,7 @@ pub mod dialogs;
 pub mod events;
 pub mod explorer;
 pub mod images;
+pub mod layers;
 pub mod logs;
 pub mod networks;
 pub mod resource;
