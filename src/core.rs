@@ -138,6 +138,9 @@ pub enum TaskReq {
     /// Stop the image helper when its window closes (image-explorer;
     /// HOST-MUTATING).
     RemoveImageHelper { image: String },
+    /// Analyze one image's layers (image-layer explorer). `key` is the
+    /// image id; the response is keyed by it.
+    AnalyzeImageLayers { key: String, image: String },
     /// Fresh-tail log session for one container. The
     /// flag was created UI-side and already sits in the core buffer;
     /// the worker exits when it flips.

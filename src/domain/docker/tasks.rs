@@ -237,6 +237,38 @@ pub fn spawn_task_worker(
                         let _ = super::explorer::remove_image_helper(&docker, &image).await;
                     }
                 }
+                TaskReq::AnalyzeImageLayers { key, image } => {
+                    // Progress rides the bounded app channel fire-and-forget:
+                    // a full channel drops the tick (the next one supersedes
+                    // it) — [`poller::offer`]'s documented contract.
+                    let ptx = app_tx.clone();
+                    let pkey = key.clone();
+                    let outcome = super::layers::fetch(&image, move |bytes| {
+                        let _ = super::poller::offer(
+                            &ptx,
+                            AppMsg::LayerProgress {
+                                key: pkey.clone(),
+                                bytes,
+                            },
+                        );
+                    })
+                    .await;
+                    match outcome {
+                        Ok(analysis) => {
+                            let _ = app_tx
+                                .send(AppMsg::ImageLayers {
+                                    key,
+                                    analysis: Box::new(analysis),
+                                })
+                                .await;
+                        }
+                        Err(err) => {
+                            let _ = app_tx
+                                .send(AppMsg::TaskError(format!("layers {image}: {err}")))
+                                .await;
+                        }
+                    }
+                }
             }
         }
     });
@@ -748,6 +780,25 @@ mod tests {
         assert!(
             matches!(msg, AppMsg::TaskError(_)),
             "§10: background errors are messages, not modals: {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_layer_request_with_no_docker_latches_a_task_error() {
+        let (_app_tx, mut app_rx, _action_tx, _action_rx, task_tx) = worker();
+        task_tx
+            .send(TaskReq::AnalyzeImageLayers {
+                key: "sha256:aaa".into(),
+                image: "sha256:aaa".into(),
+            })
+            .expect("worker alive");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), app_rx.recv())
+            .await
+            .expect("worker answered")
+            .expect("channel open");
+        assert!(
+            matches!(msg, AppMsg::TaskError(_)),
+            "§10: a background failure is a message, not a modal: {msg:?}"
         );
     }
 
