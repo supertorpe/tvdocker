@@ -4,11 +4,14 @@
 //! This module is PURE — no `bollard`, no `tokio`, no views — so every rule
 //! is unit-testable against synthesised archives. See the design spec
 //! §5 for the ported dive semantics.
+pub mod archive;
 pub mod tree;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek};
 
+pub use archive::parse;
 pub use tree::{Node, NodeId, Tree};
 
 /// What a node's content is, relative to the comparison base.
@@ -96,6 +99,11 @@ pub struct Analysis {
     pub wasted_bytes: u64,
     /// Ascending by `wasted`.
     pub inefficient: Vec<InefficientPath>,
+}
+
+/// Parse a `docker save` archive into ordered layers (design §5.3).
+pub fn analyze(reader: impl Read + Seek) -> anyhow::Result<LayerSet> {
+    archive::parse(reader)
 }
 
 /// The content hash every layer entry is keyed by (`DefaultHasher`, design
