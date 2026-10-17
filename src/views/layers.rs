@@ -4,7 +4,7 @@
 //! `RowModel`s, a `Drop`-cleared reopen flag) but is a separate window —
 //! the container-based Image Explorer is untouched.
 use crate::core::{AppCore, TaskReq};
-use crate::domain::layers::Analysis;
+use crate::domain::layers::{Analysis, Compare, Comparer, DiffType, Tree};
 use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
 use crate::widgets::{Align, Column, FilterBar, SharedLine};
 use std::cell::RefCell;
@@ -50,8 +50,11 @@ fn layers_rects(size: tv::Point) -> LayersRects {
     let right = (size.x - 1).max(1); // exclusive client right (frame = size.x-1)
     let bottom = (size.y - 1).max(1); // exclusive client bottom (frame = size.y-1)
     let mid = (size.x / 2).clamp(1, right); // the layer/tree split column
-    let first_table = 4.min(bottom);
-    let details_y = (bottom - 2).max(first_table);
+    let first_table = 3.min(bottom); // filters end at row 3 — no blank line (the explorer's formula)
+    // `bottom - 3`: the strip needs its header AND two path rows (the
+    // design's "list of inefficient paths"); `bottom - 2` left room for a
+    // single path, clipping every entry past the first at any window size.
+    let details_y = (bottom - 3).max(first_table);
     let last_table = details_y.min(bottom);
     LayersRects {
         summary: Rect::new(1, 1, right, 2.min(bottom)),
@@ -74,9 +77,9 @@ struct LayersRects {
     inefficient: Rect,
 }
 
-/// The Layers window: the layer table on the left, the (still empty until
-/// the tree task) change-tree and inefficient-paths tables, two filter
-/// bars, and a summary line with the efficiency score.
+/// The Layers window: the layer table on the left, the colour-coded
+/// change tree on the right, the inefficient-paths strip at the bottom,
+/// two filter bars, and a summary line with the efficiency score.
 pub struct LayersWindow {
     win: Window,
     core: Rc<RefCell<AppCore>>,
@@ -93,6 +96,11 @@ pub struct LayersWindow {
     summary: Rc<RefCell<String>>,
     /// The selected layer index (the left table's focused row).
     selected: usize,
+    /// Which comparison the change tree shows (rule 5).
+    mode: Compare,
+    comparer: Comparer,
+    /// The flattened rows of the change tree, in DFS order.
+    tree_rows: Vec<TreeRow>,
     /// The cached analysis (`None` = still loading). Like the Explorer's
     /// `Panel::entries`, the window holds the data and only pushes it into
     /// the tables where it has a `Context` (the `redraw_texts` pattern).
@@ -134,6 +142,92 @@ fn layer_rows(analysis: &Analysis, selected: usize) -> Vec<TableRow> {
                     l.command.clone(),
                 ],
             )
+        })
+        .collect()
+}
+
+/// One row of the change tree (the flatten result, kept so the key
+/// handlers in Task 10 can re-filter without re-walking the tree).
+#[derive(Clone, Debug)]
+pub struct TreeRow {
+    pub path: String,
+    pub diff: DiffType,
+    pub is_dir: bool,
+    pub depth: usize,
+}
+
+/// The DFS flatten the window renders (depth for indentation, `is_dir` for
+/// the expand/collapse keys added in Task 10).
+pub fn flatten(tree: &Tree) -> Vec<TreeRow> {
+    tree.dfs()
+        .into_iter()
+        .filter(|id| *id != tree.root())
+        .map(|id| {
+            let node = tree.node(id);
+            let path = tree.path_of(id);
+            let depth = path.matches('/').count().saturating_sub(1);
+            TreeRow {
+                path,
+                diff: node.diff,
+                is_dir: tree.is_dir(id),
+                depth,
+            }
+        })
+        .collect()
+}
+
+/// Dive's change letters, tinted by the theme roles (design §7): the
+/// upstream `Role` is a closed enum, so Added/Removed/Modified map onto
+/// Success/Error/Warning. The row role replaces only the normal colour —
+/// focus and selection still win.
+pub fn role_for(diff: DiffType) -> Option<Role> {
+    match diff {
+        DiffType::Added => Some(Role::Success),
+        DiffType::Removed => Some(Role::Error),
+        DiffType::Modified => Some(Role::Warning),
+        DiffType::Unmodified => None,
+    }
+}
+
+/// The change letter shown in the tree's CHANGE column.
+fn letter_for(diff: DiffType) -> char {
+    match diff {
+        DiffType::Added => '+',
+        DiffType::Removed => '-',
+        DiffType::Modified => '~',
+        DiffType::Unmodified => ' ',
+    }
+}
+
+/// `TreeRow`s as `TableRow`s: an indent-by-depth name, the change letter,
+/// the size and the mode, tinted by [`role_for`]. Size and mode come from
+/// `tree` — the comparison tree the rows were flattened from, not the
+/// selected layer's tar — and `compare` back-fills a `Removed` node with
+/// its `Entry`, so a removed row still shows what it used to be.
+pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree) -> Vec<TableRow> {
+    rows.iter()
+        .map(|r| {
+            let entry = tree.get(&r.path).and_then(|id| tree.node(id).entry.clone());
+            let size = entry
+                .as_ref()
+                .map(|e| crate::views::resource::format_size(e.size as i64))
+                .unwrap_or_default();
+            let mode = entry
+                .as_ref()
+                .map(|e| format!("{:o}", e.mode))
+                .unwrap_or_default();
+            let indent = " ".repeat(r.depth.saturating_sub(1));
+            let name = r.path.rsplit('/').next().unwrap_or(&r.path).to_string();
+            TableRow::new(
+                r.path.clone(),
+                vec![
+                    format!("{indent}{name}"),
+                    letter_for(r.diff).to_string(),
+                    size,
+                    mode,
+                ],
+            )
+            .with_opt_role(role_for(r.diff))
         })
         .collect()
 }
@@ -210,6 +304,9 @@ pub fn build(
         summary_id,
         summary,
         selected: 0,
+        mode: Compare::Single,
+        comparer: Comparer::new(),
+        tree_rows: Vec::new(),
         analysis: None,
         last_rev: None,
     };
@@ -282,15 +379,53 @@ impl LayersWindow {
         }
     }
 
-    /// Push the cached analysis into the tables (needs a `Context`, so it
-    /// runs from `handle_event` — the `redraw_texts` pattern).
+    /// Push the cached analysis into the three tables (needs a `Context`, so
+    /// it runs from `handle_event` — the `redraw_texts` pattern).
     fn redraw(&mut self, ctx: &mut Context) {
-        let Some(analysis) = &self.analysis else {
+        // Nothing renderable — still loading, a re-analysis wiped the slot,
+        // or a degenerate zero-layer analysis (`Comparer::tree` slices
+        // `layers[0..=selected]`). Clear the tables — the explorer's
+        // clear-then-repush — so stale rows cannot outlive the summary's
+        // "Analyzing" line (Task 8 review carry C).
+        let Some(a) = self.analysis.clone().filter(|a| !a.layers.is_empty()) else {
+            self.tree_rows.clear();
+            for id in [self.layer_table, self.tree_table, self.inefficient_table] {
+                if let Some(t) = self.table_mut(id) {
+                    t.set_model(Box::new(RowModel::new(Vec::new())), ctx);
+                }
+            }
             return;
         };
-        let rows = layer_rows(analysis, self.selected);
-        let table_id = self.layer_table;
-        if let Some(t) = self.table_mut(table_id) {
+        let rows = layer_rows(&a, self.selected);
+        if let Some(t) = self.table_mut(self.layer_table) {
+            t.set_model(Box::new(RowModel::new(rows)), ctx);
+        }
+        // `Comparer::tree` borrows self mutably, so flatten into a local
+        // before touching the table.
+        let tree = self
+            .comparer
+            .tree(&a.layers, self.mode, self.selected)
+            .clone();
+        self.tree_rows = flatten(&tree);
+        let rows = tree_rows_for(&self.tree_rows, &tree);
+        if let Some(t) = self.table_mut(self.tree_table) {
+            t.set_model(Box::new(RowModel::new(rows)), ctx);
+        }
+        if let Some(t) = self.table_mut(self.inefficient_table) {
+            let rows: Vec<TableRow> = a
+                .inefficient
+                .iter()
+                .map(|p| {
+                    TableRow::new(
+                        p.path.clone(),
+                        vec![
+                            p.count.to_string(),
+                            crate::views::resource::format_size(p.wasted as i64),
+                            p.path.clone(),
+                        ],
+                    )
+                })
+                .collect();
             t.set_model(Box::new(RowModel::new(rows)), ctx);
         }
     }

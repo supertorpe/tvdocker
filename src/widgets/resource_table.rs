@@ -70,6 +70,13 @@ impl TableRow {
         self.role = Some(role);
         self
     }
+
+    /// Builder: tint the row only when `role` is `Some` (the change tree
+    /// maps `DiffType` to roles, `None` meaning "no tint").
+    pub fn with_opt_role(mut self, role: Option<Role>) -> Self {
+        self.role = role;
+        self
+    }
 }
 
 /// `TableRow`s as an upstream [`TableModel`], with an optional per-(col,row)
