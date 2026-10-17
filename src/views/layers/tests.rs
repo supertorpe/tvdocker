@@ -419,6 +419,56 @@ fn the_a_key_hides_added_rows() {
     assert!(win.visible_rows().iter().any(|r| r.path == "/etc/new"));
 }
 
+/// The primary interaction: the layer table's cursor OWNS `selected`, so
+/// arrowing to another layer rebuilds the comparison tree for it in the
+/// SAME event. (Task 9's tests assigned `selected` directly, which is
+/// exactly how the missing wiring stayed hidden.)
+#[test]
+fn selecting_a_different_layer_rebuilds_the_tree_for_that_layer() {
+    let mut win = window_with(three_layer_analysis());
+    // `selected` starts on layer 0: a layer compared against itself marks
+    // nothing — no added rows.
+    assert_eq!(win.selected, 0);
+    assert!(!win.tree_rows.iter().any(|r| r.path == "/etc/new"));
+    // Focus the layer table the way the pump does (the explorer test's
+    // pattern: mark the group focused, settle its currency, descend),
+    // then arrow down onto row 1.
+    crate::testutil::with_ctx(|ctx| {
+        win.win.state_mut().state.focused = true;
+        win.win.settle_currency(ctx);
+        win.win.focus_descendant(win.layer_table, ctx);
+    });
+    testutil::send_key(&mut win, Key::Down);
+    // ONE event: the cursor moved → `selected` followed → the tree
+    // rebuilt for layer 1's changes.
+    assert_eq!(win.selected, 1, "the layer cursor drives `selected`");
+    let diffs: Vec<(&str, DiffType)> = win
+        .tree_rows
+        .iter()
+        .map(|r| (r.path.as_str(), r.diff))
+        .collect();
+    assert!(
+        diffs.contains(&("/etc/new", DiffType::Added)),
+        "layer 1's tree: {diffs:?}"
+    );
+    assert!(
+        diffs.contains(&("/etc/hosts", DiffType::Modified)),
+        "layer 1's tree: {diffs:?}"
+    );
+    // The `▏` marker followed (redraw re-rendered the layer rows).
+    {
+        let table = win.table_mut(win.layer_table).expect("layer table");
+        let model = table.model();
+        assert_eq!(&*model.cell(1, 0), "▏", "marker on layer 1");
+        assert_eq!(&*model.cell(0, 0), " ", "…and off layer 0");
+    }
+    // It keeps moving: a second Down lands on layer 2 — which also proves
+    // `set_model` kept the cursor on its RowKey across the rebuild (a
+    // reset cursor would move 0→1 and never reach 2).
+    testutil::send_key(&mut win, Key::Down);
+    assert_eq!(win.selected, 2, "the cursor was not fought back to 0");
+}
+
 /// The path filter bar must actually narrow the tree (spec §7): typed
 /// through the real key path, one event per keystroke — no second event
 /// may be needed for the sink the `FilterBar` just wrote to reach the
@@ -427,6 +477,13 @@ fn the_a_key_hides_added_rows() {
 fn the_path_filter_bar_narrows_the_tree_as_you_type() {
     let mut win = window_with(three_layer_analysis());
     win.selected = 1;
+    // Park the layer table's cursor on the SAME row: `handle_event` syncs
+    // `selected` FROM that cursor, so a bare `selected = 1` would be
+    // snapped back to row 0 by the first keystroke.
+    crate::testutil::with_ctx(|ctx| {
+        let t = win.table_mut(win.layer_table).expect("layer table");
+        t.set_focused_key(&tv::widgets::RowKey("L1".to_string()), ctx);
+    });
     sync_and_draw(&mut win);
     // The pump does this before children can report `focused` (the
     // explorer test's pattern): mark the group focused, settle its

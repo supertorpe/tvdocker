@@ -529,6 +529,14 @@ impl LayersWindow {
         self.table_mut(self.tree_table)?.focused_key().map(|k| k.0)
     }
 
+    /// The layer index of the layer table's focused row — keyed on the row id
+    /// (`"L{n}"`), so it survives both column sorting and the fuzzy layer
+    /// filter. `None` while the table has no cursor (an empty model).
+    fn focused_layer(&mut self) -> Option<usize> {
+        let key = self.table_mut(self.layer_table)?.focused_key()?.0; // e.g. "L2"
+        key.strip_prefix('L')?.parse().ok()
+    }
+
     /// Is `id` (or one of its descendants) the focused view? (The
     /// Explorer's `is_focused`; `child_mut` because focus lives on the
     /// child's own state.)
@@ -721,16 +729,29 @@ impl View for LayersWindow {
     }
 
     /// Every event: run the window's own keys, map a fresh analysis,
-    /// delegate to the children, then push the cached rows into the
-    /// tables (the Explorer's `sync_from_core` + `redraw_texts`, in the
-    /// ResourceWindow's delegate-then-refilter ORDER): the redraw runs
-    /// LAST, so a keystroke a focused `FilterBar` turns into sink text is
-    /// reflected in the model of the SAME event.
+    /// delegate to the children, hand the layer cursor to `selected`, then
+    /// push the cached rows into the tables (the Explorer's
+    /// `sync_from_core` + `redraw_texts`, in the ResourceWindow's
+    /// delegate-then-refilter ORDER): the redraw runs LAST, so a keystroke
+    /// a focused `FilterBar` turns into sink text — and a cursor move the
+    /// delegation made — are reflected in the model of the SAME event.
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         let before = self.win.state().size;
         self.window_keys(ev, ctx);
         self.sync_from_core();
         self.win.handle_event(ev, ctx);
+        // The layer table's cursor owns `selected` (arrow keys and clicks
+        // both land here through the delegation above), keyed by row id so
+        // sorting and the layer filter don't shift it. Bounded by the
+        // current analysis; the `sync_from_core` clamp stays the floor for
+        // a shrunk layer list. Then the redraw below rebuilds the tree for
+        // that layer.
+        if let Some(i) = self.focused_layer()
+            && i != self.selected
+            && i < self.analysis.as_ref().map_or(0, |a| a.layers.len())
+        {
+            self.selected = i;
+        }
         // Zoom / fullscreen re-bound the inner window's group directly,
         // bypassing this window's `change_bounds` (the Explorer's
         // reconcile): keep the child rects following the new client area.
