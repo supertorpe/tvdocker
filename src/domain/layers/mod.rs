@@ -5,6 +5,7 @@
 //! is unit-testable against synthesised archives. See the design spec
 //! §5 for the ported dive semantics.
 pub mod archive;
+pub mod diff;
 pub mod tree;
 
 use std::collections::hash_map::DefaultHasher;
@@ -12,6 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek};
 
 pub use archive::parse;
+pub use diff::{Compare, Comparer, compare, stack};
 pub use tree::{Node, NodeId, Tree};
 
 /// What a node's content is, relative to the comparison base.
