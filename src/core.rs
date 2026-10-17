@@ -216,6 +216,18 @@ pub enum AppMsg {
         path: String,
         entries: Vec<crate::domain::docker::explorer::ExplorerEntry>,
     },
+    /// One image's finished layer analysis, keyed by image id (boxed: a
+    /// `Layer` carries a whole `Tree`, so a bare enum would trip
+    /// `large_enum_variant`).
+    ImageLayers {
+        key: String,
+        analysis: Box<crate::domain::layers::Analysis>,
+    },
+    /// Bytes of the `docker save` stream so far, keyed by image id.
+    LayerProgress {
+        key: String,
+        bytes: u64,
+    },
     /// A background task failed (§10: never a modal).
     TaskError(String),
     /// A diagnostics run's phase change.
@@ -355,6 +367,12 @@ pub struct AppCore {
     /// Last Explorer listing per window+side, keyed `"{key}:{'h'|'r'}"`;
     /// the window applies only path-matching entries.
     pub explorer: HashMap<String, ExplorerListing>,
+    /// Finished (or in-flight) analyses by image id; `None` = loading.
+    pub image_layers: HashMap<String, Option<crate::domain::layers::Analysis>>,
+    /// `docker save` byte progress by image id (absent = no run).
+    pub layers_progress: HashMap<String, u64>,
+    /// Bumped per layer message — the Layers window diffs on it.
+    pub layers_rev: u64,
 }
 
 impl AppCore {
@@ -380,6 +398,9 @@ impl AppCore {
             pending_targets: Vec::new(),
             pending_kind: PendingKind::default(),
             explorer: HashMap::new(),
+            image_layers: HashMap::new(),
+            layers_progress: HashMap::new(),
+            layers_rev: 0,
         }
     }
 
@@ -531,6 +552,17 @@ impl AppCore {
                 slot.rev += 1;
                 self.revision += 1;
             }
+            AppMsg::ImageLayers { key, analysis } => {
+                self.image_layers.insert(key.clone(), Some(*analysis));
+                self.layers_progress.remove(&key);
+                self.layers_rev += 1;
+                self.revision += 1;
+            }
+            AppMsg::LayerProgress { key, bytes } => {
+                self.layers_progress.insert(key, bytes);
+                self.layers_rev += 1;
+                self.revision += 1;
+            }
             AppMsg::TaskError(msg) => {
                 self.last_error = Some(msg);
                 self.revision += 1;
@@ -680,6 +712,45 @@ mod tests {
         assert_eq!(host.rev, 2);
         assert_eq!(host.path, "/home/u/sub");
         assert_eq!(host.entries.len(), 1);
+    }
+
+    #[test]
+    fn image_layers_are_cached_by_key_and_clear_the_progress() {
+        use crate::domain::layers::Analysis;
+        let mut core = AppCore::new();
+        core.apply(AppMsg::LayerProgress {
+            key: "sha256:aaa".into(),
+            bytes: 4096,
+        });
+        assert_eq!(core.layers_rev, 1);
+        let rev = core.revision;
+        core.apply(AppMsg::ImageLayers {
+            key: "sha256:aaa".into(),
+            analysis: Box::new(Analysis::default()),
+        });
+        assert!(core.image_layers["sha256:aaa"].is_some());
+        assert!(
+            !core.layers_progress.contains_key("sha256:aaa"),
+            "the byte counter goes away once the result lands"
+        );
+        assert_eq!(core.layers_rev, 2);
+        assert!(core.revision > rev, "the REFRESH broadcast fires");
+    }
+
+    #[test]
+    fn a_layer_progress_message_does_not_overwrite_a_finished_analysis() {
+        use crate::domain::layers::Analysis;
+        let mut core = AppCore::new();
+        core.apply(AppMsg::ImageLayers {
+            key: "sha256:aaa".into(),
+            analysis: Box::new(Analysis::default()),
+        });
+        core.apply(AppMsg::LayerProgress {
+            key: "sha256:aaa".into(),
+            bytes: 1,
+        });
+        assert!(core.image_layers["sha256:aaa"].is_some());
+        assert_eq!(core.layers_progress["sha256:aaa"], 1);
     }
 
     #[test]

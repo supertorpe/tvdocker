@@ -64,7 +64,7 @@ impl Entry {
 }
 
 /// One layer: a history command plus its filesystem tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     /// Position in the archive (0 = base layer).
     pub index: usize,
@@ -98,7 +98,7 @@ pub struct InefficientPath {
 }
 
 /// The finished analysis the window renders.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Analysis {
     pub layers: Vec<Layer>,
     /// `min_seen_sum / total_seen_sum`, 0.0..=1.0 (1.0 when undefined).

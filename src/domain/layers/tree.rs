@@ -6,7 +6,7 @@ use super::{DiffType, Entry, Kind};
 /// Index into `Tree::nodes`. `0` is always the root.
 pub type NodeId = usize;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
@@ -21,7 +21,7 @@ pub struct Node {
     pub entry: Option<Entry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tree {
     nodes: Vec<Node>,
     root: NodeId,
