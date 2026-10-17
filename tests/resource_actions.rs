@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Action flows through the real pump:
 //! right-click targeting, delete confirmation, the shell round trip,
-//! the column picker, F2 → Logs.
+//! the run form, F2 → Logs.
 //!
 //! **Modal tests drive `app::run_program`, not bare `pump_once`.** tvision-rs
 //! answers a view's `request_message_box`/`request_exec_view` by stashing the
@@ -9,8 +9,10 @@
 //! `pump_and_drive` (run under `run_app`) executes — `pump_once` leaves it
 //! pending forever, so the box would never appear. The pattern is
 //! `tests/chrome.rs::f1_help_documents_the_table_sort_keys`: pre-queue every
-//! key, end with two `QUIT`s (one closes the modal, one ends `run_app`), then
-//! assert. An open modal *swallows* its keys, which is what proves it existed.
+//! key, close the box with a command it handles, then end the drive with
+//! [`common::close_modal_and_quit`] (`0.17`: a modal alone receives keys and
+//! commands, so a bare `QUIT` is *dropped* while a box is up). An open modal
+//! swallows its keys, which is what proves it existed.
 mod common;
 
 use common::{SharedClock, close_modal_and_quit, container_state, pump, screen_text};

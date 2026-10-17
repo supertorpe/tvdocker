@@ -62,8 +62,9 @@ fn start() -> (
 }
 
 /// Open Help → Check for updates… (Alt-H, then the `C` hot letter),
-/// queue `answer` for the Yes/No box plus two QUITs, then drive the
-/// real entry point with an injected check (no network).
+/// queue `answer` for the Yes/No box, then drive the real entry point with
+/// an injected check (no network) and end it with
+/// [`common::close_modal_and_quit`].
 fn drive_check(
     program: Program,
     screen: &HeadlessHandle,

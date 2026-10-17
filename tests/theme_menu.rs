@@ -10,9 +10,9 @@
 //!
 //! 1. **`exec_view_with` runs under `run_app`'s private `pump_and_drive`** —
 //!    `pump_once` leaves `Program::pending_modal` pending forever. So the
-//!    picker's keys are queued only after staging, and the drive ends with
-//!    QUITs (a QUIT landing on a still-open modal is discarded by exec's
-//!    end_state save/restore, so two are queued).
+//!    picker's keys are queued only after staging, and the drive ends with a
+//!    command the picker handles (`OK`) followed by a `QUIT` that ends
+//!    `run_app` (`0.17`: a bare `QUIT` is *dropped* while a box is up).
 //! 2. **`app_commands` is drained ONLY by `run_app`** (`program.rs:919`), so
 //!    the menu activation may be staged with plain `pump_once` calls and the
 //!    command simply waits there. The modal then opens at the END of
