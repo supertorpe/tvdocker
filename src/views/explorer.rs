@@ -2,15 +2,27 @@
 //! container/volume right, both panels `Table`s over the vendored
 //! explorer domain. The window owns a task-worker sender (the
 //! StartShell precedent) and applies only path-matching listings.
+//!
+//! Since the tvision-rs 0.17 migration both panels are upstream
+//! [`tv::widgets::Table`]s built over a
+//! [`RowModel`](crate::widgets::resource_table::RowModel). Keyboard and
+//! mouse routing follow the FOCUS (which table holds the focused child)
+//! instead of a window-owned `active_remote` flag, the inactive panel dims
+//! automatically (the upstream body draws `Role::ListInactive`), and the
+//! double-click is the framework's (`m.flags.double_click`, synthesized by
+//! the pump) rather than a window-counted timer.
 
 use crate::core::{AppCore, ExplorerTarget, TaskReq};
+use crate::domain::config::{ColumnLayoutCfg, TvdockerConfig};
 use crate::domain::docker::explorer::ExplorerEntry;
-use crate::widgets::{Align, Column, FilterBar, SharedLine, Table, TableRow};
+use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
+use crate::widgets::{Align, Column, FilterBar, SharedLine};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
+use tv::widgets::{SelectionMode, SortDir, Table};
 use tv::{Command, Context, DrawCtx, Rect, Role, View, ViewState, Window, delegate};
 
 /// Help context while an Explorer window is focused .
@@ -19,14 +31,11 @@ pub const HELP_CTX: tv::HelpCtx = tv::HelpCtx::custom("tvdocker.explorer");
 /// Window-menu number for Explorer (7/8/9 = Details/Logs/Shell).
 pub const WINDOW_NUMBER: i16 = 10;
 
-/// Two left clicks on the same row within this many milliseconds count as a
-/// double-click (a click that opens the row).
-///
-/// The window counts clicks itself: tvision-rs 0.16's crossterm backend
-/// builds every `MouseDown` with `..Default::default()`, so
-/// `MouseEventFlags::double_click` is never set to `true` anywhere in the
-/// dependency — a handler keyed on that flag can never fire.
-const DOUBLE_CLICK_MS: u64 = 500;
+/// The persisted column-layout key for the host panel's table
+/// (`[column_layouts.explorer.host]`).
+const HOST_TABLE_KEY: &str = "explorer.host";
+/// The persisted column-layout key for the remote (container/volume) panel.
+const REMOTE_TABLE_KEY: &str = "explorer.remote";
 
 /// The explorer window's self-commands (keys post them; so do its menus
 /// and modals). The window handles them itself — no desktop hop.
@@ -156,9 +165,26 @@ fn rows_for(entries: &[ExplorerEntry], show_parent: bool) -> Vec<TableRow> {
     rows
 }
 
+/// Build one panel's upstream `Table`: a multi-select table over `rows`, its
+/// group marked selectable (so the window's focus pass treats it as a stop),
+/// with the persisted per-panel column layout restored when configured.
+fn make_table(rect: Rect, table_key: &str, rows: Vec<TableRow>) -> Table {
+    let specs = columns().iter().map(to_spec).collect();
+    let mut table = Table::new(rect, specs, None)
+        .with_selection_mode(SelectionMode::Multi)
+        .with_model(Box::new(RowModel::new(rows)));
+    // The upstream `Table` is a `Group`: mark it selectable so focus can
+    // land on it (its body is the selectable leaf inside).
+    table.state_mut().options.selectable = true;
+    if let Some(cfg) = TvdockerConfig::load().0.column_layout(table_key).cloned() {
+        table.set_column_layout(&cfg.to_states());
+    }
+    table
+}
+
 /// The Explorer window: two `Table` panels over the host fs and the
 /// container/volume, a shared hint row, and a task-worker sender for
-/// list/copy/delete/create/rename requests (Tasks 9-10).
+/// list/copy/delete/create/rename requests.
 pub struct ExplorerWindow {
     win: Window,
     core: Rc<RefCell<AppCore>>,
@@ -168,11 +194,6 @@ pub struct ExplorerWindow {
     open: Rc<RefCell<bool>>,
     host: Panel,
     remote: Panel,
-    /// Which side the printable keys / `/` / Del act on.
-    active_remote: bool,
-    /// The last left click — `(panel_is_remote, row, at_ms)` — for
-    /// double-click detection (see [`DOUBLE_CLICK_MS`]).
-    last_click: Option<(bool, usize, u64)>,
     /// The breadcrumb path for each side (one tiny child view per column)
     /// + the hint text: all redrawn by those children.
     breadcrumb_host: Rc<RefCell<String>>,
@@ -204,8 +225,32 @@ impl ExplorerWindow {
         std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
     }
 
-    fn active(&self) -> &Panel {
-        if self.active_remote {
+    /// The panel's table id (`remote` selects the container/volume side).
+    fn panel_table(&self, remote: bool) -> tv::ViewId {
+        if remote {
+            self.remote.table
+        } else {
+            self.host.table
+        }
+    }
+
+    /// Is child `id` the focused one? (tvision-rs has no `is_focused`, so
+    /// this reads the delegated `focused` flag.)
+    fn is_focused(&mut self, id: tv::ViewId) -> bool {
+        self.win
+            .child_mut(id)
+            .is_some_and(|v| v.state().state.focused)
+    }
+
+    /// Which side receives the keys: the REMOTE panel is active when its
+    /// table (not the host's) holds the focus. The inactive panel dims
+    /// automatically (the upstream body draws `Role::ListInactive`).
+    fn active_remote(&mut self) -> bool {
+        self.is_focused(self.remote.table)
+    }
+
+    fn active(&mut self) -> &Panel {
+        if self.active_remote() {
             &self.remote
         } else {
             &self.host
@@ -213,11 +258,19 @@ impl ExplorerWindow {
     }
 
     fn active_mut(&mut self) -> &mut Panel {
-        if self.active_remote {
+        if self.active_remote() {
             &mut self.remote
         } else {
             &mut self.host
         }
+    }
+
+    /// The pane's table, downcast from the window group.
+    fn table_mut(&mut self, id: tv::ViewId) -> Option<&mut Table> {
+        self.win
+            .child_mut(id)
+            .and_then(|v| v.as_any_mut())
+            .and_then(|a| a.downcast_mut::<Table>())
     }
 
     /// Ask the pump to focus the HOST table once this window is wired in.
@@ -276,15 +329,13 @@ impl ExplorerWindow {
         );
         let host_rows = rows_for(&self.host.entries, self.host.show_parent);
         let remote_rows = rows_for(&self.remote.entries, self.remote.show_parent);
-        if let Some(v) = self.win.child_mut(self.host.table)
-            && let Some(t) = v.as_any_mut().and_then(|a| a.downcast_mut::<Table>())
-        {
-            t.set_rows(host_rows, ctx);
+        let host_id = self.host.table;
+        if let Some(t) = self.table_mut(host_id) {
+            t.set_model(Box::new(RowModel::new(host_rows)), ctx);
         }
-        if let Some(v) = self.win.child_mut(self.remote.table)
-            && let Some(t) = v.as_any_mut().and_then(|a| a.downcast_mut::<Table>())
-        {
-            t.set_rows(remote_rows, ctx);
+        let remote_id = self.remote.table;
+        if let Some(t) = self.table_mut(remote_id) {
+            t.set_model(Box::new(RowModel::new(remote_rows)), ctx);
         }
     }
 
@@ -317,6 +368,103 @@ impl ExplorerWindow {
             }
         }
     }
+
+    /// The panel (host/remote) whose table bounds contain window-local `pos`.
+    fn panel_at(&mut self, pos: tv::Point) -> Option<bool> {
+        for remote in [false, true] {
+            let id = self.panel_table(remote);
+            if let Some(v) = self.win.child_mut(id)
+                && v.state().get_bounds().contains(pos)
+            {
+                return Some(remote);
+            }
+        }
+        None
+    }
+
+    /// Focus the panel `remote` and the row under window-local `pos`: the
+    /// table is focused through the window group, then a synthetic left
+    /// press is delivered to the table through a throwaway `Context` so the
+    /// body focuses the clicked row exactly as upstream would. The scratch
+    /// queue, timers and — decisively — the mouse-hold capture the press
+    /// arms are all discarded: a left/right click is not a drag, and leaving
+    /// that hold capture live would swallow the NEXT event (for a bare
+    /// MouseDown, the following key) and, for a right-click, the command the
+    /// context menu posts on release.
+    fn focus_row_at(&mut self, remote: bool, pos: tv::Point, ctx: &mut Context) {
+        let table_id = self.panel_table(remote);
+        self.win.focus_descendant(table_id, ctx);
+        let Some(t) = self.table_mut(table_id) else {
+            return;
+        };
+        let local = pos - t.state().get_bounds().a;
+        let mut out = std::collections::VecDeque::new();
+        let mut timers = tv::TimerQueue::new();
+        let mut deferred: Vec<tv::Deferred> = Vec::new();
+        let mut scratch = Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = Event::MouseDown(tv::MouseEvent {
+            position: local,
+            buttons: tv::event::MouseButtons {
+                left: true,
+                ..tv::event::MouseButtons::default()
+            },
+            ..tv::MouseEvent::default()
+        });
+        t.handle_event(&mut ev, &mut scratch);
+    }
+
+    /// Cycle the sort column on ←/→ (backward walks the other way and lands
+    /// DESCENDING, as the old table did), or flip the direction on
+    /// Shift+←/→. The upstream `Table` only exposes `TABLE_SORT_NEXT`
+    /// (forward, ascending) and `TABLE_SORT_FLIP`, so the window keeps
+    /// tvdocker's documented cycle and drives [`Table::sort_by`] itself.
+    fn cycle_sort(&mut self, remote: bool, forward: bool, flip: bool, ctx: &mut Context) {
+        let id = self.panel_table(remote);
+        let Some(t) = self.table_mut(id) else {
+            return;
+        };
+        let layout = t.column_layout();
+        let n = layout.len();
+        if n == 0 {
+            return;
+        }
+        let mut visible = vec![false; n];
+        for s in &layout {
+            if s.column < n {
+                visible[s.column] = !s.hidden;
+            }
+        }
+        let current = t.sort_spec();
+        let (col, dir) = if flip {
+            match current {
+                Some((c, d)) => (c, d.flip()),
+                None => match (0..n).find(|&i| visible[i]) {
+                    Some(c) => (c, SortDir::Asc),
+                    None => return,
+                },
+            }
+        } else {
+            let step: i64 = if forward { 1 } else { -1 };
+            // No sort yet: start one past the first / last column so the first
+            // step lands ON it.
+            let start = current.map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
+            let mut found = None;
+            let mut probe = start;
+            for _ in 0..n {
+                probe = (probe + step).rem_euclid(n as i64);
+                let i = probe as usize;
+                if visible[i] {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(c) => (c, if forward { SortDir::Asc } else { SortDir::Desc }),
+                None => return,
+            }
+        };
+        t.sort_by(col, dir, ctx);
+    }
 }
 
 /// Build one window. The two initial listings are requested
@@ -342,8 +490,8 @@ pub fn build(
     let hint = Rc::new(RefCell::new(String::new()));
 
     // Row 1: the breadcrumb — one path per column, above its pane (row 0 is
-    // the frame's top border). Row 2: the two filters. Rows 3..h-2: the tables. Row h-2: the hint (row h-1 is the
-    // frame's bottom border).
+    // the frame's top border). Row 2: the two filters. Rows 3..h-2: the
+    // tables. Row h-2: the hint (row h-1 is the frame's bottom border).
     let breadcrumb_host_id = win.insert_child(Box::new(SharedLine::new(
         r.breadcrumb_host,
         Rc::clone(&breadcrumb_host),
@@ -364,16 +512,29 @@ pub fn build(
         Rc::clone(&remote_sink),
         "remote filter (/)",
     )));
-    let host_table = win.insert_child(Box::new(Table::new(r.host_table, columns(), None)));
-    let remote_table = win.insert_child(Box::new(Table::new(r.remote_table, columns(), None)));
+
+    let host_path = ExplorerWindow::host_home();
+    // The initial models: the host's `..` parent row (unless at "/") and no
+    // remote rows. A listing replaces them on the first event.
+    let host_rows = rows_for(&[], host_path != "/");
+    let remote_rows = rows_for(&[], false);
+    let host_table = win.insert_child(Box::new(make_table(
+        r.host_table,
+        HOST_TABLE_KEY,
+        host_rows,
+    )));
+    let remote_table = win.insert_child(Box::new(make_table(
+        r.remote_table,
+        REMOTE_TABLE_KEY,
+        remote_rows,
+    )));
     let hint_id = win.insert_child(Box::new(SharedLine::new(
         r.hint,
         Rc::clone(&hint),
         Role::Info,
     )));
 
-    let host_path = ExplorerWindow::host_home();
-    let mut window = ExplorerWindow {
+    let window = ExplorerWindow {
         win,
         core,
         task_tx,
@@ -396,8 +557,6 @@ pub fn build(
             last_rev: 0,
             show_parent: false,
         },
-        active_remote: false,
-        last_click: None,
         breadcrumb_host,
         breadcrumb_remote,
         hint,
@@ -424,8 +583,6 @@ pub fn build(
         target,
         path: "/".to_string(),
     });
-    // The host side is active at open: only its table draws a cursor row.
-    window.sync_panel_active();
     window
 }
 
@@ -445,53 +602,67 @@ impl View for ExplorerWindow {
 
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         self.sync_from_core();
+        // --- The upstream Table arranged its columns (resize / move / show /
+        // hide): persist the new layout for the panel's key. The broadcast
+        // carries the table's own id as `source`.
+        if let Event::Broadcast { command, source } = ev
+            && *command == Command::TABLE_COLUMNS_CHANGED
+            && (*source == Some(self.host.table) || *source == Some(self.remote.table))
+        {
+            let (table_id, table_key) = if *source == Some(self.host.table) {
+                (self.host.table, HOST_TABLE_KEY)
+            } else {
+                (self.remote.table, REMOTE_TABLE_KEY)
+            };
+            let states = self
+                .table_mut(table_id)
+                .map(|t| t.column_layout())
+                .unwrap_or_default();
+            let _ = TvdockerConfig::set_column_layout_in_file(
+                &TvdockerConfig::path(),
+                table_key,
+                &ColumnLayoutCfg::from_states(&states),
+            );
+            ev.clear();
+            return;
+        }
         // --- Tab: exactly two stops (Ruling 3). The window intercepts
         // before the group's default traversal (which would also stop at
         // the selectable FilterBars). tv has no `BackTab` variant —
         // Shift+Tab is `Key::Tab` + shift — and the brief's tests use
-        // plain Tab only.
+        // plain Tab only. Routing follows the FOCUS: a focused filter
+        // escapes back to its own table, otherwise the focus toggles
+        // between the two tables.
         if let Event::KeyDown(ke) = ev
             && ke.key == Key::Tab
         {
-            // A focused filter escapes back to its own table first.
-            let active_filter = if self.active_remote {
-                self.remote.filter
+            let target = if self.is_focused(self.host.filter) {
+                self.host.table
+            } else if self.is_focused(self.remote.filter) {
+                self.remote.table
+            } else if self.is_focused(self.remote.table) {
+                self.host.table
             } else {
-                self.host.filter
+                self.remote.table
             };
-            let filter_focused = self
-                .win
-                .child_mut(active_filter)
-                .is_some_and(|v| v.state().state.focused);
-            let target = if filter_focused {
-                self.active().table
-            } else {
-                self.active_remote = !self.active_remote;
-                self.active().table
-            };
-            self.sync_panel_active();
             self.win.focus_descendant(target, ctx);
             self.redraw_texts(ctx);
             ev.clear();
             return;
         }
         // --- Esc: a focused filter escapes back to its table. When no
-        // filter is focused, Esc falls through to the children (Task 9
-        // adds the window-level Esc chain).
+        // filter is focused, Esc falls through to the children.
         if let Event::KeyDown(ke) = ev
             && ke.key == Key::Esc
         {
-            let filter = if self.active_remote {
-                self.remote.filter
+            let target = if self.is_focused(self.host.filter) {
+                Some(self.host.table)
+            } else if self.is_focused(self.remote.filter) {
+                Some(self.remote.table)
             } else {
-                self.host.filter
+                None
             };
-            let filter_focused = self
-                .win
-                .child_mut(filter)
-                .is_some_and(|v| v.state().state.focused);
-            if filter_focused {
-                let table = self.active().table;
+            if let Some(table) = target {
                 self.win.focus_descendant(table, ctx);
                 ev.clear();
                 return;
@@ -501,7 +672,12 @@ impl View for ExplorerWindow {
         if let Event::KeyDown(ke) = ev
             && matches!(ke.key, Key::Char('/'))
         {
-            let filter = self.active().filter;
+            let remote = self.active_remote();
+            let filter = if remote {
+                self.remote.filter
+            } else {
+                self.host.filter
+            };
             self.win.focus_descendant(filter, ctx);
             ev.clear();
             return;
@@ -521,6 +697,20 @@ impl View for ExplorerWindow {
                     return;
                 }
                 _ => {}
+            }
+        }
+        // --- Sort keys (←/→ cycle the column, Shift flips the direction):
+        // the window owns them because the upstream `Table` command layer
+        // only has forward-ascending and flip. Only when a table body holds
+        // the focus (a filter keeps its own ←/→ caret movement).
+        if let Event::KeyDown(ke) = ev
+            && matches!(ke.key, Key::Left | Key::Right)
+        {
+            let remote = self.active_remote();
+            if self.is_focused(self.panel_table(remote)) {
+                self.cycle_sort(remote, ke.key == Key::Right, ke.modifiers.shift, ctx);
+                ev.clear();
+                return;
             }
         }
         // --- Self-commands (keys/menus/modals post them).
@@ -621,7 +811,8 @@ impl View for ExplorerWindow {
                     return;
                 }
                 (Key::Char('X'), false) | (Key::Char('c'), true) => {
-                    if self.read_only() && !self.active_remote {
+                    let remote = self.active_remote();
+                    if self.read_only() && !remote {
                         ev.clear();
                         return;
                     }
@@ -647,41 +838,43 @@ impl View for ExplorerWindow {
                 _ => {}
             }
         }
-        // --- Mouse: a left click ACTIVATES the panel it lands on (and moves
-        // that panel's cursor); a second click on the SAME row within
-        // `DOUBLE_CLICK_MS` OPENS it — the file-manager convention, and the
-        // same request Enter makes. Right-click opens the context menu (the
-        // ResourceWindow precedent).
-        //
-        // The window counts the clicks itself because tvision-rs 0.16's
-        // crossterm backend never sets `flags.double_click` (it builds every
-        // MouseDown with `..Default::default()`), so that flag can never fire.
+        // --- Mouse: the ROUTING (not a window flag) decides which panel a
+        // click belongs to. A left click on a panel's BODY focuses that panel
+        // and the row under the pointer — delivered through a throwaway
+        // `Context` by [`focus_row_at`], so the mouse-hold capture the body
+        // arms on press is discarded instead of swallowing the NEXT event (a
+        // bare MouseDown in the pump would otherwise hold keys until a
+        // MouseUp that a click-only stream never sends). A press on the
+        // table's HEADER row is the table's own (click-to-sort / resize /
+        // move), so it is forwarded to the group. A DOUBLE-click
+        // (`m.flags.double_click`, synthesized by the pump) OPENS the row —
+        // the file-manager convention, the same request Enter makes.
+        // Right-click opens the context menu (the ResourceWindow precedent).
         if let Event::MouseDown(m) = ev {
             let m = *m;
             if m.buttons.left
-                && let Some((remote, row)) = self.row_at(m.position)
+                && let Some(remote) = self.panel_at(m.position)
             {
-                let now = ctx.now_ms();
-                let double = matches!(
-                    self.last_click,
-                    Some((p, r, at))
-                        if p == remote && r == row && now.saturating_sub(at) <= DOUBLE_CLICK_MS
-                );
-                self.focus_panel_at(remote, row, ctx);
-                if double {
-                    self.last_click = None; // consumed: a triple click must not reopen
-                    self.enter(ctx); // climbs/descends; a no-op on files
-                } else {
-                    self.last_click = Some((remote, row, now));
+                let table_id = self.panel_table(remote);
+                // Table-local y == 0 is the header row; any lower row is body.
+                let on_header = self
+                    .win
+                    .child_mut(table_id)
+                    .is_some_and(|v| v.state().get_bounds().a.y == m.position.y);
+                if !on_header {
+                    self.focus_row_at(remote, m.position, ctx);
+                    if m.flags.double_click {
+                        self.enter(ctx); // climbs/descends; a no-op on files
+                    }
+                    ev.clear();
+                    return;
                 }
-                ev.clear();
-                return;
             }
             if m.buttons.right
                 && !m.buttons.left
-                && let Some((remote, row)) = self.row_at(m.position)
+                && let Some(remote) = self.panel_at(m.position)
             {
-                self.focus_panel_at(remote, row, ctx);
+                self.focus_row_at(remote, m.position, ctx);
                 let items = self.context_menu_items();
                 let mut builder = Menu::builder();
                 for (label, command) in items {
@@ -710,15 +903,13 @@ impl ExplorerWindow {
     /// Enter: on the `..` row climb; on a dir row descend; files are
     /// no-ops (copy is the file action).
     fn enter(&mut self, ctx: &mut Context) {
-        let table_id = self.active().table;
-        let row = self
-            .win
-            .child_mut(table_id)
-            .and_then(|v| v.as_any_mut())
-            .and_then(|a| a.downcast_mut::<Table>())
-            .map(|t| t.cursor());
-        let Some(cursor) = row else { return };
-        let target = if self.active_remote {
+        let remote = self.active_remote();
+        let table_id = self.panel_table(remote);
+        let cursor = self.table_mut(table_id).and_then(|t| t.focused_row());
+        let Some(cursor) = cursor else {
+            return;
+        };
+        let target = if remote {
             self.target.clone()
         } else {
             ExplorerTarget::Host
@@ -735,7 +926,7 @@ impl ExplorerWindow {
         let idx = cursor - usize::from(show_parent); // ".." occupies row 0
         let Some(e) = entries.get(idx) else { return };
         if !e.is_dir {
-            return; // files: no-op (Task 9 handles copy/delete)
+            return; // files: no-op (copy/delete carry the file actions)
         }
         let new_path = format!("{}/{}", path.trim_end_matches('/'), e.name);
         let panel = self.active_mut();
@@ -751,6 +942,7 @@ impl ExplorerWindow {
 
     /// Backspace / the `..` row: climb one directory.
     fn go_up(&mut self, ctx: &mut Context) {
+        let remote = self.active_remote();
         let parent = {
             let p = self.active();
             if p.path == "/" {
@@ -766,7 +958,7 @@ impl ExplorerWindow {
                 parent
             }
         };
-        let target = if self.active_remote {
+        let target = if remote {
             self.target.clone()
         } else {
             ExplorerTarget::Host
@@ -782,21 +974,15 @@ impl ExplorerWindow {
         let _ = ctx;
     }
 
-    /// Is the ACTIVE panel's filter bar focused? (gate for the printables)
+    /// Is one of the filter bars focused? (gate for the printables)
     fn filter_focused(&mut self) -> bool {
-        let filter = if self.active_remote {
-            self.remote.filter
-        } else {
-            self.host.filter
-        };
-        self.win
-            .child_mut(filter)
-            .is_some_and(|v| v.state().state.focused)
+        self.is_focused(self.host.filter) || self.is_focused(self.remote.filter)
     }
 
     /// Re-request the active panel's current listing (F5 / `R`).
     fn relist_active(&mut self) {
-        let target = if self.active_remote {
+        let remote = self.active_remote();
+        let target = if remote {
             self.target.clone()
         } else {
             ExplorerTarget::Host
@@ -811,34 +997,41 @@ impl ExplorerWindow {
 
     /// g/G: jump the active table to the first/last row.
     fn jump(&mut self, bottom: bool, ctx: &mut Context) {
-        let table = self.active().table;
-        if let Some(t) = self
-            .win
-            .child_mut(table)
-            .and_then(|v| v.as_any_mut())
-            .and_then(|a| a.downcast_mut::<Table>())
-        {
-            let len = t.row_ids().len();
-            let idx = if bottom { len.saturating_sub(1) } else { 0 };
-            t.set_cursor_row(idx, ctx);
+        let remote = self.active_remote();
+        let table = self.panel_table(remote);
+        let Some(t) = self.table_mut(table) else {
+            return;
+        };
+        let key = {
+            let order = t.row_order();
+            let model = t.model();
+            let row = if bottom {
+                order.last().copied()
+            } else {
+                order.first().copied()
+            };
+            row.map(|r| model.row_key(r))
+        };
+        if let Some(key) = key {
+            t.set_focused_key(&key, ctx);
         }
     }
 
     /// The active panel's selection-or-cursor paths (selection wins).
     fn targets(&mut self) -> Vec<String> {
+        let remote = self.active_remote();
         let panel_dir = self.active().path.clone();
-        let table_id = self.active().table;
-        let Some(t) = self
-            .win
-            .child_mut(table_id)
-            .and_then(|v| v.as_any_mut())
-            .and_then(|a| a.downcast_mut::<Table>())
-        else {
+        let table_id = self.panel_table(remote);
+        let Some(t) = self.table_mut(table_id) else {
             return Vec::new();
         };
-        let selected = t.selected_ids();
+        let selected: Vec<String> = t.selected_keys().into_iter().map(|k| k.0).collect();
         let ids = if selected.is_empty() {
-            t.row_ids().get(t.cursor()).cloned().into_iter().collect()
+            let model = t.model();
+            t.focused_row()
+                .map(|r| model.row_key(r).0)
+                .into_iter()
+                .collect()
         } else {
             selected
         };
@@ -857,10 +1050,10 @@ impl ExplorerWindow {
 
     /// The context menu for the ACTIVE panel. An image window offers only
     /// copying out of the image plus refresh .
-    fn context_menu_items(&self) -> Vec<(String, Command)> {
+    fn context_menu_items(&mut self) -> Vec<(String, Command)> {
         if self.read_only() {
             let mut items = Vec::new();
-            if self.active_remote {
+            if self.active_remote() {
                 items.push(("~c~opy to host".to_string(), CMD_EXP_COPY));
             }
             items.push(("~R~efresh".to_string(), CMD_EXP_REFRESH));
@@ -878,14 +1071,15 @@ impl ExplorerWindow {
 
     fn copy_active(&mut self) {
         // An image may only be copied OUT of .
-        if self.read_only() && !self.active_remote {
+        let remote = self.active_remote();
+        if self.read_only() && !remote {
             return;
         }
         let items = self.targets();
         if items.is_empty() {
             return;
         }
-        let (target, to_container, dst) = if self.active_remote {
+        let (target, to_container, dst) = if remote {
             (self.target.clone(), false, self.host.path.clone())
         } else {
             (self.target.clone(), true, self.remote.path.clone())
@@ -938,14 +1132,13 @@ impl ExplorerWindow {
         });
     }
 
-    /// The active table's cursor row id (absent when the table has no rows).
+    /// The active table's focused row id (absent when the table has no rows).
     fn cursor_row_id(&mut self) -> Option<String> {
-        let table_id = self.active().table;
-        self.win
-            .child_mut(table_id)
-            .and_then(|v| v.as_any_mut())
-            .and_then(|a| a.downcast_mut::<Table>())
-            .and_then(|t| t.row_ids().get(t.cursor()).cloned())
+        let remote = self.active_remote();
+        let table_id = self.panel_table(remote);
+        let t = self.table_mut(table_id)?;
+        let row = t.focused_row()?;
+        Some(t.model().row_key(row).0)
     }
 
     /// The active panel's renamable row: the cursor row unless it is the
@@ -1004,8 +1197,9 @@ impl ExplorerWindow {
         if value.is_empty() {
             return;
         }
+        let remote = self.active_remote();
         let dir = self.active().path.trim_end_matches('/').to_string();
-        let target = if self.active_remote {
+        let target = if remote {
             self.target.clone()
         } else {
             ExplorerTarget::Host
@@ -1048,80 +1242,6 @@ impl ExplorerWindow {
                     path: value,
                 });
             }
-        }
-    }
-
-    /// Window-local click → (is_remote, data-row index) for the context
-    /// menu, mirroring the ResourceWindow `row_at_window_y` precedent.
-    fn row_at(&mut self, pos: tv::Point) -> Option<(bool, usize)> {
-        for remote in [false, true] {
-            let table_id = if remote {
-                self.remote.table
-            } else {
-                self.host.table
-            };
-            let bounds = match self.win.child_mut(table_id) {
-                Some(v) => v.state().get_bounds(),
-                None => continue,
-            };
-            if pos.x < bounds.a.x || pos.x >= bounds.b.x {
-                continue;
-            }
-            let view = pos.y - bounds.a.y - 1; // −1 for the header
-            if view < 0 {
-                continue;
-            }
-            let Some(t) = self
-                .win
-                .child_mut(table_id)
-                .and_then(|v| v.as_any_mut())
-                .and_then(|a| a.downcast_mut::<Table>())
-            else {
-                continue;
-            };
-            let idx = t.scroll_offset() + view;
-            let len = t.row_ids().len();
-            if idx >= 0 && (idx as usize) < len {
-                return Some((remote, idx as usize));
-            }
-        }
-        None
-    }
-
-    /// Push `active_remote` into the two tables: only the key-receiving side
-    /// draws its cursor row, so it is visible which panel is active.
-    /// (`state.focused` would be the natural signal, but tvision-rs does not
-    /// propagate it down to leaf tables in this app — a focused, key-receiving
-    /// table still reports `focused == false`.)
-    fn sync_panel_active(&mut self) {
-        let (host_id, remote_id) = (self.host.table, self.remote.table);
-        let remote_is_active = self.active_remote;
-        for (id, active) in [(host_id, !remote_is_active), (remote_id, remote_is_active)] {
-            if let Some(t) = self
-                .win
-                .child_mut(id)
-                .and_then(|v| v.as_any_mut())
-                .and_then(|a| a.downcast_mut::<Table>())
-            {
-                t.set_active(active);
-            }
-        }
-    }
-
-    /// Clicking a panel selects it, focuses its table and moves its cursor
-    /// to the clicked row (the ResourceWindow precedent).
-    fn focus_panel_at(&mut self, remote: bool, row: usize, ctx: &mut Context) {
-        self.active_remote = remote;
-        self.sync_panel_active();
-        let table = self.active().table;
-        self.win.focus_descendant(table, ctx);
-        if let Some(t) = self
-            .win
-            .child_mut(table)
-            .and_then(|v| v.as_any_mut())
-            .and_then(|a| a.downcast_mut::<Table>())
-        {
-            t.set_cursor_row(row, ctx);
         }
     }
 }

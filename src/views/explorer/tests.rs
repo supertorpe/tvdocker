@@ -11,6 +11,20 @@ fn entry(name: &str, is_dir: bool) -> ExplorerEntry {
     }
 }
 
+/// Focus the window group and descend to the host table — the
+/// desktop program does this before children can report `focused`. The
+/// `settle_currency` pass first establishes each table group's own currency
+/// (its body), which the pump would otherwise do between events; without it
+/// keys would land on the table group and never reach the row body.
+fn focus_panel(w: &mut ExplorerWindow, remote: bool) {
+    let id = w.panel_table(remote);
+    crate::testutil::with_ctx(|ctx| {
+        w.win.state_mut().state.focused = true;
+        w.win.settle_currency(ctx);
+        w.win.focus_descendant(id, ctx);
+    });
+}
+
 fn window() -> (
     ExplorerWindow,
     Rc<RefCell<AppCore>>,
@@ -28,14 +42,9 @@ fn window() -> (
         open,
         tx,
     );
-    // The desktop program focuses the window group before children can
-    // report `focused`; standalone tests recreate that (the group.rs
-    // pattern): mark the group focused, then descend to the host table.
-    let host_table = w.host.table;
-    crate::testutil::with_ctx(|ctx| {
-        w.win.state_mut().state.focused = true;
-        w.win.focus_descendant(host_table, ctx);
-    });
+    // The group.rs pattern standalone tests must recreate: mark the group
+    // focused, settle its currency, then descend to the host table.
+    focus_panel(&mut w, false);
     (w, core, rx)
 }
 
@@ -43,24 +52,41 @@ fn send(w: &mut ExplorerWindow, key: Key) {
     crate::testutil::send_key(w, key);
 }
 
-/// A left click delivered with an EXPLICIT clock: the harness's
-/// `with_ctx` fixes `now_ms` at 0, so double-click timing cannot be
-/// driven through it.
-fn click(w: &mut ExplorerWindow, x: i32, y: i32, now_ms: u64) {
-    use tv::event::MouseEvent;
-    let mut out = std::collections::VecDeque::new();
-    let mut timers = tv::TimerQueue::new();
-    let mut deferred: Vec<tv::Deferred> = Vec::new();
-    let mut ctx = Context::new(&mut out, &mut timers, now_ms, &mut deferred);
-    let mut ev = Event::MouseDown(MouseEvent {
-        position: tv::Point::new(x, y),
-        buttons: tv::event::MouseButtons {
-            left: true,
-            ..tv::event::MouseButtons::default()
-        },
-        ..MouseEvent::default()
+/// Deliver a left `MouseDown` at window-local `(x, y)`. `double` sets the
+/// framework double-click flag the pump synthesizes (`m.flags.double_click`).
+fn mouse(w: &mut ExplorerWindow, x: i32, y: i32, double: bool) {
+    crate::testutil::with_ctx(|ctx| {
+        let mut ev = Event::MouseDown(tv::MouseEvent {
+            position: tv::Point::new(x, y),
+            buttons: tv::event::MouseButtons {
+                left: true,
+                ..Default::default()
+            },
+            flags: tv::event::MouseEventFlags {
+                double_click: double,
+                ..Default::default()
+            },
+            ..tv::MouseEvent::default()
+        });
+        w.handle_event(&mut ev, ctx);
     });
-    w.handle_event(&mut ev, &mut ctx);
+}
+
+/// The table row ids of panel `remote`, in display order.
+fn table_ids(w: &mut ExplorerWindow, remote: bool) -> Vec<String> {
+    let id = w.panel_table(remote);
+    let Some(t) = w.table_mut(id) else {
+        return Vec::new();
+    };
+    let order = t.row_order();
+    let model = t.model();
+    order.iter().map(|&row| model.row_key(row).0).collect()
+}
+
+/// The focused row's key in panel `remote`, if any.
+fn focused_key(w: &mut ExplorerWindow, remote: bool) -> Option<String> {
+    let id = w.panel_table(remote);
+    w.table_mut(id).and_then(|t| t.focused_key()).map(|k| k.0)
 }
 
 #[test]
@@ -95,15 +121,9 @@ fn applied_listing_renders_rows_and_a_parent_row() {
     // Root has no parent row: the remote panel's rows are exactly the
     // two entries. Checked on the table itself, not the screen — the
     // HOST panel legitimately renders its own `..` row at $HOME.
-    let remote_rows = w
-        .win
-        .child_mut(w.remote.table)
-        .and_then(|v| v.as_any_mut())
-        .and_then(|a| a.downcast_mut::<Table>())
-        .map(|t| t.row_ids());
     assert_eq!(
-        remote_rows.as_deref(),
-        Some(&["app".to_string(), "notes.txt".to_string()][..]),
+        table_ids(&mut w, true),
+        vec!["app".to_string(), "notes.txt".to_string()],
         "root has no parent row: {out:?}"
     );
     assert!(out.contains("2 items"), "hint counts: {out:?}");
@@ -135,36 +155,42 @@ fn tab_has_exactly_two_stops_and_filters_are_escapable() {
     // (the FilterBars are selectable, so the window intercepts Tab),
     // and a focused filter must be escapable via Esc.
     //
-    // Table focus flags are inert in tv 0.16.0: Table's View impl
-    // is `#[delegate(to = scroller)]` (table.rs:471), so the
-    // focused/selected state always lands on the inner scroller and
-    // `v.state().state.focused` on a Table child is ALWAYS false
-    // (Ruling 21). The hops are asserted by the active-side flip and
-    // by the FilterBar flags instead — the window's Tab interception
-    // is exactly what must keep `focused` off the selectable bars.
+    // The upstream `Table` is a `Group`, so the focus flag on the table
+    // child IS meaningful — the window's Tab interception is exactly
+    // what must keep `focused` on a table and never on a filter bar.
     let (mut w, _core, _rx) = window();
-    let focused =
-        |w: &mut ExplorerWindow, id| w.win.child_mut(id).is_some_and(|v| v.state().state.focused);
+    let host_table = w.host.table;
+    let remote_table = w.remote.table;
     let host_filter = w.host.filter;
     let remote_filter = w.remote.filter;
-    assert!(!w.active_remote, "host side active first");
+    let focused =
+        |w: &mut ExplorerWindow, id| w.win.child_mut(id).is_some_and(|v| v.state().state.focused);
+    assert!(!w.active_remote(), "host side active first");
+    assert!(
+        focused(&mut w, host_table) && !focused(&mut w, remote_table),
+        "opens on the host table"
+    );
     assert!(
         !focused(&mut w, host_filter) && !focused(&mut w, remote_filter),
-        "opens on the host table, not a filter"
+        "opens on a table, not a filter"
     );
 
     // Tab 1: host → remote.
     send(&mut w, Key::Tab);
-    assert!(w.active_remote, "Tab → remote table");
+    assert!(w.active_remote(), "Tab → remote table");
+    assert!(
+        focused(&mut w, remote_table) && !focused(&mut w, host_table),
+        "Tab hands the focus to the remote table"
+    );
     assert!(
         !focused(&mut w, host_filter) && !focused(&mut w, remote_filter),
         "Tab never stops on a filter"
     );
     // Tab 2: exactly two stops, wrapping back to the host table.
     send(&mut w, Key::Tab);
-    assert!(!w.active_remote, "Tab wraps to the host table");
+    assert!(!w.active_remote(), "Tab wraps to the host table");
     assert!(
-        !focused(&mut w, host_filter) && !focused(&mut w, remote_filter),
+        focused(&mut w, host_table) && !focused(&mut w, remote_table),
         "still exactly two stops"
     );
 
@@ -175,15 +201,15 @@ fn tab_has_exactly_two_stops_and_filters_are_escapable() {
     send(&mut w, Key::Char('a'));
     let typed = w
         .win
-        .child_mut(w.host.filter)
+        .child_mut(host_filter)
         .and_then(|v| v.as_any_mut())
         .and_then(|a| a.downcast_mut::<FilterBar>())
         .map(|f| f.value().to_string());
     assert_eq!(typed.as_deref(), Some("a"), "typing narrows the filter");
     send(&mut w, Key::Esc);
     assert!(
-        !focused(&mut w, host_filter),
-        "Esc returns focus to the table (table flags stay inert)"
+        focused(&mut w, host_table) && !focused(&mut w, host_filter),
+        "Esc returns focus to the table"
     );
 }
 
@@ -553,29 +579,24 @@ fn a_click_activates_the_panel_it_lands_on() {
         vec![entry("r1", false)],
     );
     let mid = 76 / 2;
-    let cursor_x = |w: &mut ExplorerWindow| {
-        crate::testutil::text(&crate::testutil::render_view(76, 23, w))
-            .lines()
-            .find_map(|l| l.find('>'))
-    };
-    assert!(!w.active_remote, "the host side is active at open");
+    assert!(!w.active_remote(), "the host side is active at open");
 
-    click(&mut w, mid + 4, 4, 0);
-    assert!(w.active_remote, "clicking the other panel activates it");
-    let x = cursor_x(&mut w).expect("a cursor is drawn");
-    assert!(
-        x >= mid as usize,
-        "the cursor moved to the clicked panel: x={x}"
+    mouse(&mut w, mid + 4, 4, false);
+    assert!(w.active_remote(), "clicking the other panel activates it");
+    assert_eq!(
+        focused_key(&mut w, true).as_deref(),
+        Some("r1"),
+        "the click moved the cursor to the clicked panel's row"
     );
 
-    click(&mut w, 4, 4, 0);
-    assert!(!w.active_remote, "clicking back returns to the host");
+    mouse(&mut w, 4, 4, false);
+    assert!(!w.active_remote(), "clicking back returns to the host");
 }
 
-/// Two clicks on the SAME row within the interval open it (the
-/// file-manager convention — the same request Enter makes).
+/// A click carrying the framework's double-click flag opens the row under
+/// it (the file-manager convention — the same request Enter makes).
 #[test]
-fn a_second_click_on_the_same_row_opens_it() {
+fn a_double_click_opens_the_row_it_lands_on() {
     let (mut w, _core, mut rx) = window();
     core_seed_host(&mut w, &mut rx); // drain the two build requests
     // The REMOTE panel is rooted at "/" and has no ".." row, so its only
@@ -587,50 +608,28 @@ fn a_second_click_on_the_same_row_opens_it() {
         vec![entry("app", true)],
     );
     while rx.try_recv().is_ok() {}
-    let mid = 76 / 2;
-    let x = mid + 4;
-    let y = 4; // the header owns local y=3, so data row 0 is y=4
+    let x = 76 / 2 + 4;
+    let y = 4; // the header owns local y=0, so data row 0 is y=4
 
-    click(&mut w, x, y, 1_000);
+    mouse(&mut w, x, y, false);
     assert!(rx.try_recv().is_err(), "one click only activates");
 
-    click(&mut w, x, y, 1_200);
-    let req = rx.try_recv().expect("the second click opens the row");
+    mouse(&mut w, x, y, true);
+    let req = rx.try_recv().expect("the double-click opens the row");
     assert!(
         matches!(req, TaskReq::ExplorerList { path, .. } if path == "/app"),
-        "a second click opens the directory"
+        "a double-click opens the directory"
     );
-    assert!(w.active_remote, "the clicked panel became active");
+    assert!(w.active_remote(), "the clicked panel became active");
 }
 
-/// …but a click on the same row LATER than the interval is just another
-/// single click — it must not open anything.
+/// Only the panel that receives the keys holds the focus (bug report: both
+/// the host and the container side looked active, so there was no way to tell
+/// where a keypress would go). The inactive panel now dims automatically
+/// (the upstream body draws `Role::ListInactive`); the flag asserted here is
+/// what selects the dimming and the key routing.
 #[test]
-fn a_click_beyond_the_interval_only_activates() {
-    let (mut w, _core, mut rx) = window();
-    core_seed_host(&mut w, &mut rx);
-    seed(
-        &mut w,
-        ExplorerTarget::Container("c1".into()),
-        "/",
-        vec![entry("app", true)],
-    );
-    while rx.try_recv().is_ok() {}
-    let x = 76 / 2 + 4;
-
-    click(&mut w, x, 4, 10_000);
-    click(&mut w, x, 4, 11_000); // 1 s later: a fresh first click
-    assert!(
-        rx.try_recv().is_err(),
-        "a click outside the interval must not open"
-    );
-}
-
-/// Only the panel that receives the keys draws its cursor row (bug
-/// report: both the host and the container side looked active, so there
-/// was no way to tell where a keypress would go).
-#[test]
-fn only_the_active_panel_draws_the_cursor_marker() {
+fn only_the_focused_panel_holds_the_focus() {
     let (mut w, _core, _rx) = window();
     // Give both sides something to draw a cursor on.
     seed(&mut w, ExplorerTarget::Host, "/", vec![entry("h1", false)]);
@@ -640,26 +639,28 @@ fn only_the_active_panel_draws_the_cursor_marker() {
         "/",
         vec![entry("r1", false)],
     );
-    let mid = 76 / 2;
-    let cursor_x = |w: &mut ExplorerWindow| {
-        crate::testutil::text(&crate::testutil::render_view(76, 23, w))
-            .lines()
-            .find_map(|l| l.find('>'))
-    };
+    let host_table = w.host.table;
+    let remote_table = w.remote.table;
 
-    // The host side is active at open.
-    let x = cursor_x(&mut w).expect("a cursor is drawn");
-    assert!(x < mid, "the host side is active: x={x}");
+    // The host side is focused at open.
+    assert!(
+        w.is_focused(host_table) && !w.is_focused(remote_table),
+        "the host side is focused"
+    );
 
-    // Tab hands the keys to the container side: its cursor lights up.
+    // Tab hands the keys to the container side.
     send(&mut w, Key::Tab);
-    let x = cursor_x(&mut w).expect("a cursor is drawn");
-    assert!(x >= mid, "the container side is active: x={x}");
+    assert!(
+        w.is_focused(remote_table) && !w.is_focused(host_table),
+        "the container side is focused"
+    );
 
     // …and back again.
     send(&mut w, Key::Tab);
-    let x = cursor_x(&mut w).expect("a cursor is drawn");
-    assert!(x < mid, "the host side is active again: x={x}");
+    assert!(
+        w.is_focused(host_table) && !w.is_focused(remote_table),
+        "the host side is focused again"
+    );
 }
 /// The two text rows must be READABLE (contrast) and the breadcrumb
 /// must show each side's absolute path above ITS column.
@@ -756,7 +757,7 @@ fn image_window() -> (ExplorerWindow, mpsc::UnboundedReceiver<TaskReq>) {
 #[test]
 fn the_image_context_menu_is_read_only() {
     let (mut w, _rx) = image_window();
-    w.active_remote = true;
+    focus_panel(&mut w, true);
     let on_image = w
         .context_menu_items()
         .into_iter()
@@ -774,7 +775,7 @@ fn the_image_context_menu_is_read_only() {
     );
     assert!(!on_image.iter().any(|l| l.contains("ew ")), "{on_image:?}");
 
-    w.active_remote = false;
+    focus_panel(&mut w, false);
     let on_host = w
         .context_menu_items()
         .into_iter()
@@ -814,18 +815,13 @@ fn copy_fires_only_from_the_image_side() {
     // drops the `..` parent, so without this `copy_active` bails on
     // "nothing selected" BEFORE any direction logic — which let this test
     // pass with both direction gates removed (review mutations M5c-M5e).
-    let host_table = w.host.table;
-    crate::testutil::with_ctx(|ctx| {
-        w.win.state_mut().state.focused = true;
-        w.win.focus_descendant(host_table, ctx);
-    });
+    focus_panel(&mut w, false);
     send(&mut w, Key::Down); // off the `..` parent row
 
-    w.active_remote = false; // the HOST side is active
     send(&mut w, Key::Char('X'));
     assert!(rx.try_recv().is_err(), "host → image is refused");
 
-    w.active_remote = true; // the IMAGE side is active
+    focus_panel(&mut w, true); // the IMAGE side is active
     send(&mut w, Key::Char('X'));
     assert!(
         matches!(
@@ -863,7 +859,7 @@ fn del_and_new_and_rename_are_inert_on_an_image_target() {
             permissions: "drwxr-xr-x".into(),
         }],
     );
-    w.active_remote = true;
+    focus_panel(&mut w, true);
 
     for key in [Key::Delete, Key::Char('n'), Key::Char('N'), Key::Char('r')] {
         let mut out = std::collections::VecDeque::new();
