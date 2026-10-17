@@ -9,9 +9,11 @@ use common::{SharedClock, screen_text};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Key, KeyModifiers};
+use tv::widgets::{SelectionMode, Table};
 use tv::{Desktop, DrawCtx, HeadlessBackend, HeadlessHandle, Program, Rect, Role, View, ViewState};
 use tvdocker::app;
-use tvdocker::widgets::{Align, Column, FilterBar, PaneWindow, Table, TableRow};
+use tvdocker::widgets::resource_table::{RowModel, TableRow, to_spec};
+use tvdocker::widgets::{Align, Column, FilterBar, PaneWindow};
 
 /// Stands in for the probes' info line (the real ones draw stats text).
 struct InfoStub {
@@ -59,16 +61,15 @@ fn probe_pane() -> PaneWindow {
             "type to filter",
         )),
         |rect, bar| {
-            let mut table = Table::new(
-                rect,
-                vec![
-                    Column::new("ID", 12, Align::Left),
-                    Column::new("NAME", 30, Align::Left),
-                    Column::new("STATE", 12, Align::Left),
-                ],
-                bar,
-            );
-            table.set_rows_initial(rows(50));
+            let columns = [
+                Column::new("ID", 12, Align::Left),
+                Column::new("NAME", 30, Align::Left),
+                Column::new("STATE", 12, Align::Left),
+            ];
+            let mut table = Table::new(rect, columns.iter().map(to_spec).collect(), bar)
+                .with_selection_mode(SelectionMode::Multi)
+                .with_model(Box::new(RowModel::new(rows(50))));
+            table.state_mut().options.selectable = true;
             Box::new(table)
         },
     )

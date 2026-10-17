@@ -16,7 +16,7 @@ pub const HELP_CTX: HelpCtx = HelpCtx::custom("tvdocker.networks");
 /// Column headers/formats are new (no oh-my-docker
 /// equivalent row layout; no icons/colors, the theme has no per-kind
 /// roles). Widths are ours, NOT copied: the 7-col total exceeds the
-/// 76-cell interior and `layout_widths` shaves the widest (a
+/// 76-cell interior and the table shaves the widest (a
 /// tested invariant).
 pub fn columns() -> Vec<Column> {
     vec![

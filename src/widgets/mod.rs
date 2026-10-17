@@ -5,7 +5,6 @@ pub mod pane;
 pub mod pty;
 pub mod resource_table;
 pub mod shared_line;
-pub mod table;
 pub mod text_pane;
 
 pub use filter_bar::FilterBar;
@@ -16,7 +15,6 @@ pub use pane::{
     build_compact_window, build_pane_window, build_scroll_status_window, build_scroll_window,
     compact_rects, pane_rects, scroll_rects, scroll_status_rects,
 };
-pub use resource_table::{Align, Column, RowModel, to_spec};
+pub use resource_table::{Align, Column, RowModel, TableRow, to_spec};
 pub use shared_line::SharedLine;
-pub use table::{Table, TableRow};
 pub use text_pane::{TextPane, severity_role};
