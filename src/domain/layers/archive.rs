@@ -19,19 +19,26 @@ pub fn parse<R: Read + Seek>(mut reader: R) -> anyhow::Result<LayerSet> {
         .ok_or_else(|| anyhow::anyhow!("manifest.json is empty"))?;
     let config_name = first["Config"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("manifest Config is not a string"))?;
+        .ok_or_else(|| anyhow::anyhow!("manifest Config is not a string"))?
+        .trim_start_matches("./")
+        .to_string();
     let layer_paths: Vec<String> = first["Layers"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("manifest Layers is not an array"))?
         .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_default()
+                .trim_start_matches("./")
+                .to_string()
+        })
         .collect();
 
     // Each scan is a full pass over the outer tar: `entries_with_seek`
     // skips unread data with relative seeks, so a fresh `Archive` starts
     // wherever the reader currently sits — rewind between passes.
     reader.seek(SeekFrom::Start(0))?;
-    let config = read_named(&mut reader, config_name)?;
+    let config = read_named(&mut reader, &config_name)?;
     let config: Value = serde_json::from_slice(&config)?;
     let diff_ids: Vec<String> = config["rootfs"]["diff_ids"]
         .as_array()
@@ -251,11 +258,13 @@ mod tests {
             config.as_bytes(),
         )
         .unwrap();
+        // The manifest declares its blobs with a "./" prefix (as real
+        // saves may); `parse` must trim it before matching entry paths.
         let manifest = format!(
-            r#"[{{"Config":"config.json","RepoTags":["t:latest"],"Layers":[{}]}}]"#,
+            r#"[{{"Config":"./config.json","RepoTags":["t:latest"],"Layers":[{}]}}]"#,
             layer_paths
                 .iter()
-                .map(|p| format!(r#""{p}""#))
+                .map(|p| format!(r#""./{p}""#))
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -300,6 +309,7 @@ mod tests {
         let id = set.layers[0].tree.get("/etc/hosts").expect("entry");
         let entry = set.layers[0].tree.node(id).entry.as_ref().unwrap();
         assert_eq!(entry.size, "127.0.0.1".len() as u64);
+        assert_eq!(set.layers[0].size, "127.0.0.1".len() as u64);
         assert_eq!(entry.kind, Kind::File);
         assert_eq!(entry.hash, hash_bytes(b"127.0.0.1"));
     }
@@ -344,7 +354,7 @@ mod tests {
         let set = two_layer(save_tar(
             &[
                 vec![("etc/hosts", "x"), ("etc/passwd", "y")],
-                vec![("etc/.wh.hosts", "")],
+                vec![("etc/hosts", "z"), ("etc/.wh.hosts", "")],
             ],
             &[("one", false), ("two", false)],
             &["sha256:aaa", "sha256:bbb"],

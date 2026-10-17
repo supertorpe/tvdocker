@@ -69,7 +69,8 @@ pub struct Layer {
     pub id: String,
     /// History `created_by`.
     pub command: String,
-    /// Bytes the layer's tar entry occupies.
+    /// Total bytes of file payload this layer adds (excludes tar headers
+    /// and padding).
     pub size: u64,
     pub tree: Tree,
 }
