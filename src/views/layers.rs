@@ -216,7 +216,7 @@ pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree) -> Vec<TableRow> {
                 .as_ref()
                 .map(|e| format!("{:o}", e.mode))
                 .unwrap_or_default();
-            let indent = " ".repeat(r.depth.saturating_sub(1));
+            let indent = " ".repeat(r.depth);
             let name = r.path.rsplit('/').next().unwrap_or(&r.path).to_string();
             TableRow::new(
                 r.path.clone(),

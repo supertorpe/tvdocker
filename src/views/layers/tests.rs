@@ -137,9 +137,10 @@ fn the_second_layer_marks_an_add_and_a_modification() {
     let table = win.table_mut(win.tree_table).expect("tree table");
     let model = table.model();
     let role_of = |path: &str| {
-        (0..model.row_count())
+        let row = (0..model.row_count())
             .find(|i| model.row_key(*i).0 == path)
-            .and_then(|i| model.row_role(i))
+            .unwrap_or_else(|| panic!("{path} row present"));
+        model.row_role(row)
     };
     assert_eq!(
         role_of("/etc/new"),
@@ -261,6 +262,24 @@ fn an_empty_layers_analysis_clears_the_panes_without_panicking() {
     assert!(win.tree_rows.is_empty());
     let table = win.table_mut(win.tree_table).expect("tree table");
     assert_eq!(table.model().row_count(), 0, "the pane stays cleared");
+}
+
+#[test]
+fn child_rows_are_indented_one_step_deeper_than_their_parent() {
+    let mut t = Tree::new();
+    t.add_path(entry("/hosts", "v1")); // top level
+    t.add_path(entry("/etc/hosts", "v1")); // one level down
+    t.add_path(entry("/etc/sub/x", "v1")); // two levels down
+    let rows = tree_rows_for(&flatten(&t), &t);
+    let leading = |path: &str| {
+        let row = rows.iter().find(|r| r.id == path).expect(path);
+        row.cells[0].len() - row.cells[0].trim_start().len()
+    };
+    assert_eq!(leading("/hosts"), 0, "top-level file");
+    assert_eq!(leading("/etc"), 0, "top-level directory");
+    assert_eq!(leading("/etc/hosts"), 1, "one step deeper than /etc");
+    assert_eq!(leading("/etc/sub"), 1, "level-1 directory");
+    assert_eq!(leading("/etc/sub/x"), 2, "two steps deeper than /etc");
 }
 
 #[test]
