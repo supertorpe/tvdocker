@@ -20,6 +20,29 @@ Everything runs in the pinned container — no host toolchain required:
 
 ```  
 
+## Features
+
+- **Multi-window desktop** — open Containers, Images, Networks, Volumes, Events and Statistics as overlapping windows, each independently moved, zoomed, tiled or cascaded; opening an item already on screen focuses it instead of duplicating it
+- **Never suspends** — the shell and log views run *inside* the desktop, so the TUI keeps running while you work in a container (no terminal hand-off)
+- **Container list** — running/exited containers with fuzzy search and an optional initial filter via the CLI argument
+- **Container details** — the parsed inspect payload in scrollable sections (name, image, command, env, mounts, networks, ports, labels, …)
+- **Live logs** — per-container streaming with follow/pause (`F7`), search, scrolling and export; one Logs window per container
+- **Embedded shell** — `docker exec` into a live PTY with configurable shell, user and working directory per container, and scrollback; the config is persisted to `tvdocker.toml`
+- **File explorer** — host ↔ container and host ↔ volume, two panes: navigate, filter, copy, rename, delete and create files/directories; a read-only Image Explorer browses an image's filesystem
+- **Image management** — `REPOSITORY:TAG` and `SIZE`, remove, prune/dangling cleanup, and Run… (`F2`) through a validated run form
+- **Networks & volumes** — names, drivers, sizes and container counts; delete with confirmation; open a volume directly in the Explorer
+- **Live statistics** — `docker stats` (CPU %, memory, net, block I/O, PIDs) per container, sortable by column
+- **Docker events** — a real-time, filtered event stream, newest first
+- **AI diagnostics** — right-click a container → **Diagnose…** compiles recent logs, exit code, stats and config into a local or cloud LLM for root-cause analysis and a repair playbook
+- **Context menus** — right-click a row for its actions (Details, Logs, Shell, Explorer, Diagnose…, Start/Stop, Delete)
+- **Multi-select** — `Ctrl+A` selects the filtered rows for batch actions
+- **Themes** — Options ▸ **Themes…** picks a palette; Options ▸ **Edit colors…** edits and saves your own; the selection persists in `tvdocker.toml`
+- **Settings** — Options ▸ **Settings…** edits `tvdocker.toml` in-app (`F2` saves and live-reloads), including keybindings
+- **Self-update** — Help ▸ **Check for updates…** queries the GitHub releases and can download and install the matching asset; an optional startup check only posts a status-line notice
+- **Keyboard-first** — every action is reachable from the keyboard; the status line shows the focused window's contextual shortcuts and hides under `F10`; mouse scrolling and right-click are supported
+- **Fast & resilient** — async polling keeps the UI non-blocking, logs and events use bounded ring buffers, and Docker reconnection is reported in the status line instead of crashing when the daemon is down
+- **CLI** — `--help`/`-h`, `--version`/`-V`, and an optional `<search_text>` that pre-fills the Containers filter
+
 ## Windows
 
  Six resource windows come from the six-item **Docker** menu (`Alt+D`); the rest follow from a row's action or the menu:
