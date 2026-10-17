@@ -81,6 +81,10 @@ pub struct InfoLine {
     info: Rc<RefCell<InfoState>>,
     total: fn(&AppCore) -> usize,
     empty: &'static str,
+    /// Whether the window owns multi-select (`spec.kind.is_some()`). Read-only
+    /// windows (Events/Statistics) drop the `· N selected` segment — with no
+    /// action there is nothing a selection could apply to.
+    selectable: bool,
 }
 
 impl View for InfoLine {
@@ -101,10 +105,14 @@ impl View for InfoLine {
             _ if (self.total)(&core) == 0 => (self.empty.to_string(), Role::Info),
             _ => (
                 format!(
-                    " {} / {} shown · {} selected · filter {}",
+                    " {} / {} shown{} · filter {}",
                     info.shown,
                     (self.total)(&core),
-                    info.selected,
+                    if self.selectable {
+                        format!(" · {} selected", info.selected)
+                    } else {
+                        String::new()
+                    },
                     if info.filter.is_empty() {
                         "-"
                     } else {
@@ -227,6 +235,10 @@ pub fn build(
         .0
         .column_layout(spec.table_key)
         .cloned();
+    // Selection is the action-target picker: only windows that own an action
+    // (`kind: Some`) offer multi-select. Read-only windows (Events/Statistics)
+    // get `Single` — no check column, no "selected" counter.
+    let selectable = spec.kind.is_some();
     let mut pane = PaneWindow::new(
         bounds,
         spec.title,
@@ -237,6 +249,7 @@ pub fn build(
             info: Rc::clone(&info),
             total: spec.total,
             empty: spec.empty,
+            selectable,
         }),
         Box::new(FilterBar::new(
             Rect::new(0, 0, 1, 1),
@@ -246,7 +259,11 @@ pub fn build(
         |rect, bar| {
             let columns = (spec.columns)().iter().map(to_spec).collect();
             let mut table = Table::new(rect, columns, bar)
-                .with_selection_mode(SelectionMode::Multi)
+                .with_selection_mode(if selectable {
+                    SelectionMode::Multi
+                } else {
+                    SelectionMode::Single
+                })
                 .with_model(Box::new(initial_model));
             // The upstream `Table` is a `Group`: mark it selectable so the
             // window's hierarchical Tab pass treats it as one focusable stop
@@ -283,6 +300,13 @@ impl ResourceWindow {
             let model = t.model();
             order.iter().map(|&row| model.row_key(row).0).collect()
         })
+    }
+
+    /// Whether this window owns multi-select: true when it has an action
+    /// (`kind: Some`) for the marked rows to target. Read-only windows
+    /// (Events/Statistics) return false — their table is `Single`.
+    fn selectable(&self) -> bool {
+        self.spec.kind.is_some()
     }
 
     fn table_mut(&mut self) -> Option<&mut Table> {
@@ -571,6 +595,7 @@ impl View for ResourceWindow {
         if let Event::KeyDown(ke) = ev
             && ke.modifiers.ctrl
             && matches!(ke.key, Key::Char('a') | Key::Char('A'))
+            && self.selectable()
         {
             self.select_all();
             ev.clear();
@@ -581,6 +606,7 @@ impl View for ResourceWindow {
         // key binding is active. Identical behavior, shared `select_all()`.
         if let Event::Command(cmd) = ev
             && *cmd == crate::app::CMD_SELECT_ALL
+            && self.selectable()
         {
             self.select_all();
             ev.clear();
@@ -792,6 +818,71 @@ mod tests {
             table_key: "demo",
             sort_keys: |_| Vec::new(),
         }
+    }
+
+    /// A spec with an action (`kind: Some`) — the shape Containers and the
+    /// four pickers have.
+    fn actionable_demo_spec() -> ResourceSpec {
+        ResourceSpec {
+            kind: Some(crate::core::PendingKind::Volumes),
+            ..demo_spec()
+        }
+    }
+
+    /// Selection is the action-target picker: a window with no action
+    /// (`kind: None` — Events/Statistics) must NOT get the upstream
+    /// multi-select check column, nor the "selected" info-line segment.
+    #[test]
+    fn read_only_windows_get_no_check_column_and_no_selected_count() {
+        let core = core_with(&["alpha", "beta"]);
+        let mut w = window(demo_spec(), core); // kind: None
+        let out = text(&render_view(76, 23, &mut w));
+        assert_eq!(
+            w.table_mut().expect("table child").selection_mode(),
+            SelectionMode::Single,
+            "no action ⇒ single selection"
+        );
+        assert!(!out.contains("[ ]"), "no check column drawn: {out:?}");
+        assert!(!out.contains("selected"), "no selected counter: {out:?}");
+        assert!(out.contains(" 2 / 2 shown"), "counts still shown: {out:?}");
+    }
+
+    /// The mirror: an actionable window keeps multi-select and its counter.
+    #[test]
+    fn actionable_windows_keep_multi_select_and_the_selected_count() {
+        let core = core_with(&["alpha", "beta"]);
+        let mut w = window(actionable_demo_spec(), core);
+        let out = text(&render_view(76, 23, &mut w));
+        assert_eq!(
+            w.table_mut().expect("table child").selection_mode(),
+            SelectionMode::Multi,
+            "an action ⇒ multi selection"
+        );
+        assert!(out.contains("[ ]"), "check column drawn: {out:?}");
+        assert!(out.contains("selected"), "selected counter: {out:?}");
+    }
+
+    /// Ctrl+A on a read-only window must not silently populate invisible
+    /// marks (which would then consume the first Esc).
+    #[test]
+    fn ctrl_a_is_inert_on_a_read_only_window() {
+        let core = core_with(&["alpha", "beta"]);
+        let mut w = window(demo_spec(), core);
+        send_key_mods(
+            &mut w,
+            Key::Char('a'),
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            },
+        );
+        assert!(
+            w.table_mut()
+                .expect("table child")
+                .selected_keys()
+                .is_empty(),
+            "no marks on a window with no action"
+        );
     }
 
     fn core_with(names: &[&str]) -> Rc<RefCell<AppCore>> {
