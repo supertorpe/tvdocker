@@ -6,6 +6,7 @@
 //! §5 for the ported dive semantics.
 pub mod archive;
 pub mod diff;
+pub mod efficiency;
 pub mod tree;
 
 use std::collections::hash_map::DefaultHasher;
