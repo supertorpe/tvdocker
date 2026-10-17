@@ -74,6 +74,10 @@ pub struct Layer {
     /// Total bytes of file payload this layer adds (excludes tar headers
     /// and padding).
     pub size: u64,
+    /// Absolute paths this layer's whiteouts delete from lower layers.
+    /// Opaque (`.wh..wh..opq`) markers record NOTHING — see the ruling in
+    /// the design spec.
+    pub removed: Vec<String>,
     pub tree: Tree,
 }
 

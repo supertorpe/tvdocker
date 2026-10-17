@@ -73,12 +73,13 @@ pub fn parse<R: Read + Seek>(mut reader: R) -> anyhow::Result<LayerSet> {
             .zip(diff_ids.get(index).cloned())
             .ok_or_else(|| anyhow::anyhow!("layer {index} has no history entry"))?;
         reader.seek(SeekFrom::Start(0))?;
-        let (size, tree) = parse_layer(&mut reader, path)?;
+        let (size, tree, removed) = parse_layer(&mut reader, path)?;
         layers.push(Layer {
             index,
             id,
             command,
             size,
+            removed,
             tree,
         });
     }
@@ -105,8 +106,12 @@ fn read_named<R: Read + Seek>(reader: &mut R, wanted: &str) -> anyhow::Result<Ve
 }
 
 /// Parse one layer tar (streaming — the outer entry is the reader), apply
-/// the whiteout rules, and return the bytes the layer occupies plus its tree.
-fn parse_layer<R: Read + Seek>(reader: &mut R, wanted: &str) -> anyhow::Result<(u64, Tree)> {
+/// the whiteout rules, and return the bytes the layer occupies, its tree
+/// and the cross-layer removals its whiteouts declare.
+fn parse_layer<R: Read + Seek>(
+    reader: &mut R,
+    wanted: &str,
+) -> anyhow::Result<(u64, Tree, Vec<String>)> {
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries_with_seek()? {
         let entry = entry?;
@@ -120,6 +125,7 @@ fn parse_layer<R: Read + Seek>(reader: &mut R, wanted: &str) -> anyhow::Result<(
         }
         let mut size = 0u64;
         let mut tree = Tree::new();
+        let mut removed = Vec::new();
         let mut inner = tar::Archive::new(entry);
         for e in inner.entries()? {
             let mut e = e?;
@@ -145,6 +151,10 @@ fn parse_layer<R: Read + Seek>(reader: &mut R, wanted: &str) -> anyhow::Result<(
                         .unwrap_or_default();
                     let victim = format!("/{parent}/{target}");
                     tree.remove_path(&victim);
+                    // The marker only bites this layer's own tree (fresh,
+                    // independent trees); record it so stacking can apply
+                    // the deletion to lower layers.
+                    removed.push(victim);
                     continue;
                 }
             }
@@ -179,7 +189,7 @@ fn parse_layer<R: Read + Seek>(reader: &mut R, wanted: &str) -> anyhow::Result<(
                 hash,
             });
         }
-        return Ok((size, tree));
+        return Ok((size, tree, removed));
     }
     anyhow::bail!("layer {wanted} not found in the archive")
 }
@@ -368,6 +378,11 @@ mod tests {
             set.layers[1].tree.get("/etc/.wh.hosts").is_none(),
             "the marker is never inserted"
         );
+        assert!(
+            set.layers[1].removed == vec!["/etc/hosts".to_string()],
+            "the victim is recorded for cross-layer stacking: {:?}",
+            set.layers[1].removed
+        );
         assert!(set.layers[1].tree.get("/etc/passwd").is_none());
     }
 
@@ -386,6 +401,10 @@ mod tests {
             .collect();
         assert!(!names.iter().any(|n| n.contains(".wh")), "{names:?}");
         assert!(set.layers[1].tree.get("/etc/hosts").is_none());
+        assert!(
+            set.layers[1].removed.is_empty(),
+            "opaque whiteouts record nothing"
+        );
     }
 
     #[test]

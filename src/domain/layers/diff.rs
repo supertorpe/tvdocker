@@ -70,11 +70,16 @@ fn roll_up(tree: &mut Tree) {
     }
 }
 
-/// Flatten `layers` into one tree, later layers overwriting earlier ones
-/// (the whiteout rules already ran at parse time, so this is a plain union).
+/// Flatten `layers` into one tree, later layers overwriting earlier ones.
+/// Each layer's recorded whiteout removals are applied BEFORE its own
+/// additions, so a layer that deletes and then re-creates a path wins
+/// (overlayfs ordering); `remove_path` drops the whole subtree.
 pub fn stack(layers: &[Layer]) -> Tree {
     let mut out = Tree::new();
     for layer in layers {
+        for victim in &layer.removed {
+            out.remove_path(victim);
+        }
         for id in layer.tree.dfs() {
             if let Some(entry) = layer.tree.node(id).entry.clone() {
                 out.add_path(entry);
@@ -152,6 +157,7 @@ mod tests {
             id: format!("sha256:{index}"),
             command: format!("layer {index}"),
             size: 0,
+            removed: Vec::new(),
             tree,
         }
     }
@@ -224,6 +230,42 @@ mod tests {
         assert_eq!(diff_of(&got, "/etc/sub"), DiffType::Removed);
         assert_eq!(diff_of(&got, "/etc/sub/a"), DiffType::Removed);
         assert_eq!(diff_of(&got, "/etc/sub/b"), DiffType::Removed);
+    }
+
+    #[test]
+    fn stack_honors_layer_removals() {
+        let mut del = layer(1, &[]);
+        del.removed = vec!["/etc/hosts".to_string()];
+        let layers = vec![layer(0, &[("/etc/hosts", "v1")]), del];
+        assert!(stack(&layers).get("/etc/hosts").is_none());
+    }
+
+    #[test]
+    fn a_deleted_path_shows_as_removed_in_the_comparer() {
+        let mut del = layer(1, &[]);
+        del.removed = vec!["/etc/hosts".to_string()];
+        let layers = vec![
+            layer(0, &[("/etc/hosts", "v1"), ("/etc/passwd", "v1")]),
+            del,
+        ];
+        let mut c = Comparer::new();
+        let tree = c.tree(&layers, Compare::Single, 1);
+        assert_eq!(diff_of(tree, "/etc/hosts"), DiffType::Removed);
+        assert_eq!(diff_of(tree, "/etc/passwd"), DiffType::Unmodified);
+    }
+
+    #[test]
+    fn removals_apply_before_additions_in_the_same_layer() {
+        let mut recreate = layer(1, &[("/etc/hosts", "v1")]);
+        recreate.removed = vec!["/etc/hosts".to_string()];
+        let layers = vec![layer(0, &[("/etc/hosts", "v0")]), recreate];
+        let flat = stack(&layers);
+        let id = flat.get("/etc/hosts").expect("re-created after removal");
+        assert_eq!(
+            flat.node(id).entry.as_ref().unwrap().hash,
+            hash_bytes(b"v1"),
+            "overlayfs order: the layer's own write wins over its whiteout"
+        );
     }
 
     #[test]
