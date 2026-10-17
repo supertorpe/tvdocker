@@ -204,8 +204,6 @@ pub struct ExplorerWindow {
     breadcrumb_host_id: tv::ViewId,
     breadcrumb_remote_id: tv::ViewId,
     hint_id: tv::ViewId,
-    /// Last laid-out size — the `PaneWindow::relayout_if_resized` probe.
-    size: tv::Point,
     /// The prompt that is open (or about to be): create/rename/goto.
     pending_prompt: Option<PromptKind>,
     /// The pending Del's paths (the confirm round trip).
@@ -339,21 +337,18 @@ impl ExplorerWindow {
         }
     }
 
-    /// Re-derive the child rects whenever the window size changed (zoom /
-    /// Size-Move drag / terminal resize — each ends in a redraw, which is
-    /// where this runs, the `PaneWindow::relayout_if_resized` pattern).
+    /// Re-derive the child rects for the CURRENT window size and hand each
+    /// child its new bounds. Called from [`View::change_bounds`] (every
+    /// deferred/owner-driven resize) and from the event-time reconcile that
+    /// covers zoom/fullscreen (which re-bound the inner window's group
+    /// directly, bypassing this window's `change_bounds`).
     ///
     /// Without it the children keep their BUILD-time rects: `Group::
     /// change_bounds` only applies grow-mode deltas, and these children use
     /// the default (fixed) grow mode — so the panels froze at their original
     /// coordinates and overlapped the moved frame.
-    fn relayout_if_resized(&mut self) {
-        let size = self.win.state().size;
-        if size == self.size {
-            return;
-        }
-        self.size = size;
-        let r = explorer_rects(size);
+    fn reapply_layout(&mut self) {
+        let r = explorer_rects(self.win.state().size);
         for (id, rect) in [
             (self.breadcrumb_host_id, r.breadcrumb_host),
             (self.breadcrumb_remote_id, r.breadcrumb_remote),
@@ -563,7 +558,6 @@ pub fn build(
         breadcrumb_host_id,
         breadcrumb_remote_id,
         hint_id,
-        size,
         pending_prompt: None,
         pending_delete: None,
         modal_answer: None,
@@ -595,12 +589,20 @@ impl View for ExplorerWindow {
         self.win.state_mut()
     }
     fn draw(&mut self, ctx: &mut DrawCtx) {
-        self.relayout_if_resized(); // children must track the window size
         self.abs_origin = ctx.origin(); // right-click → global coords
         self.win.draw(ctx);
     }
 
+    /// Re-derive the child rects whenever the window size changes (zoom /
+    /// Size-Move drag / terminal resize — every path now goes through this
+    /// method). Without it the children keep their BUILD-time rects.
+    fn change_bounds(&mut self, bounds: Rect) {
+        self.win.change_bounds(bounds);
+        self.reapply_layout();
+    }
+
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
+        let before = self.win.state().size;
         self.sync_from_core();
         // --- The upstream Table arranged its columns (resize / move / show /
         // hide): persist the new layout for the panel's key. The broadcast
@@ -888,6 +890,15 @@ impl View for ExplorerWindow {
         }
         self.redraw_texts(ctx);
         self.win.handle_event(ev, ctx);
+        // Zoom / fullscreen re-bound the inner window's group directly
+        // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
+        // reaches this window's `change_bounds`; reconcile so the panels and
+        // their breadcrumb/filter/hint children follow the new client area (and
+        // the tables re-publish their scroll bars).
+        if self.win.state().size != before {
+            self.reapply_layout();
+            self.win.on_bounds_changed(ctx);
+        }
     }
 
     fn set_modal_answer(&mut self, cmd: Command) {
