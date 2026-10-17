@@ -2,6 +2,14 @@ use super::*;
 use crate::domain::layers::{Analysis, DiffType, Entry, Kind, Layer, Tree, hash_bytes};
 use crate::testutil;
 use tv::Role;
+use tv::event::{Key, KeyEvent, KeyModifiers};
+
+fn mods(ctrl: bool) -> KeyModifiers {
+    KeyModifiers {
+        ctrl,
+        ..KeyModifiers::default()
+    }
+}
 
 fn entry(path: &str, contents: &str) -> Entry {
     Entry {
@@ -95,6 +103,24 @@ fn three_layer_analysis() -> Analysis {
 fn sync_and_draw(win: &mut LayersWindow) {
     win.sync_from_core();
     crate::testutil::with_ctx(|ctx| win.redraw(ctx));
+}
+
+/// A window over a seeded core, synced and drawn — the shared setup for
+/// the key/filter tests.
+fn window_with(a: Analysis) -> LayersWindow {
+    let mut core = crate::core::AppCore::new();
+    core.image_layers.insert("sha256:aaa".into(), Some(a));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut win = build(
+        Rc::new(RefCell::new(core)),
+        Rect::new(0, 0, 80, 24),
+        "sha256:aaa".into(),
+        "img".into(),
+        Rc::new(RefCell::new(false)),
+        tx,
+    );
+    sync_and_draw(&mut win);
+    win
 }
 
 #[test]
@@ -304,4 +330,132 @@ fn the_window_titles_itself_and_lists_every_layer() {
     assert!(text.contains("FROM alpine"), "{text}");
     assert!(text.contains("RUN apk add"), "{text}");
     assert!(text.contains("Efficiency"), "{text}");
+}
+
+#[test]
+fn ctrl_t_toggles_the_compare_mode_and_the_title() {
+    let mut win = window_with(three_layer_analysis());
+    assert_eq!(win.mode, Compare::Single);
+    testutil::send_event(
+        &mut win,
+        Event::KeyDown(KeyEvent::new(Key::Char('t'), mods(true))),
+    );
+    assert_eq!(win.mode, Compare::Aggregated, "Ctrl+T flips the mode");
+    testutil::send_event(
+        &mut win,
+        Event::KeyDown(KeyEvent::new(Key::Char('t'), mods(true))),
+    );
+    assert_eq!(win.mode, Compare::Single);
+}
+
+#[test]
+fn plus_and_minus_expand_and_collapse_the_focused_directory() {
+    let mut win = window_with(three_layer_analysis());
+    win.selected = 1;
+    sync_and_draw(&mut win);
+    // `/etc` starts expanded (the root always is).
+    assert!(win.visible_rows().iter().any(|r| r.path == "/etc/hosts"));
+    win.collapse("/etc");
+    assert!(!win.visible_rows().iter().any(|r| r.path == "/etc/hosts"));
+    win.expand("/etc");
+    assert!(win.visible_rows().iter().any(|r| r.path == "/etc/hosts"));
+}
+
+/// Collapsing a DEEP directory hides every descendant of it — not just
+/// one level down (the ancestor check walks full path prefixes).
+#[test]
+fn collapsing_a_nested_directory_hides_its_whole_subtree() {
+    let mut t0 = Tree::new();
+    t0.add_path(entry("/etc/sub/deep/x", "v1"));
+    let a = Analysis {
+        layers: vec![Layer {
+            index: 0,
+            id: "a".into(),
+            command: "FROM".into(),
+            size: 100,
+            removed: Vec::new(),
+            tree: t0,
+        }],
+        efficiency: 1.0,
+        wasted_bytes: 0,
+        inefficient: Vec::new(),
+    };
+    let mut win = window_with(a);
+    sync_and_draw(&mut win);
+    assert!(
+        win.visible_rows()
+            .iter()
+            .any(|r| r.path == "/etc/sub/deep/x")
+    );
+    win.collapse("/etc/sub");
+    let still: Vec<String> = win.visible_rows().into_iter().map(|r| r.path).collect();
+    assert!(
+        !still.iter().any(|p| p == "/etc/sub/deep/x"),
+        "the subtree is hidden: {still:?}"
+    );
+    assert!(
+        !still.iter().any(|p| p == "/etc/sub/deep"),
+        "the child directory too: {still:?}"
+    );
+    assert!(
+        still.iter().any(|p| p == "/etc/sub"),
+        "the collapsed directory itself stays: {still:?}"
+    );
+    assert!(
+        still.iter().any(|p| p == "/etc"),
+        "its ancestors stay: {still:?}"
+    );
+}
+
+#[test]
+fn the_a_key_hides_added_rows() {
+    let mut win = window_with(three_layer_analysis());
+    win.selected = 1;
+    sync_and_draw(&mut win);
+    assert!(win.visible_rows().iter().any(|r| r.path == "/etc/new"));
+    win.toggle_diff(DiffType::Added);
+    assert!(!win.visible_rows().iter().any(|r| r.path == "/etc/new"));
+    win.toggle_diff(DiffType::Added);
+    assert!(win.visible_rows().iter().any(|r| r.path == "/etc/new"));
+}
+
+/// The path filter bar must actually narrow the tree (spec §7): typed
+/// through the real key path, one event per keystroke — no second event
+/// may be needed for the sink the `FilterBar` just wrote to reach the
+/// model.
+#[test]
+fn the_path_filter_bar_narrows_the_tree_as_you_type() {
+    let mut win = window_with(three_layer_analysis());
+    win.selected = 1;
+    sync_and_draw(&mut win);
+    // The pump does this before children can report `focused` (the
+    // explorer test's pattern): mark the group focused, settle its
+    // currency, then descend to the tree table.
+    crate::testutil::with_ctx(|ctx| {
+        win.win.state_mut().state.focused = true;
+        win.win.settle_currency(ctx);
+        win.win.focus_descendant(win.tree_table, ctx);
+    });
+    // `/` sends focus to the active pane's filter bar — the tree table
+    // holds the focus, so it's the path filter.
+    testutil::send_key(&mut win, Key::Char('/'));
+    assert!(win.is_focused(win.tree_filter), "the path bar holds focus");
+    for c in "new".chars() {
+        testutil::send_key(&mut win, Key::Char(c));
+    }
+    assert_eq!(&*win.tree_filter_sink.borrow(), "new");
+    let keys: Vec<String> = {
+        let table = win.table_mut(win.tree_table).expect("tree table");
+        let model = table.model();
+        (0..model.row_count()).map(|i| model.row_key(i).0).collect()
+    };
+    assert_eq!(
+        keys,
+        vec!["/etc/new".to_string()],
+        "one event per keystroke: only the needle's path survives"
+    );
+    // Clearing the sink restores the whole tree.
+    win.tree_filter_sink.borrow_mut().clear();
+    sync_and_draw(&mut win);
+    assert!(win.visible_rows().iter().any(|r| r.path == "/etc/hosts"));
 }

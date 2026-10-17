@@ -8,10 +8,11 @@ use crate::domain::layers::{Analysis, Compare, Comparer, DiffType, Tree};
 use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
 use crate::widgets::{Align, Column, FilterBar, SharedLine};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use tokio::sync::mpsc;
-use tv::event::Event;
-use tv::widgets::{SelectionMode, Table};
+use tv::event::{Event, Key};
+use tv::widgets::{SelectionMode, SortDir, Table};
 use tv::{Context, HelpCtx, Rect, Role, View, ViewState, Window, delegate};
 
 /// Help context while a Layers window is focused.
@@ -94,10 +95,22 @@ pub struct LayersWindow {
     tree_filter: tv::ViewId,
     summary_id: tv::ViewId,
     summary: Rc<RefCell<String>>,
+    /// The layer filter bar's shared sink (`FilterBar` writes it on every
+    /// keystroke; the window reads it back in [`redraw`]).
+    layer_filter_sink: Rc<RefCell<String>>,
+    /// The path filter bar's shared sink (the tree's needle, see
+    /// [`Self::visible_rows`]).
+    tree_filter_sink: Rc<RefCell<String>>,
     /// The selected layer index (the left table's focused row).
     selected: usize,
     /// Which comparison the change tree shows (rule 5).
     mode: Compare,
+    /// Directories the user collapsed (the root is never collapsed).
+    collapsed: HashSet<String>,
+    /// Change types currently hidden (A/R/M/U toggles), indexed by
+    /// [`diff_index`] — `DiffType` carries no `Hash`, so a fixed array
+    /// stands in for a set.
+    hidden: [bool; 4],
     comparer: Comparer,
     /// The flattened rows of the change tree, in DFS order.
     tree_rows: Vec<TreeRow>,
@@ -127,11 +140,21 @@ fn make_table(rect: Rect, key: &str, columns: Vec<Column>, rows: Vec<TableRow>) 
     table
 }
 
-/// The layer-table rows: a compare marker, the size and the command.
-fn layer_rows(analysis: &Analysis, selected: usize) -> Vec<TableRow> {
+/// The layer-table rows: a compare marker, the size and the command —
+/// kept when `needle` fuzzy-matches the command cell (the
+/// [`crate::views::resource::fuzzy_keep_row`] matcher, restricted to the
+/// row's search text; empty matches all).
+fn layer_rows(analysis: &Analysis, selected: usize, needle: &str) -> Vec<TableRow> {
     analysis
         .layers
         .iter()
+        .filter(|l| {
+            needle.is_empty()
+                || crate::views::resource::fuzzy_keep_row(
+                    &TableRow::new(String::new(), vec![l.command.clone()]),
+                    needle,
+                )
+        })
         .map(|l| {
             let marker = if l.index == selected { "▏" } else { " " };
             TableRow::new(
@@ -144,6 +167,35 @@ fn layer_rows(analysis: &Analysis, selected: usize) -> Vec<TableRow> {
             )
         })
         .collect()
+}
+
+/// The inefficient-paths strip rows: count, wasted bytes and path.
+fn inefficient_rows(analysis: &Analysis) -> Vec<TableRow> {
+    analysis
+        .inefficient
+        .iter()
+        .map(|p| {
+            TableRow::new(
+                p.path.clone(),
+                vec![
+                    p.count.to_string(),
+                    crate::views::resource::format_size(p.wasted as i64),
+                    p.path.clone(),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// A dense index for [`DiffType`] (the [`LayersWindow::hidden`] array —
+/// `DiffType` does not implement `Hash`).
+fn diff_index(diff: DiffType) -> usize {
+    match diff {
+        DiffType::Unmodified => 0,
+        DiffType::Modified => 1,
+        DiffType::Added => 2,
+        DiffType::Removed => 3,
+    }
 }
 
 /// One row of the change tree (the flatten result, kept so the key
@@ -251,6 +303,34 @@ pub fn build(
     let summary = Rc::new(RefCell::new(String::new()));
     let layer_sink = Rc::new(RefCell::new(String::new()));
     let tree_sink = Rc::new(RefCell::new(String::new()));
+    // Keep the sinks on the window too: the `FilterBar`s write them, the
+    // window reads the needles back for filtering.
+    let layer_filter_sink = Rc::clone(&layer_sink);
+    let tree_filter_sink = Rc::clone(&tree_sink);
+
+    // Seed all three tables with what the first `redraw` would produce
+    // (the ResourceWindow's build-seeded `initial_model`): the redraw now
+    // runs AFTER the child routing, so without this a fresh window's
+    // first event would land on empty tables.
+    let seeded = core
+        .borrow()
+        .image_layers
+        .get(&key)
+        .cloned()
+        .flatten()
+        .filter(|a| !a.layers.is_empty());
+    let mut comparer = Comparer::new();
+    let (seed_layers, seed_tree, seed_inefficient) = match &seeded {
+        Some(a) => {
+            let tree = comparer.tree(&a.layers, Compare::Single, 0).clone();
+            (
+                layer_rows(a, 0, ""),
+                tree_rows_for(&flatten(&tree), &tree),
+                inefficient_rows(a),
+            )
+        }
+        None => (Vec::new(), Vec::new(), Vec::new()),
+    };
 
     let summary_id = win.insert_child(Box::new(SharedLine::new(
         r.summary,
@@ -271,13 +351,13 @@ pub fn build(
         r.layer_table,
         LAYER_TABLE_KEY,
         layer_columns(),
-        Vec::new(),
+        seed_layers,
     )));
     let tree_table = win.insert_child(Box::new(make_table(
         r.tree_table,
         TREE_TABLE_KEY,
         tree_columns(),
-        Vec::new(),
+        seed_tree,
     )));
     let inefficient_table = win.insert_child(Box::new(make_table(
         r.inefficient,
@@ -287,7 +367,7 @@ pub fn build(
             Column::new("WASTED", 10, Align::Right),
             Column::new("PATH", 40, Align::Left),
         ],
-        Vec::new(),
+        seed_inefficient,
     )));
 
     let mut window = LayersWindow {
@@ -303,9 +383,13 @@ pub fn build(
         tree_filter,
         summary_id,
         summary,
+        layer_filter_sink,
+        tree_filter_sink,
         selected: 0,
         mode: Compare::Single,
-        comparer: Comparer::new(),
+        collapsed: HashSet::new(),
+        hidden: [false; 4],
+        comparer,
         tree_rows: Vec::new(),
         analysis: None,
         last_rev: None,
@@ -379,6 +463,179 @@ impl LayersWindow {
         }
     }
 
+    /// Show `path`'s subtree again (Space / `+`).
+    pub fn expand(&mut self, path: &str) {
+        self.collapsed.remove(path);
+    }
+
+    /// Hide `path`'s subtree (`-`).
+    pub fn collapse(&mut self, path: &str) {
+        self.collapsed.insert(path.to_string());
+    }
+
+    /// Flip change type `diff` between shown and hidden (A/R/M/U).
+    pub fn toggle_diff(&mut self, diff: DiffType) {
+        let i = diff_index(diff);
+        self.hidden[i] = !self.hidden[i];
+    }
+
+    /// Switch between the two dive compare modes (Ctrl+T): the selected
+    /// layer against its stack, or layer 0 against the whole stack.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            Compare::Single => Compare::Aggregated,
+            Compare::Aggregated => Compare::Single,
+        };
+    }
+
+    /// The rows the collapse state, the change-type filters and the path
+    /// filter allow through, in DFS order — ONE pass over the flattened
+    /// rows, the single source [`redraw`] feeds to [`tree_rows_for`]. A
+    /// directory hides its whole subtree when it is collapsed; the root
+    /// (`/`) is never collapsed.
+    pub fn visible_rows(&self) -> Vec<TreeRow> {
+        let needle = self.tree_filter_sink.borrow().to_lowercase();
+        self.tree_rows
+            .iter()
+            .filter(|r| !self.hidden[diff_index(r.diff)])
+            .filter(|r| self.expanded_by(&r.path))
+            .filter(|r| needle.is_empty() || r.path.to_lowercase().contains(&needle))
+            .cloned()
+            .collect()
+    }
+
+    /// No ancestor directory of `path` (root excluded) is collapsed — a
+    /// nearest-to-root walk over the path prefixes, so collapsing
+    /// `/usr/lib` hides `/usr/lib/jvm/bin` too.
+    fn expanded_by(&self, path: &str) -> bool {
+        let mut ancestor = path;
+        while let Some(i) = ancestor.rfind('/') {
+            ancestor = &ancestor[..i];
+            if ancestor.is_empty() {
+                return true; // the root is never collapsed
+            }
+            if self.collapsed.contains(ancestor) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The tree path of the right table's focused row (`None` while
+    /// nothing is rendered yet). The row's KEY is the path, so this stays
+    /// correct under a Ctrl+O sort — an index into [`Self::visible_rows`]
+    /// would not.
+    fn focused_tree_path(&mut self) -> Option<String> {
+        self.table_mut(self.tree_table)?.focused_key().map(|k| k.0)
+    }
+
+    /// Is `id` (or one of its descendants) the focused view? (The
+    /// Explorer's `is_focused`; `child_mut` because focus lives on the
+    /// child's own state.)
+    fn is_focused(&mut self, id: tv::ViewId) -> bool {
+        self.win
+            .child_mut(id)
+            .is_some_and(|v| v.state().state.focused)
+    }
+
+    /// Is one of the two filter bars focused? (gate for the printables —
+    /// a focused bar swallows them for typing instead, the Explorer's
+    /// `filter_focused`.)
+    fn filter_focused(&mut self) -> bool {
+        self.is_focused(self.layer_filter) || self.is_focused(self.tree_filter)
+    }
+
+    /// Ctrl+O: step the focused table's sort to the next column, ascending
+    /// (the Explorer's `cycle_sort`, without the hidden-column probe — these
+    /// tables have no hidden columns).
+    fn cycle_sort(&mut self, forward: bool, ctx: &mut Context) {
+        let on_tree = self.is_focused(self.tree_table);
+        let (id, n) = if on_tree {
+            (self.tree_table, tree_columns().len())
+        } else {
+            (self.layer_table, layer_columns().len())
+        };
+        let Some(t) = self.table_mut(id) else { return };
+        let step: i64 = if forward { 1 } else { -1 };
+        let start = t
+            .sort_spec()
+            .map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
+        let col = ((start + step).rem_euclid(n as i64)) as usize;
+        t.sort_by(col, if forward { SortDir::Asc } else { SortDir::Desc }, ctx);
+    }
+
+    /// `/` (spec §7): send the filter bar of the pane that owns the focus.
+    fn focus_active_filter(&mut self, ctx: &mut Context) {
+        let on_tree = self.is_focused(self.tree_table);
+        let target = if on_tree {
+            self.tree_filter
+        } else {
+            self.layer_filter
+        };
+        self.win.focus_descendant(target, ctx);
+    }
+
+    /// The window's own keys (design §7): expand/collapse, the
+    /// compare-mode toggle, the four change-type filters, Ctrl+O's sort
+    /// step and `/`'s filter focus. Only mutates state or moves focus —
+    /// `handle_event` delegates to the children and redraws after this
+    /// returns. The printables are gated on no filter bar being focused
+    /// (the Explorer's rule): a focused bar swallows them for typing.
+    fn window_keys(&mut self, ev: &mut Event, ctx: &mut Context) {
+        let Event::KeyDown(ke) = ev else { return };
+        match (ke.key, ke.modifiers.ctrl) {
+            // Ctrl chords the FilterBar never consumes.
+            (Key::Char('t'), true) => {
+                self.toggle_mode();
+                ev.clear();
+            }
+            (Key::Char('o'), true) => {
+                self.cycle_sort(true, ctx);
+                ev.clear();
+            }
+            (key, false) if !self.filter_focused() => match key {
+                Key::Char('/') => {
+                    self.focus_active_filter(ctx);
+                    ev.clear();
+                }
+                Key::Char(' ') | Key::Char('+') => {
+                    if let Some(path) = self.focused_tree_path() {
+                        self.expand(&path);
+                        ev.clear();
+                    }
+                }
+                Key::Char('-') => {
+                    if let Some(path) = self.focused_tree_path() {
+                        self.collapse(&path);
+                        ev.clear();
+                    }
+                }
+                Key::Char('*') => {
+                    self.collapsed.clear();
+                    ev.clear();
+                }
+                Key::Char('a') => {
+                    self.toggle_diff(DiffType::Added);
+                    ev.clear();
+                }
+                Key::Char('r') => {
+                    self.toggle_diff(DiffType::Removed);
+                    ev.clear();
+                }
+                Key::Char('m') => {
+                    self.toggle_diff(DiffType::Modified);
+                    ev.clear();
+                }
+                Key::Char('u') => {
+                    self.toggle_diff(DiffType::Unmodified);
+                    ev.clear();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     /// Push the cached analysis into the three tables (needs a `Context`, so
     /// it runs from `handle_event` — the `redraw_texts` pattern).
     fn redraw(&mut self, ctx: &mut Context) {
@@ -396,37 +653,27 @@ impl LayersWindow {
             }
             return;
         };
-        let rows = layer_rows(&a, self.selected);
+        let rows = layer_rows(&a, self.selected, &self.layer_filter_sink.borrow());
         if let Some(t) = self.table_mut(self.layer_table) {
             t.set_model(Box::new(RowModel::new(rows)), ctx);
         }
         // `Comparer::tree` borrows self mutably, so flatten into a local
-        // before touching the table.
+        // before touching the table. The collapse state, the change-type
+        // filters and the path needle re-shape the flattened rows into
+        // the visible rows — ONE O(n) pass in `visible_rows`, fed
+        // straight to `tree_rows_for` (no per-row membership lookup).
         let tree = self
             .comparer
             .tree(&a.layers, self.mode, self.selected)
             .clone();
         self.tree_rows = flatten(&tree);
-        let rows = tree_rows_for(&self.tree_rows, &tree);
+        let visible = self.visible_rows();
         if let Some(t) = self.table_mut(self.tree_table) {
+            let rows = tree_rows_for(&visible, &tree);
             t.set_model(Box::new(RowModel::new(rows)), ctx);
         }
         if let Some(t) = self.table_mut(self.inefficient_table) {
-            let rows: Vec<TableRow> = a
-                .inefficient
-                .iter()
-                .map(|p| {
-                    TableRow::new(
-                        p.path.clone(),
-                        vec![
-                            p.count.to_string(),
-                            crate::views::resource::format_size(p.wasted as i64),
-                            p.path.clone(),
-                        ],
-                    )
-                })
-                .collect();
-            t.set_model(Box::new(RowModel::new(rows)), ctx);
+            t.set_model(Box::new(RowModel::new(inefficient_rows(&a))), ctx);
         }
     }
 
@@ -473,12 +720,16 @@ impl View for LayersWindow {
         self.reapply_layout();
     }
 
-    /// Every event: first map a fresh analysis, then push the cached rows
-    /// into the tables (the Explorer's `sync_from_core` + `redraw_texts`).
+    /// Every event: run the window's own keys, map a fresh analysis,
+    /// delegate to the children, then push the cached rows into the
+    /// tables (the Explorer's `sync_from_core` + `redraw_texts`, in the
+    /// ResourceWindow's delegate-then-refilter ORDER): the redraw runs
+    /// LAST, so a keystroke a focused `FilterBar` turns into sink text is
+    /// reflected in the model of the SAME event.
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         let before = self.win.state().size;
+        self.window_keys(ev, ctx);
         self.sync_from_core();
-        self.redraw(ctx);
         self.win.handle_event(ev, ctx);
         // Zoom / fullscreen re-bound the inner window's group directly,
         // bypassing this window's `change_bounds` (the Explorer's
@@ -487,6 +738,7 @@ impl View for LayersWindow {
             self.reapply_layout();
             self.win.on_bounds_changed(ctx);
         }
+        self.redraw(ctx);
     }
 }
 
