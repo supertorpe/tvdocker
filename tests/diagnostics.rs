@@ -40,10 +40,13 @@ fn right_click(screen: &HeadlessHandle, x: i32, y: i32) {
 fn menu_diagnose(program: &mut Program, screen: &HeadlessHandle) {
     right_click(screen, 12, 6);
     // The popup needs several cycles to paint; a second invocation (over a
-    // freshly raised window) needs more than the first.
+    // freshly raised window) needs more than the first. The upstream `Table`
+    // (resource windows) is a nested group whose body is the focused leaf, so
+    // opening the Diagnostics window releases one focus level more than the
+    // old single-view table — hence one extra settle cycle here.
     pump(program, 10);
     screen.push_key(Key::Char('n'), KeyModifiers::default());
-    pump(program, 6);
+    pump(program, 7);
 }
 
 /// The focused Diagnostics window's frame position `(row, column of the

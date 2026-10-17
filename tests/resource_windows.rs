@@ -130,10 +130,12 @@ fn two_resource_windows_keep_independent_filters() {
     screen.push_key(Key::F(6), KeyModifiers::default());
     pump(&mut program, 3);
     screen.push_key(Key::Tab, KeyModifiers::default());
-    pump(&mut program, 2);
+    pump(&mut program, 3);
     for k in ['n', 'g', 'i', 'n'] {
         screen.push_key(Key::Char(k), KeyModifiers::default());
-        pump(&mut program, 2);
+        // 3, not 2: the nested Table's focus broadcasts leave the last
+        // keystroke one pass behind (see runtime tab_order).
+        pump(&mut program, 3);
     }
     let text = screen_text(&screen);
     assert!(text.contains("filter ngin"), "images filtered: {text:?}");

@@ -3,9 +3,11 @@
 
 use crate::core::{AppCore, PendingKind};
 use crate::views::resource::{self, ResourceSpec, ResourceWindow};
-use crate::widgets::{Align, Column, TableRow};
+use crate::widgets::resource_table::TableRow;
+use crate::widgets::{Align, Column};
 use std::cell::RefCell;
 use std::rc::Rc;
+use tv::widgets::SortKey;
 use tv::{HelpCtx, Rect};
 
 /// Help context while the Containers window is focused
@@ -48,6 +50,12 @@ pub fn total(core: &AppCore) -> usize {
     core.containers.len()
 }
 
+/// Raw per-column sort keys, index-aligned with [`rows`] — every container
+/// cell sorts as text (no hidden numeric value), so this is empty.
+pub fn sort_keys(_core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
+    Vec::new()
+}
+
 /// The container context menu: hot
 /// letters are scoped to the open menu ; Start/Stop
 /// flips on the ROW's state (the desktop filters the target set
@@ -87,7 +95,8 @@ const SPEC: ResourceSpec = ResourceSpec {
     total,
     empty: " No containers.",
     context_menu: Some(context_menu),
-    picker: Some(&["Name", "Image", "State", "Status", "Ports"]),
+    table_key: "containers",
+    sort_keys,
 };
 
 /// Build the window — **signature unchanged** so `chrome.rs`,

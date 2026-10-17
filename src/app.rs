@@ -96,9 +96,6 @@ pub const CMD_RUN_SUBMIT: Command = Command::custom("tvdocker.run_submit");
 pub const CMD_TOGGLE_FOLLOW: Command = Command::custom("tvdocker.toggle_follow");
 pub const CMD_TOGGLE_TIMESTAMPS: Command = Command::custom("tvdocker.toggle_timestamps");
 pub const CMD_EXPORT_LOGS: Command = Command::custom("tvdocker.export_logs");
-/// Column picker (hop 1 — the resource window owns the dialog;
-/// bound only where it works: def-1/def-2).
-pub const CMD_COLUMNS: Command = Command::custom("tvdocker.columns");
 /// The Settings window asks every status line to rebuild from the config
 /// (settings — live reload on save). Broadcast, not dispatched to
 /// one view: there may be a status line per screen.
@@ -308,7 +305,7 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                             ..KeyModifiers::default()
                         },
                     ),
-                    CMD_COLUMNS,
+                    Command::TABLE_COLUMNS,
                 )
         })
         // Images: visible F2 = Run…; hidden Del.
@@ -341,7 +338,7 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                             ..KeyModifiers::default()
                         },
                     ),
-                    CMD_COLUMNS,
+                    Command::TABLE_COLUMNS,
                 )
         })
         // Networks: hidden Del; Ctrl+O.
@@ -356,7 +353,7 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                             ..KeyModifiers::default()
                         },
                     ),
-                    CMD_COLUMNS,
+                    Command::TABLE_COLUMNS,
                 )
         })
         // Volumes: Enter opens Explorer, Del, Ctrl+O.
@@ -372,7 +369,7 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                             ..KeyModifiers::default()
                         },
                     ),
-                    CMD_COLUMNS,
+                    Command::TABLE_COLUMNS,
                 )
         })
         // Explorer: F5 Refresh, Del.
@@ -945,7 +942,7 @@ mod tests {
 
     #[test]
     fn the_universal_def_leaves_enter_and_del_unbound() {
-        // The modals (shell config, column picker) report NO_CONTEXT, so
+        // The modals (shell config) report NO_CONTEXT, so
         // while one is open the pump's idle pass re-targets the status
         // line to the MODAL's ctx (tvision-rs program.rs:2176-2198) and
         // this universal def applies. It must NOT bind Enter/Del — a

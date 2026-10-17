@@ -5,9 +5,11 @@
 
 use crate::core::AppCore;
 use crate::views::resource::{self, ResourceSpec, ResourceWindow};
-use crate::widgets::{Align, Column, TableRow};
+use crate::widgets::resource_table::TableRow;
+use crate::widgets::{Align, Column};
 use std::cell::RefCell;
 use std::rc::Rc;
+use tv::widgets::SortKey;
 use tv::{HelpCtx, Rect};
 
 /// Help context while the Events window is focused .
@@ -52,6 +54,12 @@ pub fn total(core: &AppCore) -> usize {
     core.events.len()
 }
 
+/// Raw per-column sort keys, index-aligned with [`rows`] — every event cell
+/// sorts as text (TIME is zero-padded `HH:MM:SS`), so this is empty.
+pub fn sort_keys(_core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
+    Vec::new()
+}
+
 const SPEC: ResourceSpec = ResourceSpec {
     title: "Events",
     number: 5,
@@ -62,7 +70,8 @@ const SPEC: ResourceSpec = ResourceSpec {
     total,
     empty: " Waiting for Docker events…",
     context_menu: None,
-    picker: None,
+    table_key: "events",
+    sort_keys,
 };
 
 /// Build the window (no CLI prefill — prefills Containers).

@@ -2,9 +2,11 @@
 
 use crate::core::{AppCore, PendingKind};
 use crate::views::resource::{self, ResourceSpec, ResourceWindow, format_size};
-use crate::widgets::{Align, Column, TableRow};
+use crate::widgets::resource_table::TableRow;
+use crate::widgets::{Align, Column};
 use std::cell::RefCell;
 use std::rc::Rc;
+use tv::widgets::SortKey;
 use tv::{HelpCtx, Rect};
 
 /// Help context while the Volumes window is focused .
@@ -33,7 +35,6 @@ pub fn to_row(v: &crate::domain::docker::volumes::VolumeEntry) -> TableRow {
             v.mountpoint.clone(),
         ],
     )
-    .with_sort_keys(vec![None, None, Some(v.size as f64), None])
 }
 
 /// ALL volume rows — unfiltered (the window owns fuzzy filtering).
@@ -44,6 +45,18 @@ pub fn rows(core: &AppCore) -> Vec<TableRow> {
 /// Info-line denominator: the live volume count (counts).
 pub fn total(core: &AppCore) -> usize {
     core.volumes.len()
+}
+
+/// Raw sort keys index-aligned with [`rows`]: SIZE (col 2) sorts on the raw
+/// bytes, not the `1.5MB` display text.
+pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
+    vec![(
+        2,
+        core.volumes
+            .iter()
+            .map(|v| SortKey::Num(v.size as f64))
+            .collect(),
+    )]
 }
 
 /// The Volumes context menu (delete + confirm; Enter opens Explorer).
@@ -67,7 +80,8 @@ const SPEC: ResourceSpec = ResourceSpec {
     total,
     empty: " No volumes.",
     context_menu: Some(context_menu),
-    picker: Some(&["Name", "Driver", "Size", "Mountpoint"]),
+    table_key: "volumes",
+    sort_keys,
 };
 
 /// Build the window (no CLI prefill — prefills Containers).
@@ -99,7 +113,14 @@ mod tests {
                 "/var/lib/docker/volumes/data/_data"
             ]
         );
-        assert_eq!(r.sort_keys, vec![None, None, Some(1_500_000.0), None]);
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut()
+            .apply(crate::core::AppMsg::Volumes(vec![v]));
+        assert_eq!(
+            sort_keys(&core.borrow()),
+            vec![(2, vec![SortKey::Num(1_500_000.0)])],
+            "SIZE sorts on raw bytes"
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@ fn messages_flow_bridge_to_screen_with_status_and_rows() {
     clock.advance(60);
     // 6, not 4: timers collect only on an IDLE pass, and this window's
     // startup chain (settle → grants → regray broadcasts) runs ~6 pumps.
-    pump(&mut program, 6);
+    pump(&mut program, 7);
     let text = screen_text(&screen);
     assert!(
         text.contains("web") && text.contains("db"),
@@ -349,19 +349,27 @@ fn tab_order_is_filter_then_table() {
         .unwrap();
     pump(&mut program, 3);
     screen.push_key(Key::Tab, KeyModifiers::default()); // table → filter
-    pump(&mut program, 2);
+    // 3, not 2: the nested Table group emits extra focus broadcasts, so the
+    // focus move settles a pass later (same lag the phases below account for).
+    pump(&mut program, 3);
     screen.push_key(Key::Char('q'), KeyModifiers::default());
     pump(&mut program, 3);
     assert!(screen_text(&screen).contains('q'), "filter receives typing");
     // Tab → table: typing now goes nowhere the filter can see.
     screen.push_key(Key::Tab, KeyModifiers::default());
-    pump(&mut program, 2);
+    pump(&mut program, 3);
     screen.push_key(Key::Char('y'), KeyModifiers::default());
-    pump(&mut program, 2);
-    assert!(!screen_text(&screen).contains('y'), "focus left the filter");
+    pump(&mut program, 3);
+    // The upstream Table's empty-model placeholder is "<empty>" (contains a
+    // 'y'), so a whole-screen 'y' probe no longer means "the filter saw it";
+    // check that the filter line did not gain the char after its "q".
+    assert!(
+        !screen_text(&screen).contains("qy"),
+        "focus left the filter"
+    );
     // Tab again (bar skipped) → back on the filter.
     screen.push_key(Key::Tab, KeyModifiers::default());
-    pump(&mut program, 2);
+    pump(&mut program, 3);
     screen.push_key(Key::Char('z'), KeyModifiers::default());
     // 4, not 2: with the startup deferred/broadcast backlog still queued,
     // a fresh keystroke surfaces on a later pass (measured: caret/focus was
@@ -399,7 +407,9 @@ fn images_messages_flow_into_their_window_through_the_bridge() {
         }]))
         .expect("channel open");
     clock.advance(60); // the bridge timer drains on its next tick
-    pump(&mut program, 6); // timers collect on an idle pass
+    pump(&mut program, 10); // timers collect on an idle pass; opening the
+    // Images window queued extra focus/settle broadcasts, so the drain+refresh
+    // surfaces a few passes later than the single-window harness.
     let text = screen_text(&screen);
     assert!(text.contains("nginx"), "rows on screen: {text:?}");
     assert!(text.contains("1.5MB"), "formatted SIZE column: {text:?}");

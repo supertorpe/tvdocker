@@ -196,9 +196,12 @@ fn each_container_keeps_its_own_details_window() {
         _ => panic!("Inspect task"),
     }
     // Refocus Containers (its open-or-focus command), move to row 2 and
-    // open its Details too — without closing the first.
+    // open its Details too — without closing the first. Re-focusing a
+    // window whose body is the nested upstream `Table` queues focus
+    // events, so the refocus settles late (~10 pumps); moving earlier
+    // would send `Down` to the still-focused Details window.
     screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
-    pump(&mut program, 3);
+    pump(&mut program, 10);
     screen.push_key(Key::Down, KeyModifiers::default());
     pump(&mut program, 2);
     screen.push_key(Key::Enter, KeyModifiers::default());
@@ -226,21 +229,28 @@ fn each_container_keeps_its_own_details_window() {
 fn delete_confirm_no_sends_nothing() {
     let (program, screen, _core, mut task_rx) = start(two_rows());
     // Delete opens the confirm box; the box then SWALLOWS Down (the cursor
-    // must not move) and answers 'n'. Both the swallowed key and the empty
-    // channel are what prove the box was really up.
+    // must not move) and answers 'n'. An open modal runs only under
+    // `run_program`, so nothing can be inspected mid-run: cancel that box
+    // and immediately open a second one with Delete + Yes. The ONLY request
+    // must be the removal of the row the cursor still sits on — row 1 —
+    // which proves both that No queued nothing and that the first box ate
+    // the Down (an unswallowed Down would have retargeted the second delete
+    // to row 2). The upstream Table paints its cursor as a row style, not a
+    // `>` marker, so this indirect probe replaces the old screen-text one.
     screen.push_key(Key::Delete, KeyModifiers::default());
     screen.push_key(Key::Down, KeyModifiers::default());
     screen.push_event(Event::Command(Command::NO));
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
     close_modal_and_quit(&screen);
     app::run_program(program, None);
+    let mut got = Vec::new();
+    while let Ok(req) = task_rx.try_recv() {
+        got.push(req);
+    }
     assert!(
-        task_rx.try_recv().is_err(),
-        "No ⇒ nothing is queued for the worker"
-    );
-    let text = screen_text(&screen);
-    assert!(
-        text.contains(">webalpha"),
-        "the confirm box swallowed Down (cursor never moved): {text:?}"
+        matches!(got.as_slice(), [TaskReq::RemoveContainer { id }] if id.as_str() == "id-alpha"),
+        "No queued nothing, and the swallowed Down left the cursor on row 1"
     );
 }
 
@@ -402,51 +412,6 @@ fn shell_cancel_sends_nothing() {
 }
 
 #[test]
-fn column_picker_applies_only_on_ok() {
-    // Phase 1 — Ctrl+O, toggle NAME, CANCEL. The dialog swallows Space
-    // (the table would otherwise select the cursor row), which is the
-    // observable proof it was open; the column must stay.
-    let (program, screen, _core, _task_rx) = start(two_rows());
-    screen.push_key(
-        Key::Char('o'),
-        KeyModifiers {
-            ctrl: true,
-            ..KeyModifiers::default()
-        },
-    );
-    screen.push_key(Key::Char(' '), KeyModifiers::default());
-    screen.push_key(Key::Esc, KeyModifiers::default());
-    close_modal_and_quit(&screen);
-    app::run_program(program, None);
-    let text = screen_text(&screen);
-    assert!(
-        text.contains("NAME"),
-        "cancel ⇒ the column stays (Review Focus #5): {text:?}"
-    );
-    assert!(
-        !text.contains('*'),
-        "the picker dialog swallowed Space — no row got selected: {text:?}"
-    );
-
-    // Phase 2 — again, toggle, APPLY with Enter.
-    let (program, screen, _core, _task_rx) = start(two_rows());
-    screen.push_key(
-        Key::Char('o'),
-        KeyModifiers {
-            ctrl: true,
-            ..KeyModifiers::default()
-        },
-    );
-    screen.push_key(Key::Char(' '), KeyModifiers::default());
-    screen.push_event(Event::Command(Command::OK));
-    close_modal_and_quit(&screen);
-    app::run_program(program, None);
-    let text = screen_text(&screen);
-    assert!(!text.contains("NAME"), "OK ⇒ NAME hidden: {text:?}");
-    assert!(text.contains("IMAGE"), "the other columns stay");
-}
-
-#[test]
 fn images_del_batch_removes_exactly_the_selection() {
     let (mut program, screen, core, mut task_rx) = start(two_rows());
     core.borrow_mut().apply(AppMsg::Images(vec![
@@ -577,9 +542,10 @@ fn images_f2_opens_the_run_form_and_submits_its_values() {
     )]));
     screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
     // The status def switches on an IDLE pass; measured: the Images def
-    // ("F2 Run…") lands at the 6th pump after the open command (the same
-    // settling the chrome.rs chords tests pin).
-    pump(&mut program, 6);
+    // ("F2 Run…") lands at the 9th pump after the open command (the nested
+    // upstream Table queues focus/broadcast events, so the help ctx settles
+    // later than before — the chrome.rs chords tests pin the same settling).
+    pump(&mut program, 10);
     let last = screen_text(&screen)
         .lines()
         .last()
@@ -617,10 +583,10 @@ fn run_submit_unedited_never_writes_the_config() {
         "1.27",
     )]));
     screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
-    // The Images def lands at pump 6 (measured — see images_f2…). At
+    // The Images def lands at pump 9 (measured — see images_f2…). At
     // pump 3 F2 would hit the stale Containers def and open Logs
     // instead, making every assertion below VACUOUS (reviewer finding 2).
-    pump(&mut program, 6);
+    pump(&mut program, 10);
     let last = screen_text(&screen)
         .lines()
         .last()
@@ -655,7 +621,7 @@ fn run_form_esc_sends_nothing() {
         "1.27",
     )]));
     screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
-    pump(&mut program, 6); // the Images def lands at pump 6 (measured)
+    pump(&mut program, 10); // the Images def lands at pump 9 (measured)
     screen.push_key(Key::F(2), KeyModifiers::default());
     // The form SWALLOWS Esc (the modal gate) — the swallowed key is what
     // proves it was really up; without the form, Esc would close the

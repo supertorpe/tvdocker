@@ -3,9 +3,11 @@
 
 use crate::core::{AppCore, PendingKind};
 use crate::views::resource::{self, ResourceSpec, ResourceWindow};
-use crate::widgets::{Align, Column, TableRow};
+use crate::widgets::resource_table::TableRow;
+use crate::widgets::{Align, Column};
 use std::cell::RefCell;
 use std::rc::Rc;
+use tv::widgets::SortKey;
 use tv::{HelpCtx, Rect};
 
 /// Help context while the Networks window is focused .
@@ -43,15 +45,6 @@ pub fn to_row(n: &crate::domain::docker::networks::NetworkEntry) -> TableRow {
             n.containers.to_string(),
         ],
     )
-    .with_sort_keys(vec![
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(n.containers as f64),
-    ])
 }
 
 /// ALL network rows — unfiltered (the window owns fuzzy filtering).
@@ -62,6 +55,18 @@ pub fn rows(core: &AppCore) -> Vec<TableRow> {
 /// Info-line denominator: the live network count (counts).
 pub fn total(core: &AppCore) -> usize {
     core.networks.len()
+}
+
+/// Raw sort keys index-aligned with [`rows`]: CONTAINERS (col 6) sorts on the
+/// numeric count, not the text.
+pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
+    vec![(
+        6,
+        core.networks
+            .iter()
+            .map(|n| SortKey::Num(n.containers as f64))
+            .collect(),
+    )]
 }
 
 /// The Networks context menu (delete + confirm).
@@ -79,15 +84,8 @@ const SPEC: ResourceSpec = ResourceSpec {
     total,
     empty: " No networks.",
     context_menu: Some(context_menu),
-    picker: Some(&[
-        "Name",
-        "ID",
-        "Driver",
-        "Scope",
-        "Subnet",
-        "Gateway",
-        "Containers",
-    ]),
+    table_key: "networks",
+    sort_keys,
 };
 
 /// Build the window (no CLI prefill — prefills Containers).
@@ -126,7 +124,14 @@ mod tests {
             ],
             "12-char ID cell, tvdocker columns"
         );
-        assert_eq!(r.sort_keys[6], Some(3.0), "CONTAINERS sorts numerically");
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut()
+            .apply(crate::core::AppMsg::Networks(vec![n]));
+        assert_eq!(
+            sort_keys(&core.borrow()),
+            vec![(6, vec![SortKey::Num(3.0)])],
+            "CONTAINERS sorts numerically"
+        );
     }
 
     #[test]

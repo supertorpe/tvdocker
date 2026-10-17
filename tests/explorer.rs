@@ -72,7 +72,9 @@ fn volumes_enter_opens_the_volume_explorer() {
     core.borrow_mut()
         .apply(AppMsg::Volumes(vec![volume("data")]));
     screen.push_event(Event::Command(app::CMD_OPEN_VOLUMES));
-    pump(&mut program, 6); // the volumes def lands late (4A measured)
+    pump(&mut program, 10); // the volumes def lands late (the nested upstream
+    // Table queues focus/broadcast events, so the
+    // status line's help ctx settles on pump 9)
     screen.push_key(Key::Enter, KeyModifiers::default());
     pump(&mut program, 4);
     let text = screen_text(&screen);
@@ -180,11 +182,13 @@ fn explorer_close_clears_the_slot_so_it_reopens() {
     pump(&mut program, 4);
     while task_rx.try_recv().is_ok() {}
     screen.push_event(Event::Command(Command::CLOSE));
-    pump(&mut program, 4);
+    pump(&mut program, 10); // closing a window with the nested upstream
+    // Table takes several pumps (its focus/broadcast
+    // events drain one pass at a time)
     right_click(&screen, 12, 6);
     pump(&mut program, 3);
     screen.push_key(Key::Char('e'), KeyModifiers::default());
-    pump(&mut program, 4);
+    pump(&mut program, 5);
     let text = screen_text(&screen);
     assert!(
         text.contains("host filter") || text.contains("remote filter") || text.contains("Explorer"),
@@ -379,7 +383,8 @@ fn ctrl_e_opens_the_image_explorer() {
         },
     ]));
     screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
-    pump(&mut program, 6);
+    pump(&mut program, 10); // the Images help ctx settles late (the nested
+    // upstream Table queues events past pump 6)
     while task_rx.try_recv().is_ok() {}
 
     screen.push_key(

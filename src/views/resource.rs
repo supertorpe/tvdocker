@@ -5,19 +5,27 @@
 //! (contextual hotspots).
 
 use crate::core::{AppCore, Connection};
+use crate::domain::config::{ColumnLayoutCfg, TvdockerConfig};
 use crate::widgets::pane::PaneWindow;
-use crate::widgets::{Column, FilterBar, Table, TableRow};
+use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
+use crate::widgets::{Column, FilterBar};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
+use tv::widgets::table::TableModel;
+use tv::widgets::{RowKey, SelectionMode, SortDir, SortKey, Table};
 use tv::{Command, Context, DrawCtx, HelpCtx, Rect, Role, View, ViewState, delegate};
 
 /// A resource's context-menu builder: the window's core and the clicked
 /// row's id in, the menu items out.
 pub type ContextMenu = fn(&AppCore, &str) -> Vec<(String, Command)>;
+
+/// A resource's raw sort-key source: `(model_col, keys)` pairs, the keys
+/// index-aligned with the spec's [`rows`](ResourceSpec::rows).
+pub type SortKeys = fn(&AppCore) -> Vec<(usize, Vec<SortKey>)>;
 
 /// Everything that differs between resource windows.
 /// Plain `fn` pointers + `&'static str` + `HelpCtx` — a `const` spec
@@ -48,9 +56,13 @@ pub struct ResourceSpec {
     /// no menu). Labels may
     /// carry `~` hot markers (menus are hot-letter scoped,).
     pub context_menu: Option<ContextMenu>,
-    /// Column-picker labels (`None` = no picker; §7's four table
-    /// views). Visibility is per-window runtime state.
-    pub picker: Option<&'static [&'static str]>,
+    /// Config key under which this table's column layout is persisted
+    /// (`[column_layouts.<table_key>]`).
+    pub table_key: &'static str,
+    /// Raw per-column sort keys, index-aligned with [`rows`](Self::rows)
+    /// (`(model_col, keys)`). Lets a formatted cell (e.g. `SIZE` "1.5GB")
+    /// sort by its underlying value instead of its text.
+    pub sort_keys: SortKeys,
 }
 
 /// Live counts for the info line.
@@ -148,6 +160,31 @@ pub fn format_size(bytes: i64) -> String {
     }
 }
 
+/// Build the row [`RowModel`] for `needle`: the spec's rows filtered by the
+/// fuzzy needle, plus the spec's raw per-column sort keys filtered in lockstep
+/// (so a formatted cell such as `SIZE` "1.5GB" still sorts by its bytes).
+fn model_for(spec: &ResourceSpec, core: &AppCore, needle: &str) -> RowModel {
+    let all = (spec.rows)(core);
+    let keys = (spec.sort_keys)(core);
+    let keep: Vec<usize> = (0..all.len())
+        .filter(|&i| fuzzy_keep_row(&all[i], needle))
+        .collect();
+    let rows: Vec<TableRow> = keep.iter().map(|&i| all[i].clone()).collect();
+    let mut model = RowModel::new(rows);
+    for (col, col_keys) in keys {
+        let filtered: Vec<SortKey> = keep
+            .iter()
+            .map(|&i| {
+                col_keys.get(i).cloned().unwrap_or_else(|| {
+                    SortKey::parse(all[i].cells.get(col).map_or("", String::as_str))
+                })
+            })
+            .collect();
+        model = model.with_sort_keys(col, filtered);
+    }
+    model
+}
+
 /// The window: `PaneWindow` wrapper that refilters on REFRESH / sink
 /// changes, owns the Esc priority chain  and Ctrl+A.
 pub struct ResourceWindow {
@@ -161,12 +198,6 @@ pub struct ResourceWindow {
     /// Cached screen origin for right-click → `popup_menu` (the
     /// editor/status_line `abs_origin` pattern, `editor.rs:1917`).
     abs_origin: tv::Point,
-    /// Applied picker visibility (persists across dialog opens, dies
-    /// with the window).
-    picker_flags: Rc<RefCell<Vec<bool>>>,
-    /// The IN-FLIGHT dialog's flags — merged into `picker_flags` only
-    /// on `Command::OK` (Review Focus #5).
-    active_picker: Option<Rc<RefCell<Vec<bool>>>>,
 }
 
 /// Build the window (bounds are the window's outer rect; `filter`
@@ -183,16 +214,19 @@ pub fn build(
     // The prefilled CLI filter applies from the FIRST paint :
     // initial rows honor the same needle as every later refilter.
     let needle = filter.unwrap_or_default();
-    let initial: Vec<TableRow> = (spec.rows)(&core.borrow())
-        .into_iter()
-        .filter(|r| fuzzy_keep_row(r, needle))
-        .collect();
+    let initial_model = model_for(&spec, &core.borrow(), needle);
+    let initial_shown = initial_model.row_count();
     let info = Rc::new(RefCell::new(InfoState {
-        shown: initial.len(),
+        shown: initial_shown,
         selected: 0,
         filter: sink.borrow().clone(),
     }));
     let last_revision = core.borrow().revision;
+    // The persisted per-table column layout, re-read once per build.
+    let layout = TvdockerConfig::load()
+        .0
+        .column_layout(spec.table_key)
+        .cloned();
     let mut pane = PaneWindow::new(
         bounds,
         spec.title,
@@ -210,8 +244,18 @@ pub fn build(
             "type to filter",
         )),
         |rect, bar| {
-            let mut table = Table::new(rect, (spec.columns)(), bar);
-            table.set_rows_initial(initial);
+            let columns = (spec.columns)().iter().map(to_spec).collect();
+            let mut table = Table::new(rect, columns, bar)
+                .with_selection_mode(SelectionMode::Multi)
+                .with_model(Box::new(initial_model));
+            // The upstream `Table` is a `Group`: mark it selectable so the
+            // window's hierarchical Tab pass treats it as one focusable stop
+            // (its body is the focusable leaf inside). Without this the group
+            // is skipped and Tab can never leave/enter the table.
+            table.state_mut().options.selectable = true;
+            if let Some(cfg) = &layout {
+                table.set_column_layout(&cfg.to_states());
+            }
             Box::new(table)
         },
     );
@@ -228,18 +272,17 @@ pub fn build(
         last_revision,
         open,
         abs_origin: tv::Point::new(0, 0),
-        picker_flags: Rc::new(RefCell::new(vec![
-            false;
-            spec.picker.map_or(0, |l| l.len())
-        ])),
-        active_picker: None,
     }
 }
 
 impl ResourceWindow {
-    /// Test/introspection hook: current table row ids.
+    /// Test/introspection hook: current table row ids, in display order.
     pub fn table_ids(&mut self) -> Vec<String> {
-        self.table_mut().map_or_else(Vec::new, |t| t.row_ids())
+        self.table_mut().map_or_else(Vec::new, |t| {
+            let order = t.row_order();
+            let model = t.model();
+            order.iter().map(|&row| model.row_key(row).0).collect()
+        })
     }
 
     fn table_mut(&mut self) -> Option<&mut Table> {
@@ -259,34 +302,38 @@ impl ResourceWindow {
     }
 
     /// Select exactly the filtered set (Ctrl+A). Both delivery
-    /// paths converge here — the `KeyDown` arm below and (Task 9) the
-    /// pre-route's `Event::Command(CMD_SELECT_ALL)`.
+    /// paths converge here — the `KeyDown` arm below and the
+    /// pre-route's `Event::Command(CMD_SELECT_ALL)`. The model already
+    /// holds only the filtered rows, so selecting every model row is the
+    /// filtered set.
     fn select_all(&mut self) {
         if let Some(table) = self.table_mut() {
-            let ids = table.row_ids();
-            table.select_ids(ids);
+            let keys: Vec<RowKey> = {
+                let model = table.model();
+                (0..model.row_count())
+                    .map(|row| model.row_key(row))
+                    .collect()
+            };
+            table.set_selected_keys(keys);
         }
         self.sync_info();
     }
 
-    /// Re-map core → rows (applying the active fuzzy filter and
-    /// re-asserting the active sort), then refresh the info counts.
+    /// Re-map core → rows (applying the active fuzzy filter; the upstream
+    /// `set_model` re-applies the active sort and re-focuses by `RowKey`),
+    /// then refresh the info counts.
     /// Called on REFRESH or sink change (the "last filter" guard).
     fn refresh_rows(&mut self, ctx: &mut Context) {
         let needle = self.sink.borrow().clone();
-        let rows: Vec<TableRow> = (self.spec.rows)(&self.core.borrow())
-            .into_iter()
-            .filter(|r| fuzzy_keep_row(r, &needle))
-            .collect();
-        let shown = rows.len();
+        let model = {
+            let core = self.core.borrow();
+            model_for(&self.spec, &core, &needle)
+        };
+        let shown = model.row_count();
         if let Some(table) = self.table_mut() {
-            let sort = table.sort_spec();
-            table.set_rows(rows, ctx);
-            if let Some((col, asc)) = sort {
-                table.sort_by(col, asc, ctx);
-            }
+            table.set_model(Box::new(model), ctx);
         }
-        let selected = self.table_mut().map_or(0, |t| t.selected_ids().len());
+        let selected = self.table_mut().map_or(0, |t| t.selected_keys().len());
         let mut info = self.info.borrow_mut();
         info.shown = shown;
         info.filter = needle;
@@ -295,7 +342,7 @@ impl ResourceWindow {
 
     /// Push the table's selection count into the info line.
     fn sync_info(&mut self) {
-        let selected = self.table_mut().map_or(0, |t| t.selected_ids().len());
+        let selected = self.table_mut().map_or(0, |t| t.selected_keys().len());
         self.info.borrow_mut().selected = selected;
     }
 
@@ -304,8 +351,7 @@ impl ResourceWindow {
         let Some(t) = self.table_mut() else {
             return Vec::new();
         };
-        let ids = t.row_ids();
-        ids.get(t.cursor()).cloned().into_iter().collect()
+        t.focused_key().map(|k| k.0).into_iter().collect()
     }
 
     /// Selection if any, else the cursor row (Del, §7 menu).
@@ -313,51 +359,143 @@ impl ResourceWindow {
         let Some(t) = self.table_mut() else {
             return Vec::new();
         };
-        let selected = t.selected_ids();
+        let selected: Vec<String> = t.selected_keys().into_iter().map(|k| k.0).collect();
         if !selected.is_empty() {
             return selected;
         }
-        let ids = t.row_ids();
-        ids.get(t.cursor()).cloned().into_iter().collect()
+        t.focused_key().map(|k| k.0).into_iter().collect()
     }
 
-    /// Window-local y → row index: the table's bounds
-    /// live in the same window space as the event; the body's first
-    /// row is the header.
-    fn row_at_window_y(&mut self, y: i32) -> Option<usize> {
-        let t = self.table_mut()?;
-        let top = t.state().get_bounds().a.y;
-        let view = y - top - 1; // −1 for the header
-        if view < 0 {
+    /// The display row (an index into `Table::row_order`) under window-local
+    /// `y`, or `None` when the point is on the header row or past the last
+    /// row. `t` must be focused: the upstream `Table` exposes no scroll
+    /// offset, so `top_item` is recovered from the focused cell's cursor —
+    /// `cursor_request` is table-local with the header at row 0, so its `y`
+    /// is the body origin (1) plus the focused row's offset into the body.
+    fn display_row_at(t: &Table, y: i32) -> Option<usize> {
+        let view_y = y - t.state().get_bounds().a.y - 1; // −1: the header row
+        if view_y < 0 {
             return None;
         }
-        let idx = t.scroll_offset() + view;
-        let len = t.row_ids().len();
-        (idx >= 0 && (idx as usize) < len).then_some(idx as usize)
+        let cursor = t.cursor_request()?;
+        let order = t.row_order();
+        let focused = t.focused_row()?;
+        let display_focused = order.iter().position(|&row| row == focused)?;
+        let top_item = display_focused as i32 - (cursor.y - 1);
+        usize::try_from(top_item + view_y)
+            .ok()
+            .filter(|&display| display < order.len())
     }
 
-    /// Ctrl+O: clone the applied flags into a FRESH
-    /// dialog state — cancel must not leak partial toggles.
-    fn open_column_picker(&mut self, ctx: &mut Context) {
-        let Some(labels) = self.spec.picker else {
+    /// The focused display row (an index into `Table::row_order`), or `None`.
+    fn focused_display_row(&mut self) -> Option<usize> {
+        let t = self.table_mut()?;
+        let order = t.row_order();
+        let focused = t.focused_row()?;
+        order.iter().position(|&row| row == focused)
+    }
+
+    /// Focus display row `row` on the table (a no-op when it already holds
+    /// focus, but always re-publishes the row to the vertical bar).
+    fn focus_display_row(&mut self, row: usize, ctx: &mut Context) {
+        let Some(t) = self.table_mut() else {
             return;
         };
-        let Some(requester) = self.state().id() else {
+        let key = {
+            let order = t.row_order();
+            let model = t.model();
+            order.get(row).map(|&r| model.row_key(r))
+        };
+        if let Some(key) = key {
+            t.set_focused_key(&key, ctx);
+        }
+    }
+
+    /// Deliver a press into the pane through a throwaway `Context`: the group
+    /// focuses the clicked row exactly as upstream would, while the mouse-hold
+    /// capture the press arms is written to the scratch queue and discarded (a
+    /// right-click is not a drag; leaving that track live would swallow the
+    /// command the context menu posts on release).
+    fn forward_for_focus(&mut self, ev: &mut Event) {
+        let mut out = std::collections::VecDeque::new();
+        let mut timers = tv::TimerQueue::new();
+        let mut deferred = Vec::new();
+        let mut scratch = Context::new(&mut out, &mut timers, 0, &mut deferred);
+        self.pane.handle_event(ev, &mut scratch);
+    }
+
+    /// Cycle the sort column on ←/→ (backward walks the other way and lands
+    /// DESCENDING, as the old table did), or flip the direction on
+    /// Shift+←/→. The upstream `Table` only exposes `TABLE_SORT_NEXT` (forward,
+    /// ascending) and `TABLE_SORT_FLIP`, so the window keeps tvdocker's
+    /// documented cycle and drives [`Table::sort_by`] itself.
+    fn cycle_sort(&mut self, forward: bool, flip: bool, ctx: &mut Context) {
+        let Some(t) = self.table_mut() else {
             return;
         };
-        let flags = Rc::new(RefCell::new(self.picker_flags.borrow().clone()));
-        let w = requester; // keep the id across the dialog build
-        let size = ctx.owner_size();
-        let bounds = Rect::new(
-            (size.x - 40) / 2,
-            (size.y - (labels.len() as i32 + 4)) / 2,
-            (size.x - 40) / 2 + 40,
-            (size.y - (labels.len() as i32 + 4)) / 2 + (labels.len() as i32 + 4),
-        );
-        let dialog =
-            crate::views::dialogs::ColumnPickerDialog::new(bounds, labels, Rc::clone(&flags));
-        self.active_picker = Some(flags);
-        ctx.request_exec_view(Box::new(dialog), w, None);
+        let layout = t.column_layout();
+        let n = layout.len();
+        if n == 0 {
+            return;
+        }
+        let mut visible = vec![false; n];
+        for s in &layout {
+            if s.column < n {
+                visible[s.column] = !s.hidden;
+            }
+        }
+        let current = t.sort_spec();
+        let (col, dir) = if flip {
+            match current {
+                Some((c, d)) => (c, d.flip()),
+                None => match (0..n).find(|&i| visible[i]) {
+                    Some(c) => (c, SortDir::Asc),
+                    None => return,
+                },
+            }
+        } else {
+            let step: i64 = if forward { 1 } else { -1 };
+            // No sort yet: start one past the first / last column so the first
+            // step lands ON it.
+            let start = current.map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
+            let mut found = None;
+            let mut probe = start;
+            for _ in 0..n {
+                probe = (probe + step).rem_euclid(n as i64);
+                let i = probe as usize;
+                if visible[i] {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(c) => (c, if forward { SortDir::Asc } else { SortDir::Desc }),
+                None => return,
+            }
+        };
+        t.sort_by(col, dir, ctx);
+    }
+
+    /// Open the row context menu at screen position `m.position`, built from
+    /// the row the table just focused.
+    fn open_context_menu(&mut self, m: tv::MouseEvent, ctx: &mut Context) {
+        let Some(menu) = self.spec.context_menu else {
+            return;
+        };
+        let id = self.open_target().into_iter().next().unwrap_or_default();
+        if id.is_empty() {
+            return;
+        }
+        let items = menu(&self.core.borrow(), &id);
+        if items.is_empty() {
+            return;
+        }
+        let mut builder = Menu::builder();
+        for (label, command) in items {
+            builder = builder.command(label, command);
+        }
+        let global = m.position + self.abs_origin;
+        popup_menu(global, builder.build(), ctx.owner_size(), ctx);
     }
 }
 
@@ -375,12 +513,30 @@ impl View for ResourceWindow {
     }
 
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
+        // --- The upstream Table arranged its columns (resize / move /
+        // show / hide): persist the new layout for this window's key.
+        if let Event::Broadcast { command, source } = ev
+            && *command == Command::TABLE_COLUMNS_CHANGED
+            && *source == Some(self.pane.ids().body)
+        {
+            let states = self
+                .table_mut()
+                .map(|t| t.column_layout())
+                .unwrap_or_default();
+            let _ = TvdockerConfig::set_column_layout_in_file(
+                &TvdockerConfig::path(),
+                self.spec.table_key,
+                &ColumnLayoutCfg::from_states(&states),
+            );
+            ev.clear();
+            return;
+        }
         // --- Esc priority chain , before anything else sees it:
         if let Event::KeyDown(ke) = ev
             && ke.key == Key::Esc
         {
             if let Some(table) = self.table_mut()
-                && !table.selected_ids().is_empty()
+                && !table.selected_keys().is_empty()
             {
                 table.clear_selection(); // rung 1: exit multi-select
                 self.sync_info();
@@ -427,6 +583,33 @@ impl View for ResourceWindow {
             && *cmd == crate::app::CMD_SELECT_ALL
         {
             self.select_all();
+            ev.clear();
+            return;
+        }
+        // --- Ctrl+O (re-pointed to the framework's `TABLE_COLUMNS`): the
+        // upstream Table opens its header popup. Hand the command to the
+        // table directly so it works even while the filter bar holds focus.
+        if let Event::Command(cmd) = ev
+            && *cmd == Command::TABLE_COLUMNS
+        {
+            if let Some(t) = self.table_mut() {
+                t.handle_event(ev, ctx);
+            }
+            ev.clear();
+            return;
+        }
+
+        // --- Sort keys (←/→ cycle the column, Shift flips the direction):
+        // the window owns them because the upstream `Table` command layer only
+        // has forward-ascending and flip. Only when the table body holds the
+        // focus (the filter bar keeps its own ←/→ caret movement).
+        if let Event::KeyDown(ke) = ev
+            && matches!(ke.key, Key::Left | Key::Right)
+            && self
+                .table_mut()
+                .is_some_and(|t| t.cursor_request().is_some())
+        {
+            self.cycle_sort(ke.key == Key::Right, ke.modifiers.shift, ctx);
             ev.clear();
             return;
         }
@@ -513,37 +696,47 @@ impl View for ResourceWindow {
                 ev.clear();
                 return;
             }
-            if *cmd == crate::app::CMD_COLUMNS {
-                self.open_column_picker(ctx);
-                ev.clear();
-                return;
-            }
         }
-        // --- Right-click: the context menu.
-        if let Event::MouseDown(m) = ev {
+        // --- Right-click: a press on the header is handed to the table (its
+        // column popup); a press on a body row focuses the clicked row and
+        // opens our context menu for it. The row is resolved from the click
+        // geometry rather than by forwarding the press, because forwarding
+        // would arm the body's mouse-hold capture — which would then swallow
+        // the very command the menu posts on release.
+        if let Event::MouseDown(m) = ev
+            && m.buttons.right
+            && !m.buttons.left
+        {
             let m = *m;
-            if m.buttons.right
-                && !m.buttons.left
-                && let Some(menu) = self.spec.context_menu
-                && let Some(row) = self.row_at_window_y(m.position.y)
-            {
-                if let Some(t) = self.table_mut() {
-                    t.set_cursor_row(row, ctx); // the clicked row BECOMES the target
+            let header_y = self.table_mut().map(|t| t.state().get_bounds().a.y);
+            if header_y.is_some_and(|y| m.position.y > y) {
+                // Body press. A focused table resolves the row from its
+                // cursor; an unfocused one has no cursor to read `top_item`
+                // from, so it goes through the (scratch) routing that focuses
+                // the clicked row.
+                let focused = self
+                    .table_mut()
+                    .is_some_and(|t| t.cursor_request().is_some());
+                let row = if focused {
+                    self.table_mut()
+                        .and_then(|t| Self::display_row_at(t, m.position.y))
+                } else {
+                    self.forward_for_focus(ev);
+                    self.focused_display_row()
+                };
+                if let Some(row) = row {
+                    self.focus_display_row(row, ctx);
+                    self.open_context_menu(m, ctx);
                 }
-                let id = self.open_target().into_iter().next().unwrap_or_default();
-                let items = menu(&self.core.borrow(), &id);
-                let mut builder = Menu::builder();
-                for (label, command) in items {
-                    builder = builder.command(label, command);
-                }
-                let global = m.position + self.abs_origin;
-                popup_menu(global, builder.build(), ctx.owner_size(), ctx);
-                ev.clear();
-                return;
+            } else {
+                // Header (or above): the table opens its own column popup.
+                self.pane.handle_event(ev, ctx);
             }
+            ev.clear();
+            return;
+        } else {
+            self.pane.handle_event(ev, ctx);
         }
-
-        self.pane.handle_event(ev, ctx);
 
         // --- Re-map when the bridge bumped the revision, or the sink moved.
         let revision = self.core.borrow().revision;
@@ -556,24 +749,6 @@ impl View for ResourceWindow {
             self.refresh_rows(ctx);
         }
         self.sync_info();
-    }
-
-    /// The picker's answer route (tvision-rs ships no
-    /// data-back path, `context.rs:1490`; the flags travelled by `Rc`).
-    fn set_modal_answer(&mut self, cmd: Command) {
-        if cmd == Command::OK
-            && let Some(flags) = self.active_picker.take()
-        {
-            let applied: Vec<bool> = flags.borrow().clone();
-            *self.picker_flags.borrow_mut() = applied.clone();
-            if let Some(t) = self.table_mut() {
-                for (i, hidden) in applied.iter().enumerate() {
-                    t.set_column_hidden(i, *hidden);
-                }
-            }
-        } else {
-            self.active_picker = None; // cancel ⇒ discard
-        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -594,6 +769,7 @@ mod tests {
     use crate::core::{AppMsg, Connection};
     use crate::testutil::{render_view, send_event, send_key, send_key_mods, text};
     use tv::event::{Key, KeyModifiers};
+    use tv::widgets::SortDir;
 
     /// A spec built from scratch proves the window is generic: any
     /// `fn(&AppCore) -> Vec<TableRow>` source drives it.
@@ -613,7 +789,8 @@ mod tests {
             empty: " No demos.",
             kind: None,
             context_menu: None,
-            picker: None,
+            table_key: "demo",
+            sort_keys: |_| Vec::new(),
         }
     }
 
@@ -757,8 +934,13 @@ mod tests {
             // Sort col 0 (NAME) DESCENDING directly (←/→ cycle forward-
             // ascending by design — header-click or sort_by picks
             // direction): NAME desc = web > db > cache = id1, id2, id3.
-            crate::testutil::with_ctx(|ctx| t.sort_by(0, false, ctx));
-            send_key(t, Key::End); // cursor on id3 (last row of NAME-desc)
+            // Then put the cursor on the last row (id3); `set_focused_key`
+            // is the deterministic, focus-independent way (the upstream
+            // body only routes End when it holds focus).
+            crate::testutil::with_ctx(|ctx| {
+                t.sort_by(0, SortDir::Desc, ctx);
+                t.set_focused_key(&RowKey("id3".to_string()), ctx);
+            });
         }
         assert_eq!(
             w.table_ids(),
@@ -775,11 +957,11 @@ mod tests {
         let t = w.table_mut().expect("table child");
         assert_eq!(
             t.sort_spec(),
-            Some((0, false)),
+            Some((0, SortDir::Desc)),
             "sort survived the refilter"
         );
         assert_eq!(
-            t.row_ids()[t.cursor()],
+            t.focused_key().expect("focused row").0,
             "id3",
             "cursor stayed on its row identity across the refilter"
         );
@@ -838,7 +1020,12 @@ mod tests {
             },
         );
         assert_eq!(
-            w.table_mut().expect("table child").selected_ids(),
+            w.table_mut()
+                .expect("table child")
+                .selected_keys()
+                .into_iter()
+                .map(|k| k.0)
+                .collect::<Vec<_>>(),
             vec!["id1", "id3"],
             "exactly the FILTERED rows"
         );
@@ -851,7 +1038,12 @@ mod tests {
         let mut w = filtered_window();
         send_event(&mut w, Event::Command(crate::app::CMD_SELECT_ALL));
         assert_eq!(
-            w.table_mut().expect("table child").selected_ids(),
+            w.table_mut()
+                .expect("table child")
+                .selected_keys()
+                .into_iter()
+                .map(|k| k.0)
+                .collect::<Vec<_>>(),
             vec!["id1", "id3"],
             "exactly the FILTERED rows"
         );

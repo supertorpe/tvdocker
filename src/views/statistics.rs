@@ -4,9 +4,11 @@
 
 use crate::core::AppCore;
 use crate::views::resource::{self, ResourceSpec, ResourceWindow};
-use crate::widgets::{Align, Column, TableRow};
+use crate::widgets::resource_table::TableRow;
+use crate::widgets::{Align, Column};
 use std::cell::RefCell;
 use std::rc::Rc;
+use tv::widgets::SortKey;
 use tv::{HelpCtx, Rect};
 
 /// Help context while the Statistics window is focused .
@@ -59,14 +61,6 @@ pub fn to_row(s: &crate::domain::docker::statistics::StatEntry) -> TableRow {
             s.pids.to_string(),
         ],
     )
-    .with_sort_keys(vec![
-        None,
-        Some(s.cpu_percent),
-        Some(s.memory_usage as f64),
-        Some((s.net_rx + s.net_tx) as f64),
-        Some((s.block_read + s.block_write) as f64),
-        Some(s.pids as f64),
-    ])
 }
 
 /// ALL stats rows — unfiltered (the window owns fuzzy filtering).
@@ -79,6 +73,44 @@ pub fn total(core: &AppCore) -> usize {
     core.statistics.len()
 }
 
+/// Raw sort keys index-aligned with [`rows`] — every numeric column
+/// (CPU %, MEM, NET I/O, BLOCK I/O, PIDS) sorts on its underlying value, not
+/// the formatted text.
+pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
+    let stats = &core.statistics;
+    vec![
+        (
+            1,
+            stats.iter().map(|s| SortKey::Num(s.cpu_percent)).collect(),
+        ),
+        (
+            2,
+            stats
+                .iter()
+                .map(|s| SortKey::Num(s.memory_usage as f64))
+                .collect(),
+        ),
+        (
+            3,
+            stats
+                .iter()
+                .map(|s| SortKey::Num((s.net_rx + s.net_tx) as f64))
+                .collect(),
+        ),
+        (
+            4,
+            stats
+                .iter()
+                .map(|s| SortKey::Num((s.block_read + s.block_write) as f64))
+                .collect(),
+        ),
+        (
+            5,
+            stats.iter().map(|s| SortKey::Num(s.pids as f64)).collect(),
+        ),
+    ]
+}
+
 const SPEC: ResourceSpec = ResourceSpec {
     title: "Statistics",
     number: 6,
@@ -89,7 +121,8 @@ const SPEC: ResourceSpec = ResourceSpec {
     total,
     empty: " No running containers.",
     context_menu: None,
-    picker: None,
+    table_key: "statistics",
+    sort_keys,
 };
 
 /// Build the window (no CLI prefill — prefills Containers).
@@ -127,17 +160,19 @@ mod tests {
         assert_eq!(r.cells[3], "1.0MB / 2.0MB", "NET rx / tx in MB");
         assert_eq!(r.cells[4], "0B / 0B", "zero block I/O shorthand");
         assert_eq!(r.cells[5], "4");
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut()
+            .apply(crate::core::AppMsg::Statistics(vec![entry()]));
         assert_eq!(
-            r.sort_keys,
+            sort_keys(&core.borrow()),
             vec![
-                None,
-                Some(9.9),
-                Some(104_857_600.0),
-                Some(3_000_000.0),
-                Some(0.0),
-                Some(4.0),
+                (1, vec![SortKey::Num(9.9)]),
+                (2, vec![SortKey::Num(104_857_600.0)]),
+                (3, vec![SortKey::Num(3_000_000.0)]),
+                (4, vec![SortKey::Num(0.0)]),
+                (5, vec![SortKey::Num(4.0)]),
             ],
-            "every numeric column keyed"
+            "every numeric column sorts on its raw value"
         );
     }
 
@@ -148,6 +183,13 @@ mod tests {
         s.block_write = 1_500_000;
         let r = to_row(&s);
         assert_eq!(r.cells[4], "3.0MB / 1.5MB");
-        assert_eq!(r.sort_keys[4], Some(4_500_000.0), "sum key");
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut()
+            .apply(crate::core::AppMsg::Statistics(vec![s]));
+        assert_eq!(
+            sort_keys(&core.borrow())[3].1,
+            vec![SortKey::Num(4_500_000.0)],
+            "block I/O sorts on the read+write sum"
+        );
     }
 }

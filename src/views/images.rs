@@ -2,9 +2,11 @@
 
 use crate::core::{AppCore, PendingKind};
 use crate::views::resource::{self, ResourceSpec, ResourceWindow, format_size};
-use crate::widgets::{Align, Column, TableRow};
+use crate::widgets::resource_table::TableRow;
+use crate::widgets::{Align, Column};
 use std::cell::RefCell;
 use std::rc::Rc;
+use tv::widgets::SortKey;
 use tv::{HelpCtx, Rect};
 
 /// Help context while the Images window is focused .
@@ -33,7 +35,6 @@ pub fn to_row(i: &crate::domain::docker::images::ImageEntry) -> TableRow {
             i.id.chars().take(12).collect(),
         ],
     )
-    .with_sort_keys(vec![None, None, Some(i.size as f64), None])
 }
 
 /// ALL image rows — unfiltered (the window owns fuzzy filtering).
@@ -44,6 +45,18 @@ pub fn rows(core: &AppCore) -> Vec<TableRow> {
 /// Info-line denominator: the live image count (counts).
 pub fn total(core: &AppCore) -> usize {
     core.images.len()
+}
+
+/// Raw sort keys index-aligned with [`rows`]: SIZE (col 2) sorts on the raw
+/// bytes, not the `1.5GB` display text.
+pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
+    vec![(
+        2,
+        core.images
+            .iter()
+            .map(|i| SortKey::Num(i.size as f64))
+            .collect(),
+    )]
 }
 
 /// The Images context menu: run form, remove,
@@ -71,7 +84,8 @@ const SPEC: ResourceSpec = ResourceSpec {
     total,
     empty: " No images.",
     context_menu: Some(context_menu),
-    picker: Some(&["Repository", "Tag", "Size", "ID"]),
+    table_key: "images",
+    sort_keys,
 };
 
 /// Build the window (no CLI prefill — prefills Containers).
@@ -101,9 +115,12 @@ mod tests {
             vec!["nginx", "1.27", "1.5GB", "sha256:11112"],
             "SIZE formats tvdocker-style; ID shows 12 chars"
         );
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut()
+            .apply(crate::core::AppMsg::Images(vec![entry()]));
         assert_eq!(
-            r.sort_keys,
-            vec![None, None, Some(1_500_000_000.0), None],
+            sort_keys(&core.borrow()),
+            vec![(2, vec![SortKey::Num(1_500_000_000.0)])],
             "SIZE sorts on raw bytes"
         );
     }
