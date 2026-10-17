@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
 use tv::widgets::{SelectionMode, SortDir, Table};
-use tv::{Command, Context, DrawCtx, Rect, Role, View, ViewState, Window, delegate};
+use tv::{Command, Context, DrawCtx, FieldValue, Rect, Role, View, ViewState, Window, delegate};
 
 /// Help context while an Explorer window is focused .
 pub const HELP_CTX: tv::HelpCtx = tv::HelpCtx::custom("tvdocker.explorer");
@@ -210,8 +210,9 @@ pub struct ExplorerWindow {
     pending_delete: Option<Vec<String>>,
     /// The answer of the last message box.
     modal_answer: Option<Command>,
-    /// The shared prompt value.
-    prompt_value: Rc<RefCell<String>>,
+    /// The last prompt's answered text (the `InputDialog` record, delivered
+    /// via `set_modal_data`).
+    prompt_value: String,
     /// Cached screen origin for right-click → `popup_menu` (the
     /// editor/`status_line` pattern).
     abs_origin: tv::Point,
@@ -561,7 +562,7 @@ pub fn build(
         pending_prompt: None,
         pending_delete: None,
         modal_answer: None,
-        prompt_value: Rc::new(RefCell::new(String::new())),
+        prompt_value: String::new(),
         abs_origin: tv::Point::new(0, 0),
     };
     // The two initial listings (ruling: build-time request).
@@ -905,6 +906,14 @@ impl View for ExplorerWindow {
         self.modal_answer = Some(cmd);
     }
 
+    /// The prompt dialog's record: its single text. The pump delivers this
+    /// BEFORE the close command, so `finish_prompt` reads the answered text.
+    fn set_modal_data(&mut self, data: FieldValue) {
+        if let FieldValue::Text(t) = data {
+            self.prompt_value = t;
+        }
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
@@ -1177,7 +1186,6 @@ impl ExplorerWindow {
             }
             PromptKind::Goto => self.active().path.clone(),
         };
-        *self.prompt_value.borrow_mut() = prefill;
         let (title, label) = match kind {
             PromptKind::NewDir => ("New directory", "Name"),
             PromptKind::NewFile => ("New file", "Name"),
@@ -1191,7 +1199,7 @@ impl ExplorerWindow {
             prompt_dialog_rect(ctx),
             title,
             label,
-            Rc::clone(&self.prompt_value),
+            &prefill,
         );
         ctx.request_exec_view(Box::new(dialog), requester, Some(CMD_EXP_PROMPT_OK));
     }
@@ -1204,7 +1212,7 @@ impl ExplorerWindow {
         if self.modal_answer.take() != Some(tv::Command::OK) {
             return;
         }
-        let value = self.prompt_value.borrow().clone();
+        let value = self.prompt_value.clone();
         if value.is_empty() {
             return;
         }

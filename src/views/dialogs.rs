@@ -1,10 +1,13 @@
-//! Modal dialogs launched by view code via `ctx.request_exec_view`
-//! (modals). Data travels through SHARED
-//! `Rc` state, not through the close command — tvision-rs deliberately
-//! ships no modal data-back path (`context.rs:1490`).
+//! Modal dialogs launched by view code via `ctx.request_exec_view`.
+//!
+//! Since tvision-rs 0.17 the pump gathers the modal's record through
+//! [`View::value`] while it is still in the tree and, on a non-cancel close,
+//! delivers it to the requester's [`View::set_modal_data`] BEFORE the close
+//! command reaches [`View::set_modal_answer`] (C++ `if (execView(d) !=
+//! cmCancel) d->getData(&rec)`). So the dialogs no longer smuggle their
+//! result through shared `Rc<RefCell<…>>` state: they expose `value()`, and
+//! the requester unpacks `set_modal_data`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use tv::event::{Event, Key};
 use tv::{
     Command, Context, FieldValue, InputLine, LimitMode, Rect, StaticText, View, ViewState, Window,
@@ -126,18 +129,18 @@ impl ShellForm {
 /// The shell-config dialog (modal; §5: Enter submits, Esc
 /// cancels): a `Window` with three `InputLine`s + `StaticText` labels
 /// and per-field hints. Tab cycles the fields (the window's own focus
-/// wrap — static text is not selectable). Enter collects into the
-/// shared `values` and ends the modal with `Command::OK`; Esc cancels.
+/// wrap — static text is not selectable). Enter ends the modal with
+/// `Command::OK` (its `value()` carries the three texts); Esc cancels.
 pub struct ShellConfigDialog {
     win: Window,
-    values: Rc<RefCell<ShellForm>>,
     fields: [tv::ViewId; 3],
 }
 
 impl ShellConfigDialog {
-    /// `values` is prefilled by the caller (the desktop) and read by
-    /// it after `Command::OK`.
-    pub fn new(bounds: Rect, values: Rc<RefCell<ShellForm>>, container: &str) -> Self {
+    /// `form` prefills the three fields; the requester reads the answer
+    /// from `View::value` (delivered through `set_modal_data`), not from
+    /// shared state.
+    pub fn new(bounds: Rect, form: &ShellForm, container: &str) -> Self {
         let short: String = container.chars().take(12).collect();
         let mut win = Window::new(bounds, Some(format!("Shell Config — {short}")), 0);
         let size = win.state().size;
@@ -147,7 +150,7 @@ impl ShellConfigDialog {
             "empty = container default · host · root · user:group",
             "empty = container default · / · /app",
         ];
-        let snapshot = values.borrow().clone();
+        let snapshot = form.clone();
         let inits = [snapshot.shell, snapshot.user, snapshot.workdir];
 
         // Insert the INPUTS in VISUAL order (Shell, User, Workdir): the
@@ -202,35 +205,8 @@ impl ShellConfigDialog {
         }
         Self {
             win,
-            values,
             fields: [id0, id1, id2],
         }
-    }
-}
-
-impl ShellConfigDialog {
-    /// Collect the three fields into the shared form, then end the modal
-    /// with `Command::OK` (the desktop reads `values` afterwards — no
-    /// data-back path, see the module doc).
-    fn submit(&mut self, ctx: &mut Context) {
-        let mut values = self.values.borrow_mut();
-        for (i, id) in self.fields.iter().enumerate() {
-            let text = self
-                .win
-                .child_mut(*id)
-                .and_then(|v| v.value())
-                .and_then(|fv| match fv {
-                    FieldValue::Text(t) => Some(t),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            match i {
-                0 => values.shell = text,
-                1 => values.user = text,
-                _ => values.workdir = text,
-            }
-        }
-        ctx.end_modal(Command::OK);
     }
 }
 
@@ -258,7 +234,7 @@ impl View for ShellConfigDialog {
         if let Event::KeyDown(ke) = ev {
             match ke.key {
                 Key::Enter => {
-                    self.submit(ctx);
+                    ctx.end_modal(Command::OK);
                     ev.clear();
                     return;
                 }
@@ -275,7 +251,7 @@ impl View for ShellConfigDialog {
         // stream, or the framework's own test idiom).
         if let Event::Command(cmd) = ev {
             if *cmd == Command::OK {
-                self.submit(ctx);
+                ctx.end_modal(Command::OK);
                 ev.clear();
                 return;
             }
@@ -288,28 +264,35 @@ impl View for ShellConfigDialog {
         self.win.handle_event(ev, ctx);
     }
 
+    /// The modal's record: the three field texts, in child order (Shell,
+    /// User, Workdir). Gathered by the pump while the dialog is still in
+    /// the tree and delivered to the requester's `set_modal_data`.
+    fn value(&self) -> Option<FieldValue> {
+        Some(self.win.gather_list())
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
 }
 
 /// A one-field modal prompt: rename / new dir / new file /
-/// goto-path all reuse it. Enter collects into the shared `value` and
-/// ends the modal with `Command::OK`; Esc cancels without writing
-/// (shared-form pattern).
+/// goto-path all reuse it. Enter ends the modal with `Command::OK`
+/// (`value()` carries the text); Esc cancels without delivering anything
+/// (the pump skips `set_modal_data` on a cancel close).
 ///
 /// The prefill is intentionally NOT select-all-on-focus (the `InputLine`
 /// default would replace it on the first keystroke): typing APPENDS, so
 /// a rename user edits the tail or presses Backspace first.
 pub struct InputDialog {
     win: Window,
-    value: Rc<RefCell<String>>,
     input_id: tv::ViewId,
 }
 
 impl InputDialog {
-    /// `value` is prefilled by the caller and read by it after OK.
-    pub fn new(bounds: Rect, title: &str, label: &str, value: Rc<RefCell<String>>) -> Self {
+    /// `prefill` seeds the field; the requester reads the answer from
+    /// `View::value` (delivered through `set_modal_data`).
+    pub fn new(bounds: Rect, title: &str, label: &str, prefill: &str) -> Self {
         let mut win = Window::new(bounds, Some(title.to_string()), 0);
         let size = win.state().size;
         let y = 2;
@@ -323,7 +306,7 @@ impl InputDialog {
             None,
             LimitMode::MaxChars,
         );
-        input.set_value(FieldValue::Text(value.borrow().clone()));
+        input.set_value(FieldValue::Text(prefill.to_string()));
         // `InputLine` selects all on `set_value` (ValuePosition::End) AND
         // on focus by default — the first keystroke would REPLACE the
         // prefill. Park the caret at the end (which clears the selection)
@@ -335,22 +318,7 @@ impl InputDialog {
             Rect::new(2, y + 2, size.x - 2, y + 3),
             "Enter: ok · Esc: cancel",
         )));
-        Self {
-            win,
-            value,
-            input_id,
-        }
-    }
-
-    /// The single InputLine's text (`None` on any other field kind).
-    fn read_input(&mut self) -> Option<String> {
-        self.win
-            .child_mut(self.input_id)
-            .and_then(|v| v.value())
-            .and_then(|fv| match fv {
-                FieldValue::Text(t) => Some(t),
-                _ => None,
-            })
+        Self { win, input_id }
     }
 }
 
@@ -375,9 +343,6 @@ impl View for InputDialog {
         if let Event::KeyDown(ke) = ev {
             match ke.key {
                 Key::Enter => {
-                    if let Some(text) = self.read_input() {
-                        *self.value.borrow_mut() = text;
-                    }
                     ctx.end_modal(tv::Command::OK);
                     ev.clear();
                     return;
@@ -394,9 +359,6 @@ impl View for InputDialog {
         // answer may arrive as a command as well as a key.
         if let Event::Command(cmd) = ev {
             if *cmd == tv::Command::OK {
-                if let Some(text) = self.read_input() {
-                    *self.value.borrow_mut() = text;
-                }
                 ctx.end_modal(tv::Command::OK);
                 ev.clear();
                 return;
@@ -408,6 +370,18 @@ impl View for InputDialog {
             }
         }
         self.win.handle_event(ev, ctx);
+    }
+
+    /// The modal's record: the one field's text (`FieldValue::Text`, not a
+    /// list — the requester reads the single string). The `InputLine` is the
+    /// dialog's only data-bearing child, so the gather walk yields a
+    /// one-element list; unwrap it. Gathered by the pump while the dialog is
+    /// still in the tree.
+    fn value(&self) -> Option<FieldValue> {
+        match self.win.gather_list() {
+            FieldValue::List(items) => items.into_iter().next(),
+            _ => None,
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -499,12 +473,12 @@ mod shell_form_tests {
         // submits it — verified live. (A pre-queued harness stream never
         // idles between events, so it keeps the Containers def and must
         // answer with Command::OK instead — tests/resource_actions.rs.)
-        let values = Rc::new(RefCell::new(ShellForm {
+        let form = ShellForm {
             shell: "sh".into(),
             user: String::new(),
             workdir: String::new(),
-        }));
-        let dlg = ShellConfigDialog::new(Rect::new(0, 0, 60, 10), values, "web");
+        };
+        let dlg = ShellConfigDialog::new(Rect::new(0, 0, 60, 10), &form, "web");
         assert_eq!(
             dlg.get_help_ctx(),
             HelpCtx::NO_CONTEXT,
@@ -525,12 +499,12 @@ mod shell_form_tests {
         use tv::event::{KeyEvent, KeyModifiers};
         use tv::{Deferred, TimerQueue};
 
-        let values = Rc::new(RefCell::new(ShellForm {
+        let form = ShellForm {
             shell: "sh".into(),
             user: String::new(),
             workdir: String::new(),
-        }));
-        let mut dlg = ShellConfigDialog::new(Rect::new(0, 0, 60, 10), values, "web");
+        };
+        let mut dlg = ShellConfigDialog::new(Rect::new(0, 0, 60, 10), &form, "web");
         let mut out: VecDeque<Event> = VecDeque::new();
         let mut timers = TimerQueue::new();
         let mut deferred: Vec<Deferred> = Vec::new();
@@ -586,8 +560,7 @@ mod input_dialog_tests {
     fn input_dialog_prefills_collects_and_cancels() {
         use tv::event::{KeyEvent, KeyModifiers};
         use tv::{Deferred, TimerQueue};
-        let value = Rc::new(RefCell::new("/var/log".to_string()));
-        let mut dlg = InputDialog::new(Rect::new(0, 0, 50, 7), "Go to", "Path", Rc::clone(&value));
+        let mut dlg = InputDialog::new(Rect::new(0, 0, 50, 7), "Go to", "Path", "/var/log");
         let mut out: VecDeque<Event> = VecDeque::new();
         let mut deferred: Vec<Deferred> = Vec::new();
         {
@@ -608,11 +581,17 @@ mod input_dialog_tests {
                 .any(|d| matches!(d, tv::Deferred::EndModal(c) if *c == tv::Command::OK)),
             "Enter → EndModal(OK)"
         );
-        assert_eq!(value.borrow().as_str(), "/var/log/sub");
+        // The record is gathered from the modal (delivered via
+        // `set_modal_data` on a non-cancel close).
+        assert_eq!(
+            dlg.value(),
+            Some(FieldValue::Text("/var/log/sub".into())),
+            "the edited text is the dialog's record"
+        );
 
-        // Cancel leaves the shared value untouched.
-        value.borrow_mut().clear();
-        let mut dlg = InputDialog::new(Rect::new(0, 0, 50, 7), "Rename", "New name", value.clone());
+        // A cancel close posts CANCEL; the pump delivers NOTHING on cancel
+        // (the framework contract), so the typed text is never handed over.
+        let mut dlg = InputDialog::new(Rect::new(0, 0, 50, 7), "Rename", "New name", "");
         let mut out: VecDeque<Event> = VecDeque::new();
         let mut deferred: Vec<Deferred> = Vec::new();
         {
@@ -632,6 +611,5 @@ mod input_dialog_tests {
                 .any(|d| matches!(d, tv::Deferred::EndModal(c) if *c == tv::Command::CANCEL)),
             "Esc → EndModal(CANCEL)"
         );
-        assert!(value.borrow().is_empty(), "cancel must not write back");
     }
 }

@@ -45,7 +45,9 @@ impl Slot {
 
 /// Everything `finish_shell_config` needs after the modal answers.
 struct ShellSession {
-    values: Rc<RefCell<crate::views::dialogs::ShellForm>>,
+    /// The answered form — seeded with the prefill, overwritten by the
+    /// modal's record through `set_modal_data`.
+    form: crate::views::dialogs::ShellForm,
     id: String,
     name: String,
     image: String,
@@ -433,11 +435,9 @@ impl TvdockerDesktop {
             ctx.request_focus(vid);
             return;
         }
-        let values = Rc::new(RefCell::new(crate::views::dialogs::ShellForm::prefill(
-            &name, &image,
-        )));
+        let form = crate::views::dialogs::ShellForm::prefill(&name, &image);
         self.shell_session = Some(ShellSession {
-            values: Rc::clone(&values),
+            form: form.clone(),
             id: target.clone(),
             name,
             image,
@@ -452,7 +452,7 @@ impl TvdockerDesktop {
             (size.x - 60) / 2 + 60,
             (size.y - 10) / 2 + 10,
         );
-        let dialog = crate::views::dialogs::ShellConfigDialog::new(bounds, values, &target);
+        let dialog = crate::views::dialogs::ShellConfigDialog::new(bounds, &form, &target);
         ctx.request_exec_view(
             Box::new(dialog),
             requester,
@@ -470,7 +470,7 @@ impl TvdockerDesktop {
         let Some(sess) = self.shell_session.take() else {
             return;
         };
-        let form = sess.values.borrow().clone();
+        let form = sess.form;
         if let Err(e) = form.save_if_changed(&sess.name, &sess.image) {
             // Never a modal (§10) — the status line carries it.
             self.core.borrow_mut().last_error = Some(format!("config save: {e}"));
@@ -835,6 +835,31 @@ impl View for TvdockerDesktop {
     /// `*_SUBMIT`/`*_CONFIRMED` command performs the action.
     fn set_modal_answer(&mut self, cmd: tv::Command) {
         self.modal_answer = Some(cmd);
+    }
+
+    /// The shell config dialog's record: the three field texts, in order
+    /// (Shell, User, Workdir). The pump delivers this BEFORE the close
+    /// command, so `finish_shell_config` sees the answered form.
+    fn set_modal_data(&mut self, data: tv::FieldValue) {
+        let tv::FieldValue::List(items) = data else {
+            return;
+        };
+        let Some(sess) = self.shell_session.as_mut() else {
+            return;
+        };
+        let mut texts = items.into_iter().filter_map(|v| match v {
+            tv::FieldValue::Text(t) => Some(t),
+            _ => None,
+        });
+        if let Some(shell) = texts.next() {
+            sess.form.shell = shell;
+        }
+        if let Some(user) = texts.next() {
+            sess.form.user = user;
+        }
+        if let Some(workdir) = texts.next() {
+            sess.form.workdir = workdir;
+        }
     }
 
     /// Enter the desktop at its edge — required for the hierarchical Tab

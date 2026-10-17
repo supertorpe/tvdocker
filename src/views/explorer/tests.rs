@@ -260,7 +260,7 @@ fn rename_ignores_the_parent_row() {
     // `seed` syncs with one Down; `g` parks the cursor on row 0 (`..`).
     send(&mut w, Key::Char('g'));
     w.pending_prompt = Some(PromptKind::Rename);
-    *w.prompt_value.borrow_mut() = "x".into();
+    w.prompt_value = "x".into();
     w.modal_answer = Some(tv::Command::OK);
     w.finish_prompt();
     assert!(rx.try_recv().is_err(), "the `..` row is refused");
@@ -268,7 +268,7 @@ fn rename_ignores_the_parent_row() {
     // On a real row the rename is still queued.
     send(&mut w, Key::Down);
     w.pending_prompt = Some(PromptKind::Rename);
-    *w.prompt_value.borrow_mut() = "b.txt".into();
+    w.prompt_value = "b.txt".into();
     w.modal_answer = Some(tv::Command::OK);
     w.finish_prompt();
     let req = rx.try_recv().expect("rename queued");
