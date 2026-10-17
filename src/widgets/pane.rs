@@ -175,11 +175,7 @@ mod tests {
                 d.state_mut().set_bounds(rect);
                 d
             });
-        let mut cw = ScrollWindow {
-            window: win,
-            ids,
-            size: Point::new(0, 0),
-        };
+        let mut cw = ScrollWindow { window: win, ids };
         let _ = render_view(80, 25, &mut cw);
         cw.change_bounds(Rect::new(2, 1, 60, 12));
         let _ = render_view(80, 25, &mut cw);
@@ -268,11 +264,7 @@ mod tests {
             "the bar must not stop the Tab cycle"
         );
 
-        let mut cw = ScrollStatusWindow {
-            window: win,
-            ids,
-            size: Point::new(0, 0),
-        };
+        let mut cw = ScrollStatusWindow { window: win, ids };
         let _ = render_view(80, 25, &mut cw);
         cw.change_bounds(Rect::new(2, 1, 60, 12));
         let _ = render_view(80, 25, &mut cw);
@@ -296,11 +288,7 @@ mod tests {
                 d.state_mut().set_bounds(rect);
                 d
             });
-        let mut cw = CompactWindow {
-            window: win,
-            ids,
-            size: Point::new(0, 0),
-        };
+        let mut cw = CompactWindow { window: win, ids };
         let _ = render_view(80, 25, &mut cw);
         cw.change_bounds(Rect::new(2, 1, 60, 12));
         let _ = render_view(80, 25, &mut cw);
@@ -415,13 +403,9 @@ mod tests {
                 d
             },
         );
-        let mut pane = PaneWindow {
-            window: win,
-            ids,
-            size: Point::new(0, 0),
-        };
-        // First draw records the size; then simulate the window growing
-        // (zoom / drag) and redraw — children must follow the new size.
+        let mut pane = PaneWindow { window: win, ids };
+        // Simulate the window growing (zoom / drag) and redraw — children
+        // must follow the new size via `change_bounds`.
         let _ = render_view(80, 25, &mut pane);
         let body_id = pane.ids.body;
         let grown = Rect::new(2, 1, 60, 16);
@@ -534,13 +518,13 @@ fn apply_pane_layout(win: &mut Window, ids: &PaneIds) {
 }
 
 /// Window wrapper that keeps its children laid out from the CURRENT window
-/// size: zoom / Size-Move drag / terminal clamps all end in a redraw, which
-/// is where the size check runs — so the pane always fills the client area
-/// and never overlaps the frame (the round-2 layout fix).
+/// size: every resize path (zoom / Size-Move drag / terminal clamps) goes
+/// through [`View::change_bounds`], which re-applies the layout as soon as the
+/// new bounds land — so the pane always fills the client area and never
+/// overlaps the frame (the round-2 layout fix).
 pub struct PaneWindow {
     window: Window,
     ids: PaneIds,
-    size: Point,
 }
 
 impl PaneWindow {
@@ -553,8 +537,7 @@ impl PaneWindow {
         body: impl FnOnce(Rect, Option<ViewId>) -> Box<dyn View>,
     ) -> Self {
         let (window, ids) = build_pane_window(bounds, title, number, info, filter, body);
-        let size = window.state().size;
-        Self { window, ids, size }
+        Self { window, ids }
     }
 
     /// The inserted children (probes downcast the body by id).
@@ -564,14 +547,6 @@ impl PaneWindow {
 
     pub fn window_mut(&mut self) -> &mut Window {
         &mut self.window
-    }
-
-    fn relayout_if_resized(&mut self) {
-        let size = self.window.state().size;
-        if size != self.size {
-            self.size = size;
-            apply_pane_layout(&mut self.window, &self.ids);
-        }
     }
 }
 
@@ -585,12 +560,25 @@ impl View for PaneWindow {
     }
 
     fn draw(&mut self, ctx: &mut DrawCtx) {
-        self.relayout_if_resized();
         self.window.draw(ctx);
     }
 
+    fn change_bounds(&mut self, bounds: Rect) {
+        self.window.change_bounds(bounds);
+        apply_pane_layout(&mut self.window, &self.ids);
+    }
+
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
+        let before = self.window.state().size;
         self.window.handle_event(ev, ctx);
+        // Zoom / fullscreen re-bound the inner window's group directly
+        // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
+        // reaches this wrapper's `change_bounds`; reconcile so the pane children
+        // (and their scroll bars) follow the new client area.
+        if self.window.state().size != before {
+            apply_pane_layout(&mut self.window, &self.ids);
+            self.window.on_bounds_changed(ctx);
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -667,12 +655,11 @@ fn apply_compact_layout(win: &mut Window, ids: &CompactIds) {
 }
 
 /// Window wrapper for the compact pane: re-derives the status/body rects on
-/// every redraw whose size differs (zoom / Size-Move / terminal clamps) —
-/// the round-2 fix for the shell window's cursor-outside-window bug.
+/// every [`View::change_bounds`] (zoom / Size-Move / terminal clamps) — the
+/// round-2 fix for the shell window's cursor-outside-window bug.
 pub struct CompactWindow {
     window: Window,
     ids: CompactIds,
-    size: Point,
 }
 
 impl CompactWindow {
@@ -684,8 +671,7 @@ impl CompactWindow {
         body: impl FnOnce(Rect) -> Box<dyn View>,
     ) -> Self {
         let (window, ids) = build_compact_window(bounds, title, number, status, body);
-        let size = window.state().size;
-        Self { window, ids, size }
+        Self { window, ids }
     }
 
     pub fn ids(&self) -> &CompactIds {
@@ -694,14 +680,6 @@ impl CompactWindow {
 
     pub fn window_mut(&mut self) -> &mut Window {
         &mut self.window
-    }
-
-    fn relayout_if_resized(&mut self) {
-        let size = self.window.state().size;
-        if size != self.size {
-            self.size = size;
-            apply_compact_layout(&mut self.window, &self.ids);
-        }
     }
 }
 
@@ -715,12 +693,25 @@ impl View for CompactWindow {
     }
 
     fn draw(&mut self, ctx: &mut DrawCtx) {
-        self.relayout_if_resized();
         self.window.draw(ctx);
     }
 
+    fn change_bounds(&mut self, bounds: Rect) {
+        self.window.change_bounds(bounds);
+        apply_compact_layout(&mut self.window, &self.ids);
+    }
+
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
+        let before = self.window.state().size;
         self.window.handle_event(ev, ctx);
+        // Zoom / fullscreen re-bound the inner window's group directly
+        // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
+        // reaches this wrapper's `change_bounds`; reconcile so the compact
+        // children follow the new client area.
+        if self.window.state().size != before {
+            apply_compact_layout(&mut self.window, &self.ids);
+            self.window.on_bounds_changed(ctx);
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -793,12 +784,11 @@ fn apply_scroll_layout(win: &mut Window, ids: &ScrollIds) {
 }
 
 /// Window wrapper for the scroll layout: re-derives the body/bar rects on every
-/// redraw whose size differs (zoom / Size-Move / terminal clamps), the
+/// [`View::change_bounds`] (zoom / Size-Move / terminal clamps), the
 /// [`PaneWindow`] pattern.
 pub struct ScrollWindow {
     window: Window,
     ids: ScrollIds,
-    size: Point,
 }
 
 impl ScrollWindow {
@@ -809,8 +799,7 @@ impl ScrollWindow {
         body: impl FnOnce(Rect, Option<ViewId>) -> Box<dyn View>,
     ) -> Self {
         let (window, ids) = build_scroll_window(bounds, title, number, body);
-        let size = window.state().size;
-        Self { window, ids, size }
+        Self { window, ids }
     }
 
     pub fn ids(&self) -> &ScrollIds {
@@ -819,14 +808,6 @@ impl ScrollWindow {
 
     pub fn window_mut(&mut self) -> &mut Window {
         &mut self.window
-    }
-
-    fn relayout_if_resized(&mut self) {
-        let size = self.window.state().size;
-        if size != self.size {
-            self.size = size;
-            apply_scroll_layout(&mut self.window, &self.ids);
-        }
     }
 }
 
@@ -840,12 +821,25 @@ impl View for ScrollWindow {
     }
 
     fn draw(&mut self, ctx: &mut DrawCtx) {
-        self.relayout_if_resized();
         self.window.draw(ctx);
     }
 
+    fn change_bounds(&mut self, bounds: Rect) {
+        self.window.change_bounds(bounds);
+        apply_scroll_layout(&mut self.window, &self.ids);
+    }
+
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
+        let before = self.window.state().size;
         self.window.handle_event(ev, ctx);
+        // Zoom / fullscreen re-bound the inner window's group directly
+        // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
+        // reaches this wrapper's `change_bounds`; reconcile so the body/bar
+        // follow the new client area.
+        if self.window.state().size != before {
+            apply_scroll_layout(&mut self.window, &self.ids);
+            self.window.on_bounds_changed(ctx);
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -922,7 +916,6 @@ fn apply_scroll_status_layout(win: &mut Window, ids: &ScrollStatusIds) {
 pub struct ScrollStatusWindow {
     window: Window,
     ids: ScrollStatusIds,
-    size: Point,
 }
 
 impl ScrollStatusWindow {
@@ -934,8 +927,7 @@ impl ScrollStatusWindow {
         body: impl FnOnce(Rect, Option<ViewId>) -> Box<dyn View>,
     ) -> Self {
         let (window, ids) = build_scroll_status_window(bounds, title, number, status, body);
-        let size = window.state().size;
-        Self { window, ids, size }
+        Self { window, ids }
     }
 
     pub fn ids(&self) -> &ScrollStatusIds {
@@ -944,14 +936,6 @@ impl ScrollStatusWindow {
 
     pub fn window_mut(&mut self) -> &mut Window {
         &mut self.window
-    }
-
-    fn relayout_if_resized(&mut self) {
-        let size = self.window.state().size;
-        if size != self.size {
-            self.size = size;
-            apply_scroll_status_layout(&mut self.window, &self.ids);
-        }
     }
 }
 
@@ -965,12 +949,25 @@ impl View for ScrollStatusWindow {
     }
 
     fn draw(&mut self, ctx: &mut DrawCtx) {
-        self.relayout_if_resized();
         self.window.draw(ctx);
     }
 
+    fn change_bounds(&mut self, bounds: Rect) {
+        self.window.change_bounds(bounds);
+        apply_scroll_status_layout(&mut self.window, &self.ids);
+    }
+
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
+        let before = self.window.state().size;
         self.window.handle_event(ev, ctx);
+        // Zoom / fullscreen re-bound the inner window's group directly
+        // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
+        // reaches this wrapper's `change_bounds`; reconcile so the status/body/
+        // bar follow the new client area.
+        if self.window.state().size != before {
+            apply_scroll_status_layout(&mut self.window, &self.ids);
+            self.window.on_bounds_changed(ctx);
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
