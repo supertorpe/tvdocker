@@ -304,12 +304,16 @@ fn visible_rows_in(
         .collect()
 }
 
-/// `TreeRow`s as `TableRow`s: an indent-by-depth name, the change letter,
-/// the size and the mode, tinted by [`role_for`]. Size and mode come from
-/// `tree` — the comparison tree the rows were flattened from, not the
-/// selected layer's tar — and `compare` back-fills a `Removed` node with
-/// its `Entry`, so a removed row still shows what it used to be.
-pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree) -> Vec<TableRow> {
+/// `TreeRow`s as `TableRow`s: an indent-by-depth name with dive's `⊕ `
+/// collapse marker in front of a COLLAPSED directory (finding 3, spec
+/// §7; `file_tree.go`'s `collapsedItem`), the change letter, the size and
+/// the mode, tinted by [`role_for`]. Size and mode come from `tree` — the
+/// comparison tree the rows were flattened from, not the selected layer's
+/// tar — and `compare` back-fills a `Removed` node with its `Entry`, so a
+/// removed row still shows what it used to be. The collapse state is
+/// passed as the window's `collapsed` set (rather than a per-row flag) so
+/// `flatten`/`TreeRow` stay collapse-unaware.
+pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree, collapsed: &HashSet<String>) -> Vec<TableRow> {
     rows.iter()
         .map(|r| {
             let entry = tree.get(&r.path).and_then(|id| tree.node(id).entry.clone());
@@ -323,10 +327,17 @@ pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree) -> Vec<TableRow> {
                 .unwrap_or_default();
             let indent = " ".repeat(r.depth);
             let name = r.path.rsplit('/').next().unwrap_or(&r.path).to_string();
+            // Only a collapsed DIRECTORY is flagged: with the subtree
+            // hidden, the marker is what tells collapsed rows apart.
+            let marker = if r.is_dir && collapsed.contains(&r.path) {
+                "⊕ "
+            } else {
+                ""
+            };
             TableRow::new(
                 r.path.clone(),
                 vec![
-                    format!("{indent}{name}"),
+                    format!("{indent}{marker}{name}"),
                     letter_for(r.diff).to_string(),
                     size,
                     mode,
@@ -386,7 +397,7 @@ pub fn build(
             let tree = comparer.tree(&a.layers, Compare::Single, 0).clone();
             (
                 layer_rows(a, 0, ""),
-                tree_rows_for(&flatten(&tree), &tree),
+                tree_rows_for(&flatten(&tree), &tree, &HashSet::new()),
                 inefficient_rows(a),
             )
         }
@@ -786,7 +797,7 @@ impl LayersWindow {
             let flat = flatten(tree);
             let visible =
                 visible_rows_in(&flat, &self.collapsed, &self.hidden, &self.last_tree_needle);
-            (flat, tree_rows_for(&visible, tree))
+            (flat, tree_rows_for(&visible, tree, &self.collapsed))
         };
         self.tree_rows = flat;
         if let Some(t) = self.table_mut(self.tree_table) {

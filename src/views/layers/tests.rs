@@ -296,7 +296,7 @@ fn child_rows_are_indented_one_step_deeper_than_their_parent() {
     t.add_path(entry("/hosts", "v1")); // top level
     t.add_path(entry("/etc/hosts", "v1")); // one level down
     t.add_path(entry("/etc/sub/x", "v1")); // two levels down
-    let rows = tree_rows_for(&flatten(&t), &t);
+    let rows = tree_rows_for(&flatten(&t), &t, &HashSet::new());
     let leading = |path: &str| {
         let row = rows.iter().find(|r| r.id == path).expect(path);
         row.cells[0].len() - row.cells[0].trim_start().len()
@@ -428,6 +428,31 @@ fn collapsing_a_nested_directory_hides_its_whole_subtree() {
         still.iter().any(|p| p == "/etc"),
         "its ancestors stay: {still:?}"
     );
+}
+
+/// Finding 3 (spec §7): after `-` collapses a directory, the row must
+/// SHOW it is collapsed — dive's `⊕ ` marker (`file_tree.go`,
+/// `collapsedItem`) in the PATH cell; expanding removes it again.
+#[test]
+fn collapsing_a_directory_marks_its_row_with_the_collapse_glyph() {
+    let mut win = window_with(three_layer_analysis());
+    win.selected = 1;
+    sync_and_draw(&mut win);
+    let path_cell = |win: &mut LayersWindow, path: &str| -> String {
+        let table = win.table_mut(win.tree_table).expect("tree table");
+        let model = table.model();
+        let row = (0..model.row_count())
+            .find(|i| model.row_key(*i).0 == path)
+            .unwrap_or_else(|| panic!("{path} row present"));
+        model.cell(row, 0).to_string()
+    };
+    assert_eq!(path_cell(&mut win, "/etc"), "etc", "expanded: no marker");
+    win.collapse("/etc");
+    sync_and_draw(&mut win);
+    assert_eq!(path_cell(&mut win, "/etc"), "⊕ etc", "collapsed: marker");
+    win.expand("/etc");
+    sync_and_draw(&mut win);
+    assert_eq!(path_cell(&mut win, "/etc"), "etc", "expanded again");
 }
 
 #[test]
