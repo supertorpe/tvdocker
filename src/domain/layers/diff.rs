@@ -59,12 +59,33 @@ fn roll_up(tree: &mut Tree) {
             continue;
         }
         let mut diffs: Vec<DiffType> = children.iter().map(|c| tree.node(*c).diff).collect();
-        let merged = if diffs.iter().all(|d| *d == DiffType::Removed) {
+        let children_merge = if diffs.iter().all(|d| *d == DiffType::Removed) {
             DiffType::Removed
         } else if diffs.windows(2).all(|w| w[0] == w[1]) {
             diffs.remove(0)
         } else {
             DiffType::Modified
+        };
+        // dive `deriveDiffType` (`file_node.go:300-311`) SEEDS this merge
+        // with the node's own tentative diff, so a node with its own tar
+        // entry (`entry: Some`) merges it in — equal ⇒ the shared value,
+        // differ ⇒ `Modified` (final-fix ruling for finding 4: a chmod'd
+        // directory must not read `Unmodified` just because its children
+        // agree, and a pre-existing directory with only new children reads
+        // `Modified`, not `Added`). Synthesised intermediate directories
+        // (`entry: None`) keep the children-only merge. The all-Removed
+        // cascade is unchanged: a directory that actually vanished is
+        // already stamped `Removed` on its own entry by `compare`'s
+        // removal loop, so the seeded merge keeps it `Removed`.
+        let merged = if tree.node(id).entry.is_some() {
+            let own = tree.node(id).diff;
+            if own == children_merge {
+                children_merge
+            } else {
+                DiffType::Modified
+            }
+        } else {
+            children_merge
         };
         tree.node_mut(id).diff = merged;
     }
@@ -230,6 +251,42 @@ mod tests {
         assert_eq!(diff_of(&got, "/etc/sub"), DiffType::Removed);
         assert_eq!(diff_of(&got, "/etc/sub/a"), DiffType::Removed);
         assert_eq!(diff_of(&got, "/etc/sub/b"), DiffType::Removed);
+    }
+
+    /// Finding 4's first masked change: a real tar directory entry that
+    /// was chmod'd, with otherwise uniform children — the roll-up must
+    /// seed with the node's OWN tentative diff (dive `file_node.go`),
+    /// not replace it with the children-only merge.
+    #[test]
+    fn a_chmod_on_a_directory_entry_reads_modified_even_when_its_children_are_uniform() {
+        let bottom = layer(0, &[("/etc/", "d"), ("/etc/hosts", "v1")]);
+        let mut top = layer(1, &[("/etc/", "d"), ("/etc/hosts", "v1")]);
+        top.tree
+            .node_mut(top.tree.get("/etc").expect("the dir entry"))
+            .entry
+            .as_mut()
+            .expect("a real tar entry")
+            .mode = 0o755;
+        let got = compare(&bottom.tree, &top.tree);
+        assert_eq!(
+            diff_of(&got, "/etc"),
+            DiffType::Modified,
+            "the directory's own chmod must not be masked by uniform children"
+        );
+        assert_eq!(diff_of(&got, "/etc/hosts"), DiffType::Unmodified);
+        assert_eq!(diff_of(&got, "/"), DiffType::Modified, "it rolls up");
+    }
+
+    /// Finding 4, the dive-ruled direction: a PRE-EXISTING directory whose
+    /// children are all new reads `Modified` (own diff `Unmodified` vs a
+    /// children merge of `Added`), not `Added`.
+    #[test]
+    fn a_preexisting_directory_with_only_new_children_reads_modified_not_added() {
+        let bottom = layer(0, &[("/etc/", "d")]);
+        let top = layer(1, &[("/etc/", "d"), ("/etc/hosts", "v1")]);
+        let got = compare(&bottom.tree, &top.tree);
+        assert_eq!(diff_of(&got, "/etc/hosts"), DiffType::Added);
+        assert_eq!(diff_of(&got, "/etc"), DiffType::Modified);
     }
 
     #[test]
