@@ -203,6 +203,27 @@ impl Tree {
         )
     }
 
+    /// Every node's size the way dive shows it (`FileNode.GetSize`): a
+    /// file's own payload size, a directory's rolled-up subtree sum that
+    /// SKIPS removed children — unless the directory itself is removed,
+    /// which then accumulates everything it used to hold. One post-order
+    /// pass (reverse DFS: children before parents), indexed by
+    /// [`NodeId`], so a caller renders a whole tree from one call.
+    pub fn subtree_sizes(&self) -> Vec<u64> {
+        let mut sizes = vec![0u64; self.nodes.len()];
+        for id in self.dfs().into_iter().rev() {
+            let own_removed = self.nodes[id].diff == DiffType::Removed;
+            let mut total = self.nodes[id].entry.as_ref().map_or(0, |e| e.size);
+            for child in self.children(id) {
+                if own_removed || self.nodes[child].diff != DiffType::Removed {
+                    total += sizes[child];
+                }
+            }
+            sizes[id] = total;
+        }
+        sizes
+    }
+
     /// A node without an entry is a directory.
     pub fn is_dir(&self, id: NodeId) -> bool {
         self.nodes[id]
@@ -217,10 +238,10 @@ mod tests {
     use super::*;
     use crate::domain::layers::{Entry, Kind};
 
-    fn file(path: &str) -> Entry {
+    fn sized(path: &str, size: u64) -> Entry {
         Entry {
             path: path.to_string(),
-            size: 10,
+            size,
             mode: 0o644,
             uid: 0,
             gid: 0,
@@ -228,6 +249,12 @@ mod tests {
             link: None,
             hash: 7,
         }
+    }
+
+    fn file(path: &str) -> Entry {
+        let mut e = sized(path, 10);
+        e.path = path.to_string();
+        e
     }
 
     fn paths(t: &Tree) -> Vec<String> {
@@ -314,5 +341,40 @@ mod tests {
     fn path_of_the_root_is_a_slash() {
         let t = Tree::new();
         assert_eq!(t.path_of(t.root()), "/");
+    }
+
+    /// Dive `FileNode.GetSize`: a file keeps its own size, a directory
+    /// rolls its subtree up, and a removed child never counts upward.
+    #[test]
+    fn subtree_sizes_roll_up_files_and_skip_removed_children() {
+        let mut t = Tree::new();
+        t.add_path(sized("/bin/busybox", 100));
+        t.add_path(sized("/bin/sh", 0));
+        t.add_path(sized("/etc/hosts", 7));
+        let hosts = t.get("/etc/hosts").unwrap();
+        t.node_mut(hosts).diff = DiffType::Removed;
+        let sizes = t.subtree_sizes();
+        let at = |p: &str| sizes[t.get(p).unwrap()];
+        assert_eq!(at("/bin/busybox"), 100, "a file keeps its own size");
+        assert_eq!(at("/bin/sh"), 0, "a symlink carries no payload");
+        assert_eq!(at("/bin"), 100, "the directory rolls its files up");
+        assert_eq!(at("/"), 100, "…and a removed child never counts upward");
+        assert_eq!(at("/etc/hosts"), 7, "a removed file still shows its size");
+        assert_eq!(at("/etc"), 0, "…but its parent no longer sums it");
+    }
+
+    /// The other half of dive's rule: a removed DIRECTORY still
+    /// accumulates what it used to hold.
+    #[test]
+    fn a_removed_directory_accumulates_what_it_used_to_hold() {
+        let mut t = Tree::new();
+        t.add_path(sized("/opt/app.bin", 50));
+        let opt = t.get("/opt").unwrap();
+        t.node_mut(opt).diff = DiffType::Removed;
+        let sizes = t.subtree_sizes();
+        assert_eq!(sizes[opt], 50, "the removed dir shows its old contents");
+        // `compare` marks a removed subtree node by node, so the root no
+        // longer sums it — the image's live total is what the roll-up reads.
+        assert_eq!(sizes[t.root()], 0, "…but it never counts upward again");
     }
 }

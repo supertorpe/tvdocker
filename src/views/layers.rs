@@ -4,7 +4,7 @@
 //! `RowModel`s, a `Drop`-cleared reopen flag) but is a separate window —
 //! the container-based Image Explorer is untouched.
 use crate::core::{AppCore, TaskReq};
-use crate::domain::layers::{Analysis, Compare, Comparer, DiffType, Tree};
+use crate::domain::layers::{Analysis, Compare, Comparer, DiffType, Kind, Tree};
 use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
 use crate::widgets::{Align, Column, FilterBar, SharedLine};
 use std::cell::RefCell;
@@ -13,7 +13,7 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::widgets::{SelectionMode, SortDir, Table};
-use tv::{Context, HelpCtx, Rect, Role, View, ViewState, Window, delegate};
+use tv::{Context, HelpCtx, Rect, Role, ScrollBar, View, ViewState, Window, delegate};
 
 /// Help context while a Layers window is focused.
 pub const HELP_CTX: HelpCtx = HelpCtx::custom("tvdocker.layers");
@@ -27,42 +27,76 @@ const LAYER_TABLE_KEY: &str = "layers.layers";
 /// The persisted column-layout key for the change tree.
 const TREE_TABLE_KEY: &str = "layers.tree";
 
-fn layer_columns() -> Vec<Column> {
+/// The layer table's columns for a `width`-wide pane: CMP and SIZE are
+/// fixed, the command line takes the leftover (never below 12 cells — a
+/// shorter pane clips instead, and the table still scrolls).
+fn layer_columns(width: i32) -> Vec<Column> {
     vec![
         Column::new("CMP", 3, Align::Left),
-        Column::new("SIZE", 10, Align::Right),
-        Column::new("COMMAND", 28, Align::Left),
+        Column::new("SIZE", 8, Align::Right),
+        Column::new("COMMAND", (width - 11).clamp(12, 40), Align::Left),
     ]
 }
 
-fn tree_columns() -> Vec<Column> {
-    vec![
-        Column::new("PATH", 30, Align::Left),
-        Column::new("CHANGE", 2, Align::Left),
-        Column::new("SIZE", 10, Align::Right),
-        Column::new("MODE", 8, Align::Left),
-    ]
+/// The change tree's columns for a `width`-wide pane: PATH takes whatever
+/// the fixed columns leave, and the attribute columns — dive's UID:GID
+/// and Permission — appear only when a readable path still fits beside
+/// them (dive drops the attributes entirely in a constrained layout).
+fn tree_columns(width: i32) -> Vec<Column> {
+    const CHANGE: i32 = 2;
+    const SIZE: i32 = 8;
+    const UID_GID: i32 = 7;
+    const PERM: i32 = 10;
+    // A PATH narrower than 20 cells truncates most names to an ellipsis
+    // once the indent and connector are in front of them, so the
+    // attribute columns only claim their slice when 20 cells still stay.
+    const MIN_PATH: i32 = 20;
+    let mut cols = vec![
+        Column::new("PATH", 0, Align::Left),
+        Column::new("CHANGE", CHANGE, Align::Left),
+        Column::new("SIZE", SIZE, Align::Right),
+    ];
+    if width >= MIN_PATH + CHANGE + SIZE + PERM + UID_GID {
+        cols.push(Column::new("UID:GID", UID_GID, Align::Right));
+    }
+    if width >= MIN_PATH + CHANGE + SIZE + PERM {
+        cols.push(Column::new("PERM", PERM, Align::Left));
+    }
+    let fixed: i32 = cols.iter().map(|c| c.width).sum();
+    cols[0].width = (width - fixed).max(MIN_PATH);
+    cols
 }
 
 /// Child rectangles for a Layers window of `size` (frame included): a
-/// details line, two filter bars, the two tables over the middle, and the
+/// details line, two filter bars, the two tables over the middle — each
+/// giving its right-most client column to its vertical scroll bar (the
+/// [`crate::widgets::scroll_rects`] body+bar convention) — and the
 /// inefficient-paths strip above the bottom border.
 fn layers_rects(size: tv::Point) -> LayersRects {
     let right = (size.x - 1).max(1); // exclusive client right (frame = size.x-1)
     let bottom = (size.y - 1).max(1); // exclusive client bottom (frame = size.y-1)
-    let mid = (size.x / 2).clamp(1, right); // the layer/tree split column
+    let mid = ((size.x * 2) / 5).clamp(1, right); // the layer/tree split (40/60)
     let first_table = 3.min(bottom); // filters end at row 3 — no blank line (the explorer's formula)
     // `bottom - 3`: the strip needs its header AND two path rows (the
     // design's "list of inefficient paths"); `bottom - 2` left room for a
     // single path, clipping every entry past the first at any window size.
     let details_y = (bottom - 3).max(first_table);
     let last_table = details_y.min(bottom);
+    // One column per bar, taken from its own table's right edge; the
+    // `.max(…)`/`.min(…)` pairs keep every rect ordered (never inverted,
+    // never past the client) even at degenerate widths.
+    let layer_body_right = (mid - 2).max(1);
+    let layer_bar_right = (mid - 1).max(layer_body_right);
+    let tree_body_right = (right - 1).max(mid + 1).min(right);
+    let tree_bar_right = right.max(tree_body_right);
     LayersRects {
         summary: Rect::new(1, 1, right, 2.min(bottom)),
         layer_filter: Rect::new(1, 2.min(bottom), mid - 1, 3.min(bottom)),
         tree_filter: Rect::new(mid + 1, 2.min(bottom), right, 3.min(bottom)),
-        layer_table: Rect::new(1, first_table, mid - 1, last_table),
-        tree_table: Rect::new(mid + 1, first_table, right, last_table),
+        layer_table: Rect::new(1, first_table, layer_body_right, last_table),
+        layer_bar: Rect::new(layer_body_right, first_table, layer_bar_right, last_table),
+        tree_table: Rect::new(mid + 1, first_table, tree_body_right, last_table),
+        tree_bar: Rect::new(tree_body_right, first_table, tree_bar_right, last_table),
         inefficient: Rect::new(1, details_y, right, bottom.max(details_y)),
     }
 }
@@ -74,7 +108,9 @@ struct LayersRects {
     layer_filter: Rect,
     tree_filter: Rect,
     layer_table: Rect,
+    layer_bar: Rect,
     tree_table: Rect,
+    tree_bar: Rect,
     inefficient: Rect,
 }
 
@@ -89,7 +125,11 @@ pub struct LayersWindow {
     key: String,
     open: Rc<RefCell<bool>>,
     layer_table: tv::ViewId,
+    /// The layer table's vertical scroll bar (its right-most column).
+    layer_bar: tv::ViewId,
     tree_table: tv::ViewId,
+    /// The change tree's vertical scroll bar (its right-most column).
+    tree_bar: tv::ViewId,
     inefficient_table: tv::ViewId,
     layer_filter: tv::ViewId,
     tree_filter: tv::ViewId,
@@ -107,6 +147,12 @@ pub struct LayersWindow {
     mode: Compare,
     /// Directories the user collapsed (the root is never collapsed).
     collapsed: HashSet<String>,
+    /// The column sets this window was BUILT with: a `Table` takes its
+    /// column specs once, so `redraw` and the sort step must agree with
+    /// the build-time pane width, never the current one (a resize clips
+    /// the widest column instead of re-deriving the set).
+    layer_columns: Vec<Column>,
+    tree_columns: Vec<Column>,
     /// Change types currently hidden (A/R/M/U toggles), indexed by
     /// [`diff_index`] — `DiffType` carries no `Hash`, so a fixed array
     /// stands in for a set.
@@ -141,9 +187,18 @@ pub struct LayersWindow {
     last_tree_needle: String,
 }
 
-fn make_table(rect: Rect, key: &str, columns: Vec<Column>, rows: Vec<TableRow>) -> Table {
+/// One table of the window: a `Table` wired to `bar` (the vertical scroll
+/// bar in its right-most column, `None` for the bar-less inefficient
+/// strip) and seeded with `rows`.
+fn make_table(
+    rect: Rect,
+    key: &str,
+    columns: Vec<Column>,
+    rows: Vec<TableRow>,
+    bar: Option<tv::ViewId>,
+) -> Table {
     let specs = columns.iter().map(to_spec).collect();
-    let mut table = Table::new(rect, specs, None)
+    let mut table = Table::new(rect, specs, bar)
         .with_selection_mode(SelectionMode::Single)
         .with_model(Box::new(RowModel::new(rows)));
     table.state_mut().options.selectable = true;
@@ -304,48 +359,126 @@ fn visible_rows_in(
         .collect()
 }
 
-/// `TreeRow`s as `TableRow`s: an indent-by-depth name with dive's `⊕ `
-/// collapse marker in front of a COLLAPSED directory (finding 3, spec
-/// §7; `file_tree.go`'s `collapsedItem`), the change letter, the size and
-/// the mode, tinted by [`role_for`]. Size and mode come from `tree` — the
-/// comparison tree the rows were flattened from, not the selected layer's
-/// tar — and `compare` back-fills a `Removed` node with its `Entry`, so a
-/// removed row still shows what it used to be. The collapse state is
-/// passed as the window's `collapsed` set (rather than a per-row flag) so
-/// `flatten`/`TreeRow` stay collapse-unaware.
-pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree, collapsed: &HashSet<String>) -> Vec<TableRow> {
-    rows.iter()
-        .map(|r| {
-            let entry = tree.get(&r.path).and_then(|id| tree.node(id).entry.clone());
-            let size = entry
-                .as_ref()
-                .map(|e| crate::views::resource::format_size(e.size as i64))
-                .unwrap_or_default();
-            let mode = entry
-                .as_ref()
-                .map(|e| format!("{:o}", e.mode))
-                .unwrap_or_default();
-            let indent = " ".repeat(r.depth);
-            let name = r.path.rsplit('/').next().unwrap_or(&r.path).to_string();
-            // Only a collapsed DIRECTORY is flagged: with the subtree
-            // hidden, the marker is what tells collapsed rows apart.
-            let marker = if r.is_dir && collapsed.contains(&r.path) {
-                "⊕ "
-            } else {
-                ""
-            };
-            TableRow::new(
-                r.path.clone(),
-                vec![
-                    format!("{indent}{marker}{name}"),
-                    letter_for(r.diff).to_string(),
-                    size,
-                    mode,
-                ],
-            )
-            .with_opt_role(role_for(r.diff))
-        })
-        .collect()
+/// `TreeRow`s as `TableRow`s: dive's tree rendering — `├─`/`└─`
+/// connectors, `│` continuations under an ancestor that has more siblings
+/// below it, a `→ target` suffix for symlinks, and the `⊕ ` collapse
+/// marker in front of a COLLAPSED directory (finding 3, spec §7;
+/// `file_tree.go`'s `renderStringTreeBetween`/`collapsedItem`) — plus the
+/// change letter, the size, the uid:gid and the rwx permissions, tinted
+/// by [`role_for`]. Size/permissions/ids come from `tree` — the comparison
+/// tree the rows were flattened from, not the selected layer's tar — and
+/// `compare` back-fills a `Removed` node with its `Entry`, so a removed
+/// row still shows what it used to be. The collapse state is passed as
+/// the window's `collapsed` set (rather than a per-row flag) so
+/// `flatten`/`TreeRow` stay collapse-unaware. Connectors describe the
+/// VISIBLE rows, so collapsing a directory redraws them.
+pub fn tree_rows_for(
+    rows: &[TreeRow],
+    tree: &Tree,
+    collapsed: &HashSet<String>,
+    columns: &[Column],
+) -> Vec<TableRow> {
+    // One flag per depth level: does that ancestor have a sibling below
+    // it? A row draws `│   ` per true ancestor and `    ` per false one.
+    // Dive's rolled-up sizes: a directory shows the sum of the files
+    // under it (deleted ones excluded), computed once for the whole tree.
+    let sizes = tree.subtree_sizes();
+    let mut ancestors: Vec<bool> = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        ancestors.truncate(r.depth);
+        // The next row that is not this row's descendant decides the
+        // connector: a same-depth sibling means `├─`, anything shallower
+        // (or nothing) means this is the last child, `└─`.
+        let sibling_below = rows[i + 1..]
+            .iter()
+            .find(|n| n.depth <= r.depth)
+            .is_some_and(|n| n.depth == r.depth);
+        let indent: String = ancestors
+            .iter()
+            .map(|keep| if *keep { "│   " } else { "    " })
+            .collect();
+        ancestors.push(sibling_below);
+        let connector = if sibling_below { "├─ " } else { "└─ " };
+        let entry = tree.get(&r.path).and_then(|id| tree.node(id).entry.clone());
+        let size = tree
+            .get(&r.path)
+            .map(|id| crate::views::resource::format_size(sizes[id] as i64))
+            .unwrap_or_default();
+        let ids = entry
+            .as_ref()
+            .map(|e| format!("{}:{}", e.uid, e.gid))
+            .unwrap_or_default();
+        let perm = entry
+            .as_ref()
+            .map(|e| perm_string(e.mode, e.kind))
+            .unwrap_or_default();
+        let name = r.path.rsplit('/').next().unwrap_or(&r.path);
+        // Only a collapsed DIRECTORY is flagged: with the subtree hidden,
+        // the marker is what tells collapsed rows apart.
+        let marker = if r.is_dir && collapsed.contains(&r.path) {
+            "⊕ "
+        } else {
+            ""
+        };
+        let target = entry
+            .as_ref()
+            .and_then(|e| e.link.clone())
+            .map(|t| format!(" → {t}"))
+            .unwrap_or_default();
+        // One cell per column of THIS table: a pane too narrow for the
+        // attribute columns has no UID:GID/PERM cells either, so a row can
+        // never carry a value its table has no column for.
+        let cells = columns
+            .iter()
+            .map(|c| match c.label.as_str() {
+                "PATH" => format!("{indent}{connector}{marker}{name}{target}"),
+                "CHANGE" => letter_for(r.diff).to_string(),
+                "SIZE" => size.clone(),
+                "UID:GID" => ids.clone(),
+                "PERM" => perm.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        out.push(TableRow::new(r.path.clone(), cells).with_opt_role(role_for(r.diff)));
+    }
+    out
+}
+
+/// One entry's permissions the way dive's Permission column shows them:
+/// the kind letter followed by the nine rwx bits (`drwxr-xr-x`).
+fn perm_string(mode: u32, kind: Kind) -> String {
+    let mut out = String::with_capacity(10);
+    out.push(match kind {
+        Kind::Dir => 'd',
+        Kind::Symlink => 'l',
+        Kind::Hardlink => 'h',
+        Kind::File => '-',
+        Kind::Other => '?',
+    });
+    for shift in (0..9).rev() {
+        const BITS: [char; 3] = ['r', 'w', 'x'];
+        out.push(if mode & (1 << shift) != 0 {
+            BITS[(8 - shift) as usize % 3]
+        } else {
+            '-'
+        });
+    }
+    out
+}
+
+/// A layer id as the summary line shows it: the algorithm prefix plus the
+/// first 12 hex characters (docker's short-id width).
+fn short_id(id: &str) -> String {
+    let (algo, hex) = match id.split_once(':') {
+        Some((algo, hex)) => (Some(algo), hex),
+        None => (None, id),
+    };
+    let short: String = hex.chars().take(12).collect();
+    match algo {
+        Some(algo) => format!("{algo}:{short}"),
+        None => short,
+    }
 }
 
 /// Build one window. The initial analysis request is sent here ONLY when
@@ -392,12 +525,19 @@ pub fn build(
         )
     };
     let mut comparer = Comparer::new();
+    // The columns follow each pane's body width: the attribute columns
+    // (UID:GID, PERM) only claim a slice when a readable PATH still fits
+    // beside them, and COMMAND takes whatever the layer pane leaves.
+    let layer_width = r.layer_table.b.x - r.layer_table.a.x;
+    let tree_width = r.tree_table.b.x - r.tree_table.a.x;
+    let layer_cols = layer_columns(layer_width);
+    let tree_cols = tree_columns(tree_width);
     let (seed_layers, seed_tree, seed_inefficient) = match seeded.as_deref() {
         Some(a) if !a.layers.is_empty() => {
             let tree = comparer.tree(&a.layers, Compare::Single, 0).clone();
             (
                 layer_rows(a, 0, ""),
-                tree_rows_for(&flatten(&tree), &tree, &HashSet::new()),
+                tree_rows_for(&flatten(&tree), &tree, &HashSet::new(), &tree_cols),
                 inefficient_rows(a),
             )
         }
@@ -419,17 +559,23 @@ pub fn build(
         tree_sink,
         "path filter (/)",
     )));
+    // Bars FIRST (the `build_scroll_window` pattern): the table wires
+    // itself to the bar's id and publishes its row range to it.
+    let layer_bar = win.insert_child(Box::new(ScrollBar::new(r.layer_bar)));
     let layer_table = win.insert_child(Box::new(make_table(
         r.layer_table,
         LAYER_TABLE_KEY,
-        layer_columns(),
+        layer_cols.clone(),
         seed_layers,
+        Some(layer_bar),
     )));
+    let tree_bar = win.insert_child(Box::new(ScrollBar::new(r.tree_bar)));
     let tree_table = win.insert_child(Box::new(make_table(
         r.tree_table,
         TREE_TABLE_KEY,
-        tree_columns(),
+        tree_cols.clone(),
         seed_tree,
+        Some(tree_bar),
     )));
     let inefficient_table = win.insert_child(Box::new(make_table(
         r.inefficient,
@@ -440,6 +586,7 @@ pub fn build(
             Column::new("PATH", 40, Align::Left),
         ],
         seed_inefficient,
+        None,
     )));
 
     let mut window = LayersWindow {
@@ -449,10 +596,14 @@ pub fn build(
         key,
         open,
         layer_table,
+        layer_bar,
         tree_table,
+        tree_bar,
         inefficient_table,
         layer_filter,
         tree_filter,
+        layer_columns: layer_cols,
+        tree_columns: tree_cols,
         summary_id,
         summary,
         layer_filter_sink,
@@ -564,12 +715,23 @@ impl LayersWindow {
             Compare::Aggregated => "Aggregated",
         };
         *self.summary.borrow_mut() = match &self.analysis {
-            Some(a) => format!(
-                " {mode} · Total {}   Efficiency {:.0}%   Potential wasted space {}",
-                crate::views::resource::format_size(a.layers.iter().map(|l| l.size as i64).sum()),
-                a.efficiency * 100.0,
-                crate::views::resource::format_size(a.wasted_bytes as i64),
-            ),
+            Some(a) => {
+                // dive's Layer Details pane names the selected layer by
+                // its diff id; the summary row carries it instead.
+                let layer = a
+                    .layers
+                    .get(self.selected)
+                    .map(|l| format!(" · L{} {}", l.index, short_id(&l.id)))
+                    .unwrap_or_default();
+                format!(
+                    " {mode}{layer} · Total {}   Efficiency {:.1}%   Potential wasted space {}",
+                    crate::views::resource::format_size(
+                        a.layers.iter().map(|l| l.size as i64).sum()
+                    ),
+                    a.efficiency * 100.0,
+                    crate::views::resource::format_size(a.wasted_bytes as i64),
+                )
+            }
             None => {
                 let progress = self
                     .core
@@ -668,9 +830,9 @@ impl LayersWindow {
     fn cycle_sort(&mut self, forward: bool, ctx: &mut Context) {
         let on_tree = self.is_focused(self.tree_table);
         let (id, n) = if on_tree {
-            (self.tree_table, tree_columns().len())
+            (self.tree_table, self.tree_columns.len())
         } else {
-            (self.layer_table, layer_columns().len())
+            (self.layer_table, self.layer_columns.len())
         };
         let Some(t) = self.table_mut(id) else { return };
         let step: i64 = if forward { 1 } else { -1 };
@@ -797,7 +959,10 @@ impl LayersWindow {
             let flat = flatten(tree);
             let visible =
                 visible_rows_in(&flat, &self.collapsed, &self.hidden, &self.last_tree_needle);
-            (flat, tree_rows_for(&visible, tree, &self.collapsed))
+            (
+                flat,
+                tree_rows_for(&visible, tree, &self.collapsed, &self.tree_columns),
+            )
         };
         self.tree_rows = flat;
         if let Some(t) = self.table_mut(self.tree_table) {
@@ -818,7 +983,9 @@ impl LayersWindow {
             (self.layer_filter, r.layer_filter),
             (self.tree_filter, r.tree_filter),
             (self.layer_table, r.layer_table),
+            (self.layer_bar, r.layer_bar),
             (self.tree_table, r.tree_table),
+            (self.tree_bar, r.tree_bar),
             (self.inefficient_table, r.inefficient),
         ] {
             if let Some(v) = self.win.child_mut(id) {

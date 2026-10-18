@@ -197,8 +197,9 @@ fn invoking_the_opener_twice_never_duplicates_the_window() {
 /// The whole whiteout chain — tombstone (`Layer::removed`) → `stack` →
 /// `compare` → the rendered row — proven on screen. `tree_rows_for` renders
 /// the change letter in the CHANGE cell (`Removed='-'`, `Unmodified=' '`),
-/// and no fixture or chrome string on the located line contains `-`, so
-/// `contains('-')` is exactly "this row's letter is `-`".
+/// and the CHANGE cell is delimited by spaces, so `contains(" - ")` is
+/// exactly "this row's letter is `-`" (the PERM column has its own
+/// dashes, but never surrounded by spaces).
 #[test]
 fn a_whiteout_renders_as_a_deletion_on_the_removed_paths_row() {
     let mut h = app_start(|core| seed(core, whiteout_analysis()));
@@ -206,7 +207,7 @@ fn a_whiteout_renders_as_a_deletion_on_the_removed_paths_row() {
     // Layer 0 against itself marks nothing: the tombstone must not show yet.
     let text = screen_text(&h.screen);
     assert!(
-        !line_with(&text, "hosts").contains('-'),
+        !line_with(&text, "hosts").contains(" - "),
         "layer 0 wrote hosts and nothing removed it yet: {text}"
     );
     // One Down: the cursor reaches layer 1 and the tree rebuilds for it.
@@ -214,11 +215,11 @@ fn a_whiteout_renders_as_a_deletion_on_the_removed_paths_row() {
     pump(&mut h.program, 2);
     let text = screen_text(&h.screen);
     assert!(
-        line_with(&text, "hosts").contains('-'),
+        line_with(&text, "hosts").contains(" - "),
         "the whiteout renders as a deletion: {text}"
     );
     assert!(
-        !line_with(&text, "passwd").contains('-'),
+        !line_with(&text, "passwd").contains(" - "),
         "the untouched survivor is not marked deleted: {text}"
     );
 }
@@ -256,8 +257,9 @@ fn ctrl_t_and_a_reshape_the_tree_through_the_real_key_path() {
         "Aggregated: /b is new since layer 0: {text}"
     );
     // `a` hides the Added rows: /b and /c leave the tree, Unmodified /a stays
-    // (every rendered tree row carries mode 644; the layer table has no mode
-    // column, so the count is the rendered tree-row count).
+    // (every rendered tree row carries the fixture's `-rw-r--r--`
+    // permission string; the layer table has none, so the count is the
+    // rendered tree-row count).
     h.screen.push_key(Key::Char('a'), KeyModifiers::default());
     pump(&mut h.program, 2);
     let text = screen_text(&h.screen);
@@ -266,7 +268,7 @@ fn ctrl_t_and_a_reshape_the_tree_through_the_real_key_path() {
         "the Added filter hid /b: {text}"
     );
     assert_eq!(
-        text.matches("644").count(),
+        text.matches("-rw-r--r--").count(),
         1,
         "only the Unmodified /a row survives the filter: {text}"
     );
@@ -275,7 +277,7 @@ fn ctrl_t_and_a_reshape_the_tree_through_the_real_key_path() {
     pump(&mut h.program, 2);
     let text = screen_text(&h.screen);
     assert_eq!(
-        text.matches("644").count(),
+        text.matches("-rw-r--r--").count(),
         3,
         "the second `a` restores the Added rows: {text}"
     );

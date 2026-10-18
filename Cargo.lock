@@ -1800,6 +1800,7 @@ dependencies = [
  "anyhow",
  "bollard",
  "chrono",
+ "flate2",
  "futures-util",
  "fuzzy-matcher",
  "serde",

@@ -4,8 +4,9 @@
 //! dive `image/docker/image_archive.go`.
 
 use crate::domain::layers::{Entry, Kind, Layer, LayerSet, Tree, hash_bytes};
+use flate2::read::MultiGzDecoder;
 use serde_json::Value;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use tar::EntryType;
 
 /// Parse a `docker save` archive into ordered layers.
@@ -114,7 +115,7 @@ fn parse_layer<R: Read + Seek>(
 ) -> anyhow::Result<(u64, Tree, Vec<String>)> {
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries_with_seek()? {
-        let entry = entry?;
+        let mut entry = entry?;
         let path = entry
             .path()?
             .to_string_lossy()
@@ -126,7 +127,19 @@ fn parse_layer<R: Read + Seek>(
         let mut size = 0u64;
         let mut tree = Tree::new();
         let mut removed = Vec::new();
-        let mut inner = tar::Archive::new(entry);
+        // The layer blob is a GZIP stream inside Docker's containerd
+        // image store (`blobs/sha256/<digest>`, magic `1f 8b`) and a
+        // plain `layer.tar` in the classic layout — sniff the first
+        // bytes and decompress when needed (dive's mime sniffing, the
+        // item design D10 deferred).
+        let mut magic = Vec::new();
+        (&mut entry).take(2).read_to_end(&mut magic)?;
+        let sniffed: Box<dyn Read> = if magic.as_slice() == [0x1f, 0x8b] {
+            Box::new(MultiGzDecoder::new(Cursor::new(magic).chain(entry)))
+        } else {
+            Box::new(Cursor::new(magic).chain(entry))
+        };
+        let mut inner = tar::Archive::new(sniffed);
         for e in inner.entries()? {
             let mut e = e?;
             size += e.header().size()?;
@@ -197,7 +210,7 @@ fn parse_layer<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use tar::{Builder, EntryType, Header};
 
     fn header(path: &str, size: u64) -> Header {
@@ -234,6 +247,29 @@ mod tests {
         history: &[(&str, bool)],
         diff_ids: &[&str],
     ) -> Vec<u8> {
+        save_tar_blobs(layers, history, diff_ids, &vec![false; layers.len()])
+    }
+
+    /// [`save_tar`] with every layer blob gzip-compressed — the format
+    /// Docker's containerd image store emits (see the sniff in
+    /// [`parse_layer`]).
+    fn save_tar_gzipped(
+        layers: &[Vec<(&str, &str)>],
+        history: &[(&str, bool)],
+        diff_ids: &[&str],
+    ) -> Vec<u8> {
+        save_tar_blobs(layers, history, diff_ids, &vec![true; layers.len()])
+    }
+
+    /// The [`save_tar`] body: `compressed[i]` gzip-encodes layer `i`'s
+    /// blob, so a caller can build a MIXED archive (a plain layer tar
+    /// next to a compressed blob) and pin the per-blob sniff.
+    fn save_tar_blobs(
+        layers: &[Vec<(&str, &str)>],
+        history: &[(&str, bool)],
+        diff_ids: &[&str],
+        compressed: &[bool],
+    ) -> Vec<u8> {
         let mut b = Builder::new(Vec::new());
         let layer_paths: Vec<String> = layers
             .iter()
@@ -242,10 +278,20 @@ mod tests {
             .collect();
         for (i, files) in layers.iter().enumerate() {
             let data = layer_tar(files);
+            let gzipped;
+            let data: &[u8] = if compressed[i] {
+                let mut enc =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data).unwrap();
+                gzipped = enc.finish().unwrap();
+                &gzipped
+            } else {
+                &data
+            };
             b.append_data(
                 &mut header(&layer_paths[i], data.len() as u64),
                 &layer_paths[i],
-                &data[..],
+                data,
             )
             .unwrap();
         }
@@ -428,5 +474,59 @@ mod tests {
         .unwrap();
         let bytes = b.into_inner().unwrap();
         assert!(parse(Cursor::new(bytes)).is_err());
+    }
+
+    /// Docker's containerd image store (the default since Docker 29) emits
+    /// an OCI-layout `docker save` whose layer blobs are GZIP-COMPRESSED —
+    /// the format every real image on a modern daemon has. Feeding those
+    /// bytes straight to `tar::Archive` is what froze the Layers window at
+    /// the "Analyzing …" line: the header cksum fails on gzip magic.
+    #[test]
+    fn gzip_compressed_layer_blobs_parse_like_plain_ones() {
+        let set = two_layer(save_tar_gzipped(
+            &[
+                vec![("etc/hosts", "127.0.0.1")],
+                vec![("etc/passwd", "root:x")],
+            ],
+            &[("COPY etc", false), ("ADD passwd", false)],
+            &["sha256:aaa", "sha256:bbb"],
+        ));
+        assert_eq!(
+            set.layers.len(),
+            2,
+            "each compressed blob still yields one layer"
+        );
+        let l0 = &set.layers[0];
+        let id = l0
+            .tree
+            .get("/etc/hosts")
+            .expect("entry inside the gzip blob");
+        let entry = l0.tree.node(id).entry.as_ref().unwrap();
+        // Sizes and hashes come from the DECOMPRESSED tar headers.
+        assert_eq!(entry.size, "127.0.0.1".len() as u64);
+        assert_eq!(entry.hash, hash_bytes(b"127.0.0.1"));
+        let l1 = &set.layers[1];
+        assert!(l1.tree.get("/etc/passwd").is_some());
+    }
+
+    /// The sniff is PER BLOB: an archive mixing a plain layer tar with a
+    /// compressed blob parses both, so the classic layout keeps working.
+    #[test]
+    fn a_mixed_archive_parses_plain_and_gzipped_layers_alike() {
+        let set = two_layer(save_tar_blobs(
+            &[vec![("etc/hosts", "v1")], vec![("etc/hosts", "v2")]],
+            &[("one", false), ("two", false)],
+            &["sha256:aaa", "sha256:bbb"],
+            &[false, true],
+        ));
+        assert_eq!(set.layers.len(), 2);
+        for (i, want) in ["v1", "v2"].iter().enumerate() {
+            let t = &set.layers[i].tree;
+            let id = t.get("/etc/hosts").expect("entry");
+            assert_eq!(
+                t.node(id).entry.as_ref().unwrap().hash,
+                hash_bytes(want.as_bytes())
+            );
+        }
     }
 }

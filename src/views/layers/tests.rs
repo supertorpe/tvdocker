@@ -214,7 +214,7 @@ fn the_inefficient_strip_lists_paths_ascending() {
 }
 
 #[test]
-fn baseline_rows_carry_size_and_mode_from_the_comparison_tree() {
+fn baseline_rows_carry_size_and_permissions_from_the_comparison_tree() {
     // layer 0 writes /etc/hosts; layer 1 touches only /etc/new.
     let mut t0 = Tree::new();
     t0.add_path(entry("/etc/hosts", "v1"));
@@ -265,7 +265,12 @@ fn baseline_rows_carry_size_and_mode_from_the_comparison_tree() {
         .expect("/etc/hosts is in the comparison tree");
     assert_eq!(&*model.cell(row, 1), " ", "Unmodified letter");
     assert_eq!(&*model.cell(row, 2), "2B", "size from the comparison tree");
-    assert_eq!(&*model.cell(row, 3), "644", "mode from the comparison tree");
+    assert_eq!(
+        &*model.cell(row, 3),
+        "-rw-r--r--",
+        "permissions as an rwx string (dive's Permission column); the pane is too \
+         narrow for a UID:GID column, so the PERM cell follows SIZE"
+    );
 }
 
 #[test]
@@ -296,16 +301,18 @@ fn child_rows_are_indented_one_step_deeper_than_their_parent() {
     t.add_path(entry("/hosts", "v1")); // top level
     t.add_path(entry("/etc/hosts", "v1")); // one level down
     t.add_path(entry("/etc/sub/x", "v1")); // two levels down
-    let rows = tree_rows_for(&flatten(&t), &t, &HashSet::new());
+    let rows = tree_rows_for(&flatten(&t), &t, &HashSet::new(), &tree_columns(60));
+    // One step = one 4-cell indent block (`    ` / `│   `), dive's
+    // `renderStringTreeBetween`; the connector follows the blocks.
     let leading = |path: &str| {
         let row = rows.iter().find(|r| r.id == path).expect(path);
         row.cells[0].len() - row.cells[0].trim_start().len()
     };
     assert_eq!(leading("/hosts"), 0, "top-level file");
     assert_eq!(leading("/etc"), 0, "top-level directory");
-    assert_eq!(leading("/etc/hosts"), 1, "one step deeper than /etc");
-    assert_eq!(leading("/etc/sub"), 1, "level-1 directory");
-    assert_eq!(leading("/etc/sub/x"), 2, "two steps deeper than /etc");
+    assert_eq!(leading("/etc/hosts"), 4, "one step deeper than /etc");
+    assert_eq!(leading("/etc/sub"), 4, "level-1 directory");
+    assert_eq!(leading("/etc/sub/x"), 8, "two steps deeper than /etc");
 }
 
 #[test]
@@ -358,7 +365,7 @@ fn ctrl_t_toggles_the_compare_mode_and_the_summary_indicator() {
     );
     // The indicator reaches the SCREEN — row 1 is always visible.
     let text = testutil::text(&testutil::render_view(80, 24, &mut win));
-    assert!(text.contains("Aggregated · Total"), "{text}");
+    assert!(text.contains("Aggregated · L0 a · Total"), "{text}");
     testutil::send_event(
         &mut win,
         Event::KeyDown(KeyEvent::new(Key::Char('t'), mods(true))),
@@ -446,13 +453,17 @@ fn collapsing_a_directory_marks_its_row_with_the_collapse_glyph() {
             .unwrap_or_else(|| panic!("{path} row present"));
         model.cell(row, 0).to_string()
     };
-    assert_eq!(path_cell(&mut win, "/etc"), "etc", "expanded: no marker");
+    assert_eq!(path_cell(&mut win, "/etc"), "└─ etc", "expanded: no marker");
     win.collapse("/etc");
     sync_and_draw(&mut win);
-    assert_eq!(path_cell(&mut win, "/etc"), "⊕ etc", "collapsed: marker");
+    assert_eq!(
+        path_cell(&mut win, "/etc"),
+        "└─ ⊕ etc",
+        "collapsed: marker behind the connector"
+    );
     win.expand("/etc");
     sync_and_draw(&mut win);
-    assert_eq!(path_cell(&mut win, "/etc"), "etc", "expanded again");
+    assert_eq!(path_cell(&mut win, "/etc"), "└─ etc", "expanded again");
 }
 
 #[test]
@@ -655,4 +666,219 @@ fn the_path_filter_bar_narrows_the_tree_as_you_type() {
     win.tree_filter_sink.borrow_mut().clear();
     sync_and_draw(&mut win);
     assert!(win.visible_rows().iter().any(|r| r.path == "/etc/hosts"));
+}
+
+/// A child's current bounds (the bars' placement assertions).
+fn child_bounds(win: &mut LayersWindow, id: tv::ViewId) -> Rect {
+    win.win.child_mut(id).unwrap().state().get_bounds()
+}
+
+/// `redraw` with a Context that KEEPS its deferred queue, so a test can
+/// read the scroll-bar parameter requests the tables publish to their bars.
+fn redraw_capturing_deferred(win: &mut LayersWindow) -> Vec<tv::Deferred> {
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        win.redraw(&mut ctx);
+    }
+    deferred
+}
+
+/// The two tables give their right-most client column to a vertical scroll
+/// bar (the `widgets::scroll_rects` body+bar convention): the bar is one
+/// column wide and starts exactly where its table's body ends.
+#[test]
+fn layer_and_tree_tables_each_reserve_a_scroll_bar_column() {
+    let r = layers_rects(tv::Point::new(80, 24));
+    assert_eq!(r.layer_table, Rect::new(1, 3, 30, 20));
+    assert_eq!(r.layer_bar, Rect::new(30, 3, 31, 20));
+    assert_eq!(r.tree_table, Rect::new(33, 3, 78, 20));
+    assert_eq!(r.tree_bar, Rect::new(78, 3, 79, 20));
+}
+
+/// Degenerate widths must never produce an inverted bar rect.
+#[test]
+fn the_scroll_bar_rects_stay_ordered_at_degenerate_sizes() {
+    for w in 1..8 {
+        let r = layers_rects(tv::Point::new(w, 4));
+        for bar in [r.layer_bar, r.tree_bar] {
+            assert!(bar.a.x <= bar.b.x && bar.a.y <= bar.b.y, "w={w}: {bar:?}");
+        }
+    }
+}
+
+/// The window inserts one `ScrollBar` per table at that table's right edge,
+/// and the bars stay out of the Tab order.
+#[test]
+fn both_tables_get_a_vertical_scroll_bar_that_tab_skips() {
+    let mut win = window_with(analysis());
+    let (layer_bar, tree_bar) = (win.layer_bar, win.tree_bar);
+    let r = layers_rects(win.win.state().size);
+    assert_eq!(child_bounds(&mut win, layer_bar), r.layer_bar);
+    assert_eq!(child_bounds(&mut win, tree_bar), r.tree_bar);
+    for id in [layer_bar, tree_bar] {
+        assert!(
+            !win.win.child_mut(id).unwrap().state().options.selectable,
+            "the bar participates in neither Tab order nor focus"
+        );
+    }
+}
+
+/// The id plumbing, end to end: on redraw each table publishes its row
+/// range to ITS bar (the pump applies these deferred params to the
+/// `ScrollBar` views), so a scrollbar click can drive that table.
+#[test]
+fn each_table_publishes_its_row_range_to_its_bar() {
+    let mut win = window_with(three_layer_analysis());
+    win.selected = 1;
+    sync_and_draw(&mut win);
+    let deferred = redraw_capturing_deferred(&mut win);
+    let bar_max = |id: tv::ViewId| {
+        deferred.iter().find_map(|d| match d {
+            tv::Deferred::ScrollBarSetParams { id: got, max, .. } if *got == id => *max,
+            _ => None,
+        })
+    };
+    assert_eq!(
+        bar_max(win.layer_bar),
+        Some(2),
+        "3 layers ⇒ the layer bar's max is len-1"
+    );
+    let tree_rows = win.tree_rows.len() as i32;
+    assert_eq!(bar_max(win.tree_bar), Some(tree_rows - 1));
+}
+
+/// Zoom / resize re-derives the bars' rects with the tables'.
+#[test]
+fn the_bars_follow_the_tables_through_a_resize() {
+    let mut win = window_with(analysis());
+    win.change_bounds(Rect::new(0, 0, 60, 20));
+    let (layer_bar, tree_bar) = (win.layer_bar, win.tree_bar);
+    let r = layers_rects(win.win.state().size);
+    assert_eq!(child_bounds(&mut win, layer_bar), r.layer_bar);
+    assert_eq!(child_bounds(&mut win, tree_bar), r.tree_bar);
+}
+
+/// The bars are VISIBLE: each table's right-most column renders the
+/// scroll-bar glyphs (up arrow on the header row, thumb in the body,
+/// down arrow at the foot).
+#[test]
+fn the_scroll_bars_render_in_the_tables_right_most_columns() {
+    let mut win = window_with(three_layer_analysis());
+    let screen = testutil::render_view(80, 24, &mut win);
+    let text = testutil::text(&screen);
+    let lines: Vec<&str> = text.lines().collect();
+    let row_containing = |needle: &str| {
+        lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("a row contains {needle:?}"))
+    };
+    let cell = |line: &str, x: usize| line.chars().nth(x);
+    // The bar column of each table (window coords == screen coords here).
+    let header = row_containing("CMP");
+    let body = row_containing("FROM");
+    let foot = row_containing("▼");
+    for (x, name) in [(30, "layer"), (78, "tree")] {
+        assert_eq!(cell(header, x), Some('▲'), "{name} bar's up arrow");
+        assert_eq!(cell(body, x), Some('▓'), "{name} bar's thumb");
+        assert_eq!(cell(foot, x), Some('▼'), "{name} bar's down arrow");
+    }
+}
+
+/// The PATH column renders the tree the way dive does: `├─`/`└─`
+/// connectors, `│` continuations for ancestors with more siblings below,
+/// a `→ target` suffix for symlinks — plus the rwx permission string and
+/// the uid:gid of the entry.
+#[test]
+fn tree_rows_render_connectors_symlink_targets_permissions_and_ids() {
+    let mut t = Tree::new();
+    t.add_path(entry("/bin/busybox", "v1"));
+    let mut link = entry("/bin/sh", "");
+    link.kind = Kind::Symlink;
+    link.link = Some("/bin/busybox".into());
+    t.add_path(link);
+    t.add_path(entry("/etc/hosts", "v1"));
+    let rows = flatten(&t);
+    let rendered = tree_rows_for(&rows, &t, &HashSet::new(), &tree_columns(60));
+    let cell = |path: &str, col: usize| {
+        rendered
+            .iter()
+            .find(|r| r.id == path)
+            .unwrap_or_else(|| panic!("{path} is rendered"))
+            .cells[col]
+            .clone()
+    };
+    assert_eq!(cell("/bin", 0), "\u{251c}\u{2500} bin");
+    assert_eq!(
+        cell("/bin/busybox", 0),
+        "\u{2502}   \u{251c}\u{2500} busybox"
+    );
+    assert_eq!(
+        cell("/bin/sh", 0),
+        "\u{2502}   \u{2514}\u{2500} sh \u{2192} /bin/busybox"
+    );
+    assert_eq!(cell("/etc", 0), "\u{2514}\u{2500} etc");
+    assert_eq!(cell("/etc/hosts", 0), "    \u{2514}\u{2500} hosts");
+    assert_eq!(cell("/bin", 2), "2B", "the dir rolls its subtree up");
+    assert_eq!(cell("/etc", 2), "2B", "…wherever its files sit");
+    assert_eq!(cell("/bin/busybox", 2), "2B", "a file keeps its own size");
+    assert_eq!(cell("/bin/busybox", 4), "-rw-r--r--", "the mode as rwx");
+    assert_eq!(cell("/bin/busybox", 3), "0:0", "the uid:gid");
+    assert_eq!(cell("/bin", 4), "", "a synthesised dir carries no mode");
+}
+
+/// The attribute columns only appear when the pane is wide enough for
+/// them (dive drops the attributes in a constrained layout): PATH keeps
+/// the leftover, and each attribute column claims a fixed slice of it.
+#[test]
+fn the_tree_columns_adapt_to_the_pane_width() {
+    let labels = |width: i32| -> Vec<String> {
+        tree_columns(width)
+            .iter()
+            .map(|c| c.label.clone())
+            .collect()
+    };
+    assert_eq!(
+        labels(60),
+        vec!["PATH", "CHANGE", "SIZE", "UID:GID", "PERM"]
+    );
+    assert_eq!(labels(42), vec!["PATH", "CHANGE", "SIZE", "PERM"]);
+    assert_eq!(labels(30), vec!["PATH", "CHANGE", "SIZE"]);
+    // The PATH column keeps whatever the fixed columns leave over.
+    assert!(tree_columns(60)[0].width >= 16, "PATH stays readable");
+}
+
+/// The layer pane is the narrow one now, so its COMMAND column takes the
+/// leftover width instead of a fixed 28 cells.
+#[test]
+fn the_layer_command_column_takes_the_leftover_width() {
+    let cols = layer_columns(30);
+    assert_eq!(
+        cols.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+        vec!["CMP", "SIZE", "COMMAND"]
+    );
+    assert_eq!(cols[2].width, 19, "30 - CMP(3) - SIZE(8)");
+}
+
+/// The summary line names the selected layer (its diff id, the way dive's
+/// Layer Details pane does) and keeps one decimal of the efficiency.
+#[test]
+fn the_summary_line_names_the_selected_layer_and_keeps_a_decimal() {
+    let mut a = analysis();
+    a.efficiency = 0.9959688;
+    let mut win = window_with(a);
+    win.selected = 1;
+    sync_and_draw(&mut win);
+    let summary = win.summary.borrow().clone();
+    assert!(
+        summary.contains("L1 sha256:bbb"),
+        "the layer id: {summary:?}"
+    );
+    assert!(
+        summary.contains("Efficiency 99.6%"),
+        "no round-up to 100: {summary:?}"
+    );
 }
