@@ -419,6 +419,98 @@ fn the_a_key_hides_added_rows() {
     assert!(win.visible_rows().iter().any(|r| r.path == "/etc/new"));
 }
 
+/// Finding 1's gate observable: a `LayerProgress` tick must not touch a
+/// CACHED analysis (the `Rc` pointer must survive — a re-read would hand
+/// out a fresh allocation) and must not schedule a rebuild (`dirty` stays
+/// clear, so `handle_event` skips `redraw`). Key the sync gate on
+/// `layers_rev` again (or drop it) and the deep re-clone replaces the
+/// `Rc` → the `Rc::ptr_eq` below fails; drop the dirty gate and the
+/// `assert!(!win.dirty)` fails on the very next tick.
+#[test]
+fn a_progress_tick_neither_reclones_nor_schedules_a_rebuild_for_a_cached_window() {
+    let mut win = window_with(three_layer_analysis());
+    assert!(!win.dirty, "the first draw consumed the build-time dirt");
+    let cached = win.analysis.clone().expect("the analysis is cached");
+    // One tick of the `docker save` progress stream, bridged between two
+    // events.
+    win.core
+        .borrow_mut()
+        .apply(crate::core::AppMsg::LayerProgress {
+            key: "sha256:aaa".into(),
+            bytes: 4096,
+        });
+    win.sync_from_core(); // what every event runs first
+    assert!(
+        win.analysis
+            .as_ref()
+            .is_some_and(|a| Rc::ptr_eq(a, &cached)),
+        "a progress tick must not deep-clone the analysis"
+    );
+    assert!(!win.dirty, "…and must not schedule a rebuild");
+    {
+        let core = win.core.borrow();
+        assert_eq!(core.layers_rev, 1, "the progress rev moved");
+        assert_eq!(
+            core.layers_data_rev, 0,
+            "…the data rev did not (the window's gate)"
+        );
+    }
+    // A finished analysis IS a data change: fresh `Rc`, rebuild scheduled.
+    win.core
+        .borrow_mut()
+        .apply(crate::core::AppMsg::ImageLayers {
+            key: "sha256:aaa".into(),
+            analysis: Box::new(three_layer_analysis()),
+        });
+    win.sync_from_core();
+    assert!(win.dirty, "the data rev moved → the models rebuild");
+    assert!(
+        !win.analysis
+            .as_ref()
+            .is_some_and(|a| Rc::ptr_eq(a, &cached)),
+        "a finished analysis is a fresh wrap"
+    );
+}
+
+/// The other half of the dirty spec: while the slot is `None`, a NEW byte
+/// count marks the window dirty so the "Analyzing …" line updates (the
+/// line itself is written by the gated `redraw`).
+#[test]
+fn a_progress_tick_marks_a_loading_window_dirty_so_the_analyzing_line_updates() {
+    let core = crate::core::AppCore::new();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut win = build(
+        Rc::new(RefCell::new(core)),
+        Rect::new(0, 0, 80, 24),
+        "sha256:aaa".into(),
+        "img".into(),
+        Rc::new(RefCell::new(false)),
+        tx,
+    );
+    sync_and_draw(&mut win);
+    assert!(!win.dirty, "the first draw consumed the build-time dirt");
+    win.core
+        .borrow_mut()
+        .apply(crate::core::AppMsg::LayerProgress {
+            key: "sha256:aaa".into(),
+            bytes: 4096,
+        });
+    win.sync_from_core();
+    assert!(
+        win.dirty,
+        "a loading window re-renders the Analyzing line per tick"
+    );
+    crate::testutil::with_ctx(|ctx| win.redraw(ctx));
+    let summary = win.summary.borrow();
+    assert!(
+        summary.contains(&format!(
+            "Analyzing {}",
+            crate::views::resource::format_size(4096)
+        )),
+        "the new byte count reached the line: {summary}"
+    );
+}
+
 /// The primary interaction: the layer table's cursor OWNS `selected`, so
 /// arrowing to another layer rebuilds the comparison tree for it in the
 /// SAME event. (Task 9's tests assigned `selected` directly, which is

@@ -374,8 +374,13 @@ pub struct AppCore {
     pub image_layers: HashMap<String, Option<crate::domain::layers::Analysis>>,
     /// `docker save` byte progress by image id (absent = no run).
     pub layers_progress: HashMap<String, u64>,
-    /// Bumped per layer message — the Layers window diffs on it.
+    /// Bumped per layer message (progress AND results) — the noisy
+    /// revision, kept for progress consumers.
     pub layers_rev: u64,
+    /// Bumped ONLY by `AppMsg::ImageLayers` — the data revision the
+    /// Layers window gates its (expensive) analysis re-read on, so a
+    /// per-chunk progress tick never deep-clones the per-layer trees.
+    pub layers_data_rev: u64,
 }
 
 impl AppCore {
@@ -404,6 +409,7 @@ impl AppCore {
             image_layers: HashMap::new(),
             layers_progress: HashMap::new(),
             layers_rev: 0,
+            layers_data_rev: 0,
         }
     }
 
@@ -559,6 +565,7 @@ impl AppCore {
                 self.image_layers.insert(key.clone(), Some(*analysis));
                 self.layers_progress.remove(&key);
                 self.layers_rev += 1;
+                self.layers_data_rev += 1; // the analysis itself changed
                 self.revision += 1;
             }
             AppMsg::LayerProgress { key, bytes } => {
@@ -738,6 +745,33 @@ mod tests {
         );
         assert_eq!(core.layers_rev, 2);
         assert!(core.revision > rev, "the REFRESH broadcast fires");
+    }
+
+    /// Finding 1's revision split: `layers_rev` is the noisy progress rev,
+    /// `layers_data_rev` moves ONLY when a finished analysis lands — the
+    /// Layers window gates its (expensive) re-read on the latter, so a
+    /// progress tick can never trigger a deep clone of the per-layer trees.
+    #[test]
+    fn progress_bumps_only_the_progress_rev_while_image_layers_bumps_both() {
+        use crate::domain::layers::Analysis;
+        let mut core = AppCore::new();
+        assert_eq!(core.layers_rev, 0);
+        assert_eq!(core.layers_data_rev, 0);
+        core.apply(AppMsg::LayerProgress {
+            key: "sha256:aaa".into(),
+            bytes: 4096,
+        });
+        assert_eq!(core.layers_rev, 1, "progress bumps the progress rev");
+        assert_eq!(
+            core.layers_data_rev, 0,
+            "…but never the data rev (no window rebuild)"
+        );
+        core.apply(AppMsg::ImageLayers {
+            key: "sha256:aaa".into(),
+            analysis: Box::new(Analysis::default()),
+        });
+        assert_eq!(core.layers_rev, 2);
+        assert_eq!(core.layers_data_rev, 1, "a finished analysis bumps both");
     }
 
     #[test]

@@ -114,14 +114,31 @@ pub struct LayersWindow {
     comparer: Comparer,
     /// The flattened rows of the change tree, in DFS order.
     tree_rows: Vec<TreeRow>,
-    /// The cached analysis (`None` = still loading). Like the Explorer's
+    /// The cached analysis (`None` = still loading), wrapped ONCE per data
+    /// change in `Rc` — an event holds a cheap pointer, never a deep copy
+    /// of the per-layer trees (finding 1). Like the Explorer's
     /// `Panel::entries`, the window holds the data and only pushes it into
     /// the tables where it has a `Context` (the `redraw_texts` pattern).
-    analysis: Option<Analysis>,
-    /// The last `layers_rev` this window mapped (`None` until the first
-    /// sync, so a freshly built window always maps whatever the core has —
-    /// even a directly-seeded test core that never bumped the counter).
-    last_rev: Option<u64>,
+    analysis: Option<Rc<Analysis>>,
+    /// The last `layers_data_rev` this window mapped (`None` until the
+    /// first sync, so a freshly built window always maps whatever the core
+    /// has — even a directly-seeded test core that never bumped the
+    /// counter). Progress ticks bump `layers_rev`, NOT this — so they
+    /// never trigger a re-read.
+    last_data_rev: Option<u64>,
+    /// `redraw` runs only while this is set (finding 1's gate): set on a
+    /// data-rev change, a `selected` change, a state-mutating window key,
+    /// a size reconcile and — while the slot is empty — a new progress
+    /// byte count; cleared by `redraw` itself. Filter needles are compared
+    /// separately in `handle_event` (the `FilterBar` children write their
+    /// sinks inside `win.handle_event`, which is why the gate sits last).
+    dirty: bool,
+    /// The last byte count seen for the empty slot's "Analyzing …" line.
+    last_progress: u64,
+    /// The layer/PATH needles as of the last `redraw` — the gate compares
+    /// the sinks against these to detect a typed filter change.
+    last_layer_needle: String,
+    last_tree_needle: String,
 }
 
 fn make_table(rect: Rect, key: &str, columns: Vec<Column>, rows: Vec<TableRow>) -> Table {
@@ -251,6 +268,42 @@ fn letter_for(diff: DiffType) -> char {
     }
 }
 
+/// No ancestor directory of `path` (root excluded) is collapsed — a
+/// nearest-to-root walk over the path prefixes, so collapsing `/usr/lib`
+/// hides `/usr/lib/jvm/bin` too. (Free of `self` so `redraw` can run the
+/// filter pass while `self.comparer` is mutably borrowed.)
+fn expanded_by(collapsed: &HashSet<String>, path: &str) -> bool {
+    let mut ancestor = path;
+    while let Some(i) = ancestor.rfind('/') {
+        ancestor = &ancestor[..i];
+        if ancestor.is_empty() {
+            return true; // the root is never collapsed
+        }
+        if collapsed.contains(ancestor) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The collapse-state / change-type / path-needle pass over the flattened
+/// rows — the free core of [`LayersWindow::visible_rows`] (free of `self`
+/// so `redraw` can call it while `self.comparer` is mutably borrowed).
+fn visible_rows_in(
+    rows: &[TreeRow],
+    collapsed: &HashSet<String>,
+    hidden: &[bool; 4],
+    needle: &str,
+) -> Vec<TreeRow> {
+    let needle = needle.to_lowercase();
+    rows.iter()
+        .filter(|r| !hidden[diff_index(r.diff)])
+        .filter(|r| expanded_by(collapsed, &r.path))
+        .filter(|r| needle.is_empty() || r.path.to_lowercase().contains(&needle))
+        .cloned()
+        .collect()
+}
+
 /// `TreeRow`s as `TableRow`s: an indent-by-depth name, the change letter,
 /// the size and the mode, tinted by [`role_for`]. Size and mode come from
 /// `tree` — the comparison tree the rows were flattened from, not the
@@ -284,7 +337,9 @@ pub fn tree_rows_for(rows: &[TreeRow], tree: &Tree) -> Vec<TableRow> {
         .collect()
 }
 
-/// Build one window. The initial analysis request is sent here — build
+/// Build one window. The initial analysis request is sent here ONLY when
+/// the core has no finished analysis for the key (spec D9: image ids are
+/// content-addressed, so a cached analysis can never be stale) — build
 /// cannot fail, and an empty table simply renders no rows until the core
 /// caches the finished analysis.
 pub fn build(
@@ -311,17 +366,23 @@ pub fn build(
     // Seed all three tables with what the first `redraw` would produce
     // (the ResourceWindow's build-seeded `initial_model`): the redraw now
     // runs AFTER the child routing, so without this a fresh window's
-    // first event would land on empty tables.
-    let seeded = core
-        .borrow()
-        .image_layers
-        .get(&key)
-        .cloned()
-        .flatten()
-        .filter(|a| !a.layers.is_empty());
+    // first event would land on empty tables. This is the ONE deep clone
+    // per open — the `Rc` wrap keeps every later event cheap.
+    let (seeded, data_rev, needs_request) = {
+        let core = core.borrow();
+        let slot = core.image_layers.get(&key);
+        (
+            slot.cloned().flatten().map(Rc::new),
+            core.layers_data_rev,
+            // Finding 1.4: a cached analysis is never re-requested — only
+            // an absent (or still loading) slot starts the `docker save`
+            // stream (and its per-chunk progress) again.
+            slot.is_none_or(|analysis| analysis.is_none()),
+        )
+    };
     let mut comparer = Comparer::new();
-    let (seed_layers, seed_tree, seed_inefficient) = match &seeded {
-        Some(a) => {
+    let (seed_layers, seed_tree, seed_inefficient) = match seeded.as_deref() {
+        Some(a) if !a.layers.is_empty() => {
             let tree = comparer.tree(&a.layers, Compare::Single, 0).clone();
             (
                 layer_rows(a, 0, ""),
@@ -329,7 +390,7 @@ pub fn build(
                 inefficient_rows(a),
             )
         }
-        None => (Vec::new(), Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
     let summary_id = win.insert_child(Box::new(SharedLine::new(
@@ -391,17 +452,27 @@ pub fn build(
         hidden: [false; 4],
         comparer,
         tree_rows: Vec::new(),
-        analysis: None,
-        last_rev: None,
+        analysis: seeded,
+        last_data_rev: Some(data_rev),
+        dirty: true, // a freshly built window renders on its first event
+        last_progress: 0,
+        last_layer_needle: String::new(),
+        last_tree_needle: String::new(),
     };
+    // The data was mapped by the seed read above; the sync only picks up
+    // the progress bookkeeping. `write_summary` so a fresh window renders
+    // the line even before its first event.
     window.sync_from_core();
-    // The initial analysis request (the Explorer's build-time request
-    // precedent): the opener routes the command only, so the window asks
-    // the worker itself — keyed AND image-typed by the image id.
-    let _ = window.task_tx.send(TaskReq::AnalyzeImageLayers {
-        key: window.key.clone(),
-        image: window.key.clone(),
-    });
+    window.write_summary();
+    if needs_request {
+        // The initial analysis request (the Explorer's build-time request
+        // precedent): the opener routes the command only, so the window asks
+        // the worker itself — keyed AND image-typed by the image id.
+        let _ = window.task_tx.send(TaskReq::AnalyzeImageLayers {
+            key: window.key.clone(),
+            image: window.key.clone(),
+        });
+    }
     window
 }
 
@@ -423,60 +494,97 @@ impl LayersWindow {
     }
 
     /// Cache a fresh analysis (or the loading state) — the Explorer's
-    /// stale-response discipline, keyed on `layers_rev`. No `Context` here:
-    /// [`redraw`] pushes the cached data into the tables.
+    /// stale-response discipline, keyed on `layers_data_rev` (finding 1.2):
+    /// a per-chunk `LayerProgress` tick bumps only `layers_rev`, so it
+    /// costs this window one integer read, never a deep copy of the
+    /// per-layer trees. No `Context` here: [`redraw`] pushes the cached
+    /// data into the tables (and writes the summary line).
     fn sync_from_core(&mut self) {
         let core = self.core.borrow();
-        // Unchanged since the last map: nothing to do. `last_rev` is `None`
-        // until the FIRST sync, so a freshly built window always maps —
-        // even when a test seeds the slot without bumping `layers_rev`.
-        if self.last_rev == Some(core.layers_rev) {
+        // Unchanged since the last map: nothing to re-read. `last_data_rev`
+        // is `None` until the FIRST sync, so a freshly built window always
+        // maps — even when a test seeds the slot without bumping the
+        // counter (`build` seeds it for windows it builds itself).
+        if self.last_data_rev != Some(core.layers_data_rev) {
+            self.last_data_rev = Some(core.layers_data_rev);
+            // Deep-clone ONLY when the data actually changed: one `Rc`
+            // wrap per data change, then every event holds a pointer.
+            let analysis = core
+                .image_layers
+                .get(&self.key)
+                .cloned()
+                .flatten()
+                .map(Rc::new);
+            let progress = core.layers_progress.get(&self.key).copied().unwrap_or(0);
+            drop(core);
+            if let Some(a) = &analysis {
+                self.selected = self.selected.min(a.layers.len().saturating_sub(1));
+            }
+            self.analysis = analysis;
+            self.last_progress = progress;
+            self.dirty = true; // the models (and the summary) must rebuild
             return;
         }
-        self.last_rev = Some(core.layers_rev);
-        // Clone only when the revision actually moved: the analysis owns
-        // full per-layer file trees.
-        let analysis = core.image_layers.get(&self.key).cloned().flatten();
-        let progress = core.layers_progress.get(&self.key).copied().unwrap_or(0);
-        drop(core);
-        match analysis {
-            Some(a) => {
-                self.selected = self.selected.min(a.layers.len().saturating_sub(1));
-                *self.summary.borrow_mut() = format!(
-                    " Total {}   Efficiency {:.0}%   Potential wasted space {}",
-                    crate::views::resource::format_size(
-                        a.layers.iter().map(|l| l.size as i64).sum()
-                    ),
-                    a.efficiency * 100.0,
-                    crate::views::resource::format_size(a.wasted_bytes as i64),
-                );
-                self.analysis = Some(a);
+        // Data unchanged: while the slot is empty, a NEW byte count still
+        // marks the window dirty so the "Analyzing …" line updates.
+        if self.analysis.is_none() {
+            let progress = core.layers_progress.get(&self.key).copied().unwrap_or(0);
+            drop(core);
+            if progress != self.last_progress {
+                self.last_progress = progress;
+                self.dirty = true;
             }
+        }
+    }
+
+    /// The summary line (`SharedLine`, row 1): the totals, or the loading
+    /// line with the current byte count. Written from `build` and every
+    /// `redraw` — so it follows the data and the progress ticks through
+    /// the same dirty gate the tables use.
+    fn write_summary(&self) {
+        *self.summary.borrow_mut() = match &self.analysis {
+            Some(a) => format!(
+                " Total {}   Efficiency {:.0}%   Potential wasted space {}",
+                crate::views::resource::format_size(a.layers.iter().map(|l| l.size as i64).sum()),
+                a.efficiency * 100.0,
+                crate::views::resource::format_size(a.wasted_bytes as i64),
+            ),
             None => {
-                *self.summary.borrow_mut() = format!(
+                let progress = self
+                    .core
+                    .borrow()
+                    .layers_progress
+                    .get(&self.key)
+                    .copied()
+                    .unwrap_or(0);
+                format!(
                     " Analyzing {} ({})…",
                     crate::views::resource::format_size(progress as i64),
                     self.key
-                );
-                self.analysis = None;
+                )
             }
-        }
+        };
     }
 
     /// Show `path`'s subtree again (Space / `+`).
     pub fn expand(&mut self, path: &str) {
-        self.collapsed.remove(path);
+        if self.collapsed.remove(path) {
+            self.dirty = true; // the subtree returns to the table
+        }
     }
 
     /// Hide `path`'s subtree (`-`).
     pub fn collapse(&mut self, path: &str) {
-        self.collapsed.insert(path.to_string());
+        if self.collapsed.insert(path.to_string()) {
+            self.dirty = true;
+        }
     }
 
     /// Flip change type `diff` between shown and hidden (A/R/M/U).
     pub fn toggle_diff(&mut self, diff: DiffType) {
         let i = diff_index(diff);
         self.hidden[i] = !self.hidden[i];
+        self.dirty = true;
     }
 
     /// Switch between the two dive compare modes (Ctrl+T): the selected
@@ -486,39 +594,19 @@ impl LayersWindow {
             Compare::Single => Compare::Aggregated,
             Compare::Aggregated => Compare::Single,
         };
+        self.dirty = true; // a different comparer key → a different tree
     }
 
     /// The rows the collapse state, the change-type filters and the path
     /// filter allow through, in DFS order — ONE pass over the flattened
     /// rows, the single source [`redraw`] feeds to [`tree_rows_for`]. A
     /// directory hides its whole subtree when it is collapsed; the root
-    /// (`/`) is never collapsed.
+    /// (`/`) is never collapsed. (The body is the free
+    /// [`visible_rows_in`] so `redraw` can run it while `self.comparer`
+    /// is mutably borrowed.)
     pub fn visible_rows(&self) -> Vec<TreeRow> {
-        let needle = self.tree_filter_sink.borrow().to_lowercase();
-        self.tree_rows
-            .iter()
-            .filter(|r| !self.hidden[diff_index(r.diff)])
-            .filter(|r| self.expanded_by(&r.path))
-            .filter(|r| needle.is_empty() || r.path.to_lowercase().contains(&needle))
-            .cloned()
-            .collect()
-    }
-
-    /// No ancestor directory of `path` (root excluded) is collapsed — a
-    /// nearest-to-root walk over the path prefixes, so collapsing
-    /// `/usr/lib` hides `/usr/lib/jvm/bin` too.
-    fn expanded_by(&self, path: &str) -> bool {
-        let mut ancestor = path;
-        while let Some(i) = ancestor.rfind('/') {
-            ancestor = &ancestor[..i];
-            if ancestor.is_empty() {
-                return true; // the root is never collapsed
-            }
-            if self.collapsed.contains(ancestor) {
-                return false;
-            }
-        }
-        true
+        let needle = self.tree_filter_sink.borrow();
+        visible_rows_in(&self.tree_rows, &self.collapsed, &self.hidden, &needle)
     }
 
     /// The tree path of the right table's focused row (`None` while
@@ -570,6 +658,7 @@ impl LayersWindow {
             .map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
         let col = ((start + step).rem_euclid(n as i64)) as usize;
         t.sort_by(col, if forward { SortDir::Asc } else { SortDir::Desc }, ctx);
+        self.dirty = true; // the row order changed (the `t` borrow ends here)
     }
 
     /// `/` (spec §7): send the filter bar of the pane that owns the focus.
@@ -619,7 +708,10 @@ impl LayersWindow {
                     }
                 }
                 Key::Char('*') => {
-                    self.collapsed.clear();
+                    if !self.collapsed.is_empty() {
+                        self.collapsed.clear();
+                        self.dirty = true;
+                    }
                     ev.clear();
                 }
                 Key::Char('a') => {
@@ -644,9 +736,16 @@ impl LayersWindow {
         }
     }
 
-    /// Push the cached analysis into the three tables (needs a `Context`, so
-    /// it runs from `handle_event` — the `redraw_texts` pattern).
+    /// Push the cached analysis into the three tables (needs a `Context`,
+    /// so it runs from `handle_event` — the `redraw_texts` pattern — and
+    /// only when the dirty gate says something it reads changed, finding
+    /// 1.3). Also records the rendered needles and rewrites the summary
+    /// line, so a clean window is by definition up to date.
     fn redraw(&mut self, ctx: &mut Context) {
+        self.dirty = false;
+        self.last_layer_needle = self.layer_filter_sink.borrow().clone();
+        self.last_tree_needle = self.tree_filter_sink.borrow().clone();
+        self.write_summary();
         // Nothing renderable — still loading, a re-analysis wiped the slot,
         // or a degenerate zero-layer analysis (`Comparer::tree` slices
         // `layers[0..=selected]`). Clear the tables — the explorer's
@@ -661,24 +760,27 @@ impl LayersWindow {
             }
             return;
         };
-        let rows = layer_rows(&a, self.selected, &self.layer_filter_sink.borrow());
+        let rows = layer_rows(&a, self.selected, &self.last_layer_needle);
         if let Some(t) = self.table_mut(self.layer_table) {
             t.set_model(Box::new(RowModel::new(rows)), ctx);
         }
-        // `Comparer::tree` borrows self mutably, so flatten into a local
-        // before touching the table. The collapse state, the change-type
-        // filters and the path needle re-shape the flattened rows into
-        // the visible rows — ONE O(n) pass in `visible_rows`, fed
-        // straight to `tree_rows_for` (no per-row membership lookup).
-        let tree = self
-            .comparer
-            .tree(&a.layers, self.mode, self.selected)
-            .clone();
-        self.tree_rows = flatten(&tree);
-        let visible = self.visible_rows();
+        // `Comparer::tree` borrows `self.comparer` mutably, so the whole
+        // rebuild runs in this block and only owned rows leave it: the
+        // collapse state, the change-type filters and the path needle
+        // re-shape the flattened rows into the visible rows — ONE O(n)
+        // pass in `visible_rows_in`, fed straight to `tree_rows_for` (no
+        // per-row membership lookup, and NO comparison-tree clone to
+        // break the borrow — the field-disjoint borrows are enough).
+        let (flat, tree_rows) = {
+            let tree = self.comparer.tree(&a.layers, self.mode, self.selected);
+            let flat = flatten(tree);
+            let visible =
+                visible_rows_in(&flat, &self.collapsed, &self.hidden, &self.last_tree_needle);
+            (flat, tree_rows_for(&visible, tree))
+        };
+        self.tree_rows = flat;
         if let Some(t) = self.table_mut(self.tree_table) {
-            let rows = tree_rows_for(&visible, &tree);
-            t.set_model(Box::new(RowModel::new(rows)), ctx);
+            t.set_model(Box::new(RowModel::new(tree_rows)), ctx);
         }
         if let Some(t) = self.table_mut(self.inefficient_table) {
             t.set_model(Box::new(RowModel::new(inefficient_rows(&a))), ctx);
@@ -730,11 +832,13 @@ impl View for LayersWindow {
 
     /// Every event: run the window's own keys, map a fresh analysis,
     /// delegate to the children, hand the layer cursor to `selected`, then
-    /// push the cached rows into the tables (the Explorer's
-    /// `sync_from_core` + `redraw_texts`, in the ResourceWindow's
-    /// delegate-then-refilter ORDER): the redraw runs LAST, so a keystroke
-    /// a focused `FilterBar` turns into sink text — and a cursor move the
-    /// delegation made — are reflected in the model of the SAME event.
+    /// — only when the dirty gate says something `redraw` reads changed
+    /// (finding 1.3) — push the cached rows into the tables (the
+    /// Explorer's `sync_from_core` + `redraw_texts`, in the
+    /// ResourceWindow's delegate-then-refilter ORDER): the redraw runs
+    /// LAST, so a keystroke a focused `FilterBar` turns into sink text —
+    /// and a cursor move the delegation made — are reflected in the model
+    /// of the SAME event.
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         let before = self.win.state().size;
         self.window_keys(ev, ctx);
@@ -751,6 +855,7 @@ impl View for LayersWindow {
             && i < self.analysis.as_ref().map_or(0, |a| a.layers.len())
         {
             self.selected = i;
+            self.dirty = true;
         }
         // Zoom / fullscreen re-bound the inner window's group directly,
         // bypassing this window's `change_bounds` (the Explorer's
@@ -758,8 +863,17 @@ impl View for LayersWindow {
         if self.win.state().size != before {
             self.reapply_layout();
             self.win.on_bounds_changed(ctx);
+            self.dirty = true; // the layout changed: re-push the models
         }
-        self.redraw(ctx);
+        // The gate (last, after everything that could mutate state): the
+        // `FilterBar` children wrote their sinks inside `win.handle_event`
+        // above, so the needles are compared HERE against the last
+        // RENDERED ones. `redraw` itself clears the flag and records them.
+        let needle_dirty = *self.layer_filter_sink.borrow() != self.last_layer_needle
+            || *self.tree_filter_sink.borrow() != self.last_tree_needle;
+        if self.dirty || needle_dirty {
+            self.redraw(ctx);
+        }
     }
 }
 

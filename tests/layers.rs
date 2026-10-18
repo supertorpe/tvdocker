@@ -88,10 +88,9 @@ fn three_layer_analysis() -> Analysis {
     ])
 }
 
-/// The image row plus the seeded analysis, so the opener finds a cursor row
-/// and the window finds renderable data (the harness seeds BEFORE
-/// `app::build`, so this precedes any window existing).
-fn seed(core: &Rc<RefCell<AppCore>>, a: Analysis) {
+/// The image row only — no cached analysis, so the window must ask the
+/// worker for one (finding 1.4's UNCACHED path).
+fn seed_image(core: &Rc<RefCell<AppCore>>) {
     core.borrow_mut()
         .images
         .push(tvdocker::domain::docker::images::ImageEntry {
@@ -100,6 +99,13 @@ fn seed(core: &Rc<RefCell<AppCore>>, a: Analysis) {
             tag: "3.19".into(),
             size: 3_800_000,
         });
+}
+
+/// The image row plus the seeded analysis, so the opener finds a cursor row
+/// and the window finds renderable data (the harness seeds BEFORE
+/// `app::build`, so this precedes any window existing).
+fn seed(core: &Rc<RefCell<AppCore>>, a: Analysis) {
+    seed_image(core);
     core.borrow_mut()
         .image_layers
         .insert("sha256:aaa".into(), Some(a));
@@ -132,8 +138,28 @@ fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no line renders {needle:?}:\n{text}"))
 }
 
+/// Drain the task channel, counting `AnalyzeImageLayers` requests (each
+/// one's key/image is checked while at it).
+fn count_layer_requests(h: &mut common::AppHarness) -> usize {
+    let mut requests = 0;
+    while let Ok(req) = h.task_rx.try_recv() {
+        if let TaskReq::AnalyzeImageLayers { key, image } = req {
+            assert_eq!(key, "sha256:aaa");
+            assert_eq!(image, "sha256:aaa");
+            requests += 1;
+        }
+    }
+    requests
+}
+
+/// Finding 1.4: image ids are content-addressed (spec D9), so the cached
+/// analysis can never be stale — a reopen renders it and never restarts
+/// the `docker save` stream. (The pre-final-fix version of this test
+/// seeded the cache AND expected a request; sub-item 4 makes those two
+/// assertions mutually exclusive, so the request half moved to
+/// [`an_uncached_image_asks_the_worker_exactly_once`].)
 #[test]
-fn the_layers_window_renders_the_layers_and_asks_the_worker_once() {
+fn the_layers_window_renders_a_cached_analysis_without_reasking_the_worker() {
     let mut h = app_start(|core| seed(core, analysis()));
     // The two-hop: mint the cursor row, then the desktop's opener.
     open_layers(&mut h);
@@ -143,15 +169,17 @@ fn the_layers_window_renders_the_layers_and_asks_the_worker_once() {
     assert!(text.contains("Layers — alpine:3.19"), "{text}");
     assert!(text.contains("FROM alpine"), "{text}");
     assert!(text.contains("RUN apk add"), "{text}");
-    // The window asks the worker exactly once, keyed by the image id.
-    let mut requests = 0;
-    while let Ok(req) = h.task_rx.try_recv() {
-        if let TaskReq::AnalyzeImageLayers { key, image } = req {
-            assert_eq!(key, "sha256:aaa");
-            assert_eq!(image, "sha256:aaa");
-            requests += 1;
-        }
-    }
+    let requests = count_layer_requests(&mut h);
+    assert_eq!(requests, 0, "a cached analysis is never re-requested");
+}
+
+/// The uncached path of the same open: no cached analysis ⇒ the window
+/// asks the worker exactly once, keyed by the image id.
+#[test]
+fn an_uncached_image_asks_the_worker_exactly_once() {
+    let mut h = app_start(seed_image);
+    open_layers(&mut h);
+    let requests = count_layer_requests(&mut h);
     assert_eq!(requests, 1, "one analysis request per open");
 }
 
