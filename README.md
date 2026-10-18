@@ -29,6 +29,7 @@ Everything runs in the pinned container — no host toolchain required:
 - **Live logs** — per-container streaming with follow/pause (`F7`), search, scrolling and export; one Logs window per container
 - **Embedded shell** — `docker exec` into a live PTY with configurable shell, user and working directory per container, and scrollback; the config is persisted to `tvdocker.toml`
 - **File explorer** — host ↔ container and host ↔ volume, two panes: navigate, filter, copy, rename, delete and create files/directories; a read-only Image Explorer browses an image's filesystem
+- **Image layers** — `Ctrl+L` on an image (or **Layers…** in its context menu) opens the layer explorer: the layer list beside a colour-coded change tree (Added / Removed / Modified), with an efficiency score, the potential wasted space and the inefficient paths; it streams `docker save` under the hood and never starts a container
 - **Image management** — `REPOSITORY:TAG` and `SIZE`, remove, prune/dangling cleanup, and Run… (`F2`) through a validated run form
 - **Networks & volumes** — names, drivers, sizes and container counts; delete with confirmation; open a volume directly in the Explorer
 - **Live statistics** — `docker stats` (CPU %, memory, net, block I/O, PIDs) per container, sortable by column
@@ -61,6 +62,7 @@ Everything runs in the pinned container — no host toolchain required:
 | on a container | `Ctrl+E` | **Explorer ×N** — host ↔ container files |
 | on a volume | `Enter` | **Explorer ×N** — host ↔ volume files |
 | on an image | `Ctrl+E` | **Image Explorer** — the image's filesystem, read-only |
+| on an image | `Ctrl+L` | **Layers ×N** — the layer list with the colour-coded change tree, efficiency score and potential wasted space; also **Layers…** in the context menu |
 | on an image | `F2` | **Run…** — the validated run form |
 | right-click a container | — | context menu: Explorer, Details, Logs, Shell, **Diagnose…**, Start/Stop, Delete |
 | Options menu | `Alt+O` | **Settings** — the TOML editor (`F2` saves + live-reloads) |  
@@ -68,6 +70,8 @@ Everything runs in the pinned container — no host toolchain required:
 Right-click a row for the **context menu** (Details/Logs/Shell, Start/Stop, Delete, Diagnose…, Explorer); `Del` deletes with confirmation; `Ctrl+O` opens the **column picker** (runtime-only — reopening resets it).
 
 Opening an item already on screen focuses it instead of duplicating it, windows cascade (+2/+1) and shrink to fit, and each keeps its own filter (`Esc` clears selection → filter → close). `Ctrl+A` selects the filtered rows; the status line shows the focused window's contextual shortcuts and hides them under `F10`.
+
+**Layers** (one window per image) lists the image's layers — compare marker, size, history command — beside the selected layer's changes as a colour-coded file tree (`+` Added, `-` Removed, `~` Modified, blank Unmodified); the top line shows the total size, the efficiency score and the potential wasted space, and the bottom strip lists the inefficient paths (how many layers touched them, and the wasted bytes). `Space`/`+` and `-` expand and collapse directories, `*` expands all, `Ctrl+T` toggles between comparing the selected layer and comparing the whole image against its base layer, `A`/`R`/`M`/`U` show/hide Added/Removed/Modified/Unmodified rows; in this window, `Ctrl+O` steps the sort column and `/` focuses the pane's filter bar. The analysis streams the image's `docker save` and never starts a container.
 
 The **Help** menu also carries **Check for updates…** — a GitHub release lookup against this repository (`src/domain/update.rs`). When the release has an asset for your platform, the dialog offers to download and install it: the archive is fetched, unpacked, and the running binary is replaced on disk — restart tvdocker to apply. Without a matching asset the dialog points at the release page instead. The optional startup check (`check_updates = true`) only latches a status-line notice; it never installs.
 
