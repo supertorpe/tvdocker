@@ -3,7 +3,9 @@
 //! bounded-channel policy, CLI filter prefill, ActionReq round trip.
 mod common;
 
-use common::{SharedClock, close_modal_and_quit, container_state, pump, screen_text};
+use common::{
+    SharedClock, close_modal_and_quit, container_state, isolate_config, pump, screen_text,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Event, Key, KeyModifiers};
@@ -23,6 +25,12 @@ type Start = (
 );
 
 fn start(filter: Option<&str>) -> Start {
+    // Isolate the config FIRST (the `app_start` rationale): a persisted
+    // `[column_layouts]` in the developer's real `~/.config/tvdocker/`
+    // re-shapes the Containers table (fixed columns overflow an 80-cell
+    // window and push PORTS past the right edge), so the sort-arrow
+    // assertions only hold against a virgin config.
+    isolate_config();
     let (backend, screen) = HeadlessBackend::new(80, 25);
     let (shared, clock) = SharedClock::new(0);
     let core = Rc::new(RefCell::new(AppCore::new()));
