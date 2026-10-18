@@ -2,8 +2,11 @@
 
 Multi-window Docker TUI built on Turbo Vision (via [tvision-rs](https://github.com/oetiker/tvision-rs)): overlapping resource windows, logs side by side, and an embedded shell — the TUI never suspends. A rebuilt [oh-my-docker](https://github.com/supertorpe/oh-my-docker) on a true multi-window desktop.
 
-<img src="./img/screenshot.png" width="1261" />
+The full feature tour — every window, dialog and live call, recorded from
+[`demo/tvdocker-demo.toml`](./demo/tvdocker-demo.toml) with
+[ansidrama](https://github.com/supertorpe/ansidrama):
 
+![tvdocker — the full feature tour](./demo/img/tvdocker-demo.webp)
 
 ## Build & test
 

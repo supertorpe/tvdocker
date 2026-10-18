@@ -1,0 +1,758 @@
+# =============================================================================
+# tvdocker — the full-feature tour, recorded with ansidrama.
+#
+# PRE-FLIGHT (everything must be true before recording):
+#
+#   Shortcut for a REPEAT take: demo/reset-tui.sh does steps 1 + 4 in one go
+#   (wipe the tui_* set, respawn the same fifteen, restore the seed config).
+#
+#   1. Demo containers are up. They emit the live logs, statistics and events
+#      the recording shows:
+#
+#          demo/spawn.sh
+#
+#      A take is destructive: the stop+delete beat removes one container and
+#      the Explorer beat creates and renames a file inside another. A REPEAT
+#      take therefore starts by wiping the set — which clears those files
+#      too — and respawning the same fifteen:
+#
+#          docker rm -f $(docker ps -aq --filter name=tui_)
+#          demo/spawn.sh
+#
+#   2. tvdocker is built. This script launches the debug binary; switch `launch`
+#      to target/release/tvdocker for a quieter final take:
+#
+#          ./dcargo build
+#
+#   3. llama.cpp is serving the OpenAI-compatible API on :9090 (AI Diagnose
+#      makes a real call; the status line reads "Done —" when it finishes):
+#
+#          curl -s localhost:9090/v1/models
+#
+#      The seeded config names the preset (`model = "qwen3.5-4B"`), not the
+#      gguf file stem. llama.cpp's router only applies a preset when it is
+#      asked for by preset name: the file-stem alias (`Qwen3.5-4B-Q4_K_M`)
+#      silently spawns a default instance — 4k context, thinking ON — which
+#      spends its whole token budget in `reasoning_content` and never
+#      answers inside the app's 120s HTTP timeout. The preset serves the
+#      same weights with the server's own `reasoning = off`.
+#
+#   4. The seeded config is the pristine one. A take writes to it (the theme
+#      picker installs its choice, the shell form remembers its values), so a
+#      repeat take restores it first — same rule as the containers:
+#
+#          cp demo/record-home/.config/tvdocker/tvdocker.toml.seed \
+#             demo/record-home/.config/tvdocker/tvdocker.toml
+#
+#   5. ansidrama is built:
+#          cargo build --release --manifest-path ../ansidrama/Cargo.toml
+#
+# RECORD (from the tvdocker repo root — `out` is relative to the CWD):
+#
+#   ../ansidrama/target/release/ansidrama record demo/tvdocker-demo.toml --dump-png frames/
+#
+#   --dump-png writes frames/frameNNNN.png + frames/manifest.tsv; the manifest
+#   maps every frame back to its scene, so a bisect of "which scene looks
+#   wrong" is a table lookup. A failed `await` aborts the run and dumps the
+#   last screen as text — that is the debugging loop for focus/key issues.
+#
+# NOTES:
+#   - HOME is overridden so the recording reads/writes the seeded config in
+#     demo/record-home/.config/tvdocker/tvdocker.toml (LLM endpoint, sh as
+#     shell) and never touches the real ~/.config/tvdocker/.
+#   - Focus discipline: a resource window opens with the TABLE focused; Tab
+#     hops to the filter bar and back. The script Tabs in before typing a
+#     filter and Tabs out before arrowing rows.
+#   - Scenes with inherently live output (logs stream, events arrive, stats
+#     fluctuate, the LLM answers) dwell as `app-driven` frames; everything
+#     else paces on the stability sampler, and `await` guards every beat where
+#     a half-drawn screen would ruin the frame.
+#   - Shift+F10 / Ctrl+F5 / Shift+PageUp / Shift+F6 arrive as raw xterm
+#     sequences: ansidrama's modifier syntax only covers single characters
+#     after C-/S-, and TOML spells ESC as the six characters ␛u001b
+#     (backslash, u, 0, 0, 1, b).
+#   - `await` is a REGEX (regex_lite), not a literal: escape the metacharacters
+#     a screen string happens to contain (`[X] NAME` → "\\[X\\] NAME",
+#     `Shift+F10` → "Shift\\+F10"). One stray `+` silently never matches.
+#   - Layout anchors used by the mouse scenes (1-based cells, no chrome — the
+#     chrome is drawn in pixels around the grid and does not shift cells).
+#     Windows are left-anchored (the Containers frame opens at column 3), so
+#     these x values hold at any grid width; only y needs pinning:
+#       Containers window : title bar row 3, table header row 6, first data
+#                           row 7. A right-click on the header opens the
+#                           column chooser; on a row, that row's menu.
+#       Logs window       : the wheel scene sits at x=40, row 15.
+#     The frame does not move when the filter changes, so the first row of
+#     the filtered table is still row 7; the filter only moves which
+#     container that row holds.
+# =============================================================================
+
+launch = "/home/linux/proyectos/tvdocker/target/debug/tvdocker"
+cols   = 144
+rows   = 38
+font   = "jetbrains"
+font_px = 16        # cell = 7x16 px → 1008x608 terminal + chrome (measured)
+card_font_px = 40   # cards read at a glance
+max_fps = 30
+type_cs = 8         # typing speed
+move_cs = 4         # pointer speed
+
+out = "img/tvdocker-demo.webp"
+
+# The demo app runs against its own config tree (see header).
+env = { HOME = "/home/linux/proyectos/tvdocker/demo/record-home" }
+
+# Clean shutdown: Alt-X is tvdocker's quit.
+quit_keys = ["M-x"]
+
+startup_ms  = 1200  # the TUI opens Containers and polls docker on start
+sample_ms   = 10
+change_ms   = 200   # grace for the app's reaction before a match may end a wait
+stable_ms   = 60
+persist_ms  = 50
+wait_cap_ms = 4000
+await_ms    = 8000  # per-scene overrides below go higher where noted
+
+# tvdocker is a desktop — dress the recording as one.
+[chrome]
+style   = "macos"
+title   = "tvdocker"
+padding = 12
+
+# -----------------------------------------------------------------------------
+# Act 1 — Containers
+# -----------------------------------------------------------------------------
+
+[[scene]]
+card = { lines = ["tvdocker", "", "a multi-window Docker desktop", "for your terminal"], fg = "#fef9c3", bg = "#111", bold = true }
+hold_cs = 350
+
+# Tab focuses the filter bar (the table holds focus at startup), type the
+# fuzzy filter, Tab back to the table.
+[[scene]]
+keys    = ["Tab"]
+hold_cs = 30
+
+[[scene]]
+text  = "tui_"
+await = "filter tui_"
+hold_cs = 60
+
+[[scene]]
+keys    = ["Tab"]
+hold_cs = 30
+
+# Right-click the header row: the table's own column chooser — every column
+# on/off. Esc leaves the layout as it was. The chooser shows the columns
+# with their check boxes, so wait for one before dismissing it.
+[[scene]]
+click   = { x = 20, y = 6, button = "right" }
+await   = "\\[X\\] NAME"
+hold_cs = 80
+
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 40
+
+# Walk the filtered rows.
+[[scene]]
+keys    = ["Down", "Down", "Down"]
+hold_cs = 40
+
+# Enter → Details: the parsed inspect payload, one section set.
+[[scene]]
+keys  = ["Enter"]
+await = "Details —"
+hold_cs = 80
+
+[[scene]]
+keys    = ["PageDown", "PageDown"]
+hold_cs = 40
+
+# Esc hands focus back — but Details is a plain window with no Esc-close,
+# so F3 closes it like every other window.
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# F2 → Logs: live per-container streaming.
+[[scene]]
+keys  = ["F2"]
+await = "level="
+hold_cs = 160        # dwell: streaming lines are app-driven frames
+
+# Printable keys go to the search line — filter the stream.
+[[scene]]
+text  = "ERROR"
+hold_cs = 100
+
+# F7 pauses follow, F7 resumes.
+[[scene]]
+keys    = ["F7", "F7"]
+hold_cs = 40
+
+# Wheel-scroll the buffer (pointer over the log pane).
+[[scene]]
+scroll  = { x = 40, y = 15, dir = "up", n = 4 }
+hold_cs = 40
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# F4 → Shell: exec config dialog; Enter accepts (shell/user/cwd).
+# The dialog is painted into the view tree one pump pass BEFORE it becomes
+# the modal (`request_exec_view` stashes it in `pending_modal`; the pass
+# that takes it makes it current). A key sent inside that window falls to
+# whatever held focus before — the filter bar — and is lost, which is what
+# left this dialog sitting open on Enter. The await only proves it is
+# DRAWN, so follow it with a hit-tested click: mouse events resolve against
+# the tree (the dialog is already in it), so the click cannot be swallowed,
+# and it forces the pass that installs the modal. Parking the caret in the
+# Shell field is all it does.
+[[scene]]
+keys    = ["F4"]
+await   = "Workdir"
+hold_cs = 80
+
+[[scene]]
+click   = { x = 70, y = 17, button = "left" }   # inside the Shell field
+hold_cs = 40
+
+# Now Enter reaches the modal. Wait for the PTY prompt before typing —
+# docker exec needs a beat. (The nginx container's ash prompt is a bare
+# "/ #", no user@host.)
+[[scene]]
+keys     = ["Enter"]
+await    = "/ #"
+await_ms = 20000
+hold_cs  = 100
+
+[[scene]]
+text    = "ls /etc"
+hold_cs = 30
+
+[[scene]]
+keys  = ["Enter"]
+await = "passwd"
+hold_cs = 80
+
+# Scrollback — the TUI never suspended, this is history inside the PTY view.
+[[scene]]
+keys    = ["\u001b[5;2~"]    # Shift+PageUp
+hold_cs = 40
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# Ctrl+E → Explorer: host ↔ container files, two panes.
+[[scene]]
+keys  = ["C-e"]
+await = "Explorer —"
+hold_cs = 100
+
+[[scene]]
+keys    = ["Tab", "Down", "Down", "Down"]   # hop to the container panel, walk rows
+hold_cs = 40
+
+# `N` = new file… (Explorer hotkey; `n` is new dir, `r` is rename).
+[[scene]]
+keys  = ["N"]
+await = "New file"
+hold_cs = 60
+
+[[scene]]
+text    = "demo-notes.txt"
+hold_cs = 20
+
+# Submit, then PageDown: dirs sort before files, so the new file is the LAST
+# row — below the fold of the viewport. (End would only reach the page
+# bottom; PageDown walks the cursor — and the view — down.)
+[[scene]]
+keys    = ["Enter"]
+hold_cs = 60
+
+[[scene]]
+keys     = ["PageDown", "PageDown"]
+# The name column truncates, so await the listing's clipped form (with the
+# ellipsis) — the dialog's own "demo-notes.txt" is gone by now.
+await    = "demo-notes…"
+hold_cs  = 80
+
+# `r` = rename… the prompt comes prefilled, so clear it first. The cursor is
+# on the LAST row (docker-entrypoint.sh) after the create — step up to the
+# file we just made, or the rename would grab the wrong row.
+[[scene]]
+keys    = ["Up"]
+hold_cs = 30
+
+[[scene]]
+keys  = ["r"]
+await = "Rename"
+hold_cs = 60
+
+[[scene]]
+keys    = ["End"]                    # 14 chars of prefill to clear
+hold_cs = 20
+
+[[scene]]
+keys    = ["BSpace", "BSpace", "BSpace", "BSpace", "BSpace", "BSpace", "BSpace"]
+hold_cs = 20
+
+[[scene]]
+keys    = ["BSpace", "BSpace", "BSpace", "BSpace", "BSpace", "BSpace", "BSpace"]
+hold_cs = 20
+
+[[scene]]
+text    = "renamed.txt"
+hold_cs = 20
+
+[[scene]]
+keys  = ["Enter"]        # submit the rename
+hold_cs = 60
+
+# Same bottom-of-list rule as the create: page back down to the last row.
+[[scene]]
+keys     = ["PageDown", "PageDown"]
+await    = "renamed"
+hold_cs  = 80
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# -----------------------------------------------------------------------------
+# Act 2 — Images
+# -----------------------------------------------------------------------------
+
+[[scene]]
+card = { lines = ["Images", "", "layers, filesystem and the run form"], fg = "#fef9c3", bg = "#111", bold = true }
+hold_cs = 250
+
+# Alt-D opens the Docker menu; `i` is Images.
+[[scene]]
+keys  = ["M-d", "i"]
+await = "REPOSITORY"
+hold_cs = 60
+
+# Pin the image with the fuzzy filter rather than a row index: dangling
+# `<none>` images sort to the top as builds come and go, so a fixed "Down×2"
+# would hand the layer analysis a 10GB image instead of a small one.
+[[scene]]
+keys    = ["Tab"]
+hold_cs = 30
+
+[[scene]]
+text  = "alpine"
+await = "filter alpine"
+hold_cs = 60
+
+[[scene]]
+keys    = ["Tab"]           # back to the table, cursor on the first hit
+hold_cs = 30
+
+# Ctrl+L → Layers: the layer list beside the colour-coded change tree.
+# The analysis runs on open, so give the summary line longer than the default.
+[[scene]]
+keys     = ["C-l"]
+await    = "Efficiency"
+await_ms = 30000
+hold_cs  = 80
+
+# `*` expands the whole tree.
+[[scene]]
+keys    = ["*"]
+hold_cs = 60
+
+# Ctrl+T flips the compare mode (selected layer ↔ whole image vs base).
+[[scene]]
+keys    = ["C-t"]
+hold_cs = 60
+
+# A / R / M toggle the change classes; U brings Unmarked back.
+[[scene]]
+keys    = ["a", "m", "u"]
+hold_cs = 40
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# Ctrl+E on an image → Image Explorer: the image filesystem, read-only.
+[[scene]]
+keys  = ["C-e"]
+await = "Explorer —"
+hold_cs = 80
+
+[[scene]]
+keys    = ["Down", "Down"]
+hold_cs = 30
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# F2 → Run… : the validated run form. TAB order is Command, Shell, User,
+# Workdir, Env, Ports, Volumes, Name, …
+[[scene]]
+keys  = ["F2"]
+await = "Run Container"
+hold_cs = 60
+
+[[scene]]
+keys    = ["Tab", "Tab", "Tab", "Tab", "Tab"]   # → Ports
+hold_cs = 20
+
+# A non-numeric port is rejected at the form, not at docker. (The container
+# side is the checked half — `99999:80` would pass and submit.)
+[[scene]]
+text    = "80:abc"
+hold_cs = 20
+
+[[scene]]
+keys  = ["Enter"]          # validate → the error row explains itself
+await = "Invalid"
+hold_cs = 100
+
+# Tab on to Name and fill it in — the form keeps its state.
+[[scene]]
+keys    = ["Tab", "Tab"]   # → Name
+hold_cs = 20
+
+[[scene]]
+text    = "demo-run"
+hold_cs = 80
+
+# Cancel — the tour never actually launches anything.
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 30
+
+# -----------------------------------------------------------------------------
+# Act 3 — The ops view
+# -----------------------------------------------------------------------------
+
+[[scene]]
+card = { lines = ["The ops view", "", "networks, volumes, events, statistics"], fg = "#fef9c3", bg = "#111", bold = true }
+hold_cs = 250
+
+[[scene]]
+keys  = ["M-d", "n"]
+await = "DRIVER"
+hold_cs = 60
+
+[[scene]]
+keys  = ["M-d", "v"]
+await = "MOUNTPOINT"
+hold_cs = 60
+
+# Volumes — the same table, paging and filtering over `docker volume ls`.
+[[scene]]
+keys    = ["F3"]           # and away again
+hold_cs = 30
+
+# Alt-D, c → back to Containers, then re-pin the filter. Clearing with Esc
+# alone proved flaky here (depending on which child ends up focused it can
+# fall through to the selection/close steps and leave the old filter in
+# place), so clear the field the boring way: focus it and backspace over the
+# four characters the Act 1 filter left. Backspacing an already-empty field
+# is a no-op, so this is safe either way.
+[[scene]]
+keys    = ["M-d", "c"]
+hold_cs = 40
+
+[[scene]]
+keys    = ["Tab"]          # filter bar
+hold_cs = 20
+
+[[scene]]
+keys    = ["Backspace", "Backspace", "Backspace", "Backspace"]
+hold_cs = 40
+
+[[scene]]
+text  = "tui_alpine"
+await = "filter tui_alpine"
+hold_cs = 40
+
+[[scene]]
+keys    = ["Tab"]          # back to the table, cursor on the first hit
+hold_cs = 30
+
+# Right-click the row: the context menu, under the pointer. Wait for the
+# menu itself — a hot letter sent before it opens would reach the table.
+[[scene]]
+click   = { x = 20, y = 7, button = "right" }
+await   = "Diagnose"
+hold_cs = 80
+
+# `t` = sTop (hot letters are scoped to the open menu). No confirmation:
+# the row flips to Exited and the Events window will see it happen.
+# The demo containers run a shell as PID 1, which ignores SIGTERM — so
+# docker's 10s grace period elapses before the state actually flips. The
+# cap below is deliberately generous; the wait ends the moment it matches.
+[[scene]]
+keys     = ["t"]
+await    = "Exited"
+await_ms = 30000
+hold_cs  = 100
+
+# The same menu, `x` = Delete → the confirmation dialog names the row.
+[[scene]]
+click   = { x = 20, y = 7, button = "right" }
+await   = "Diagnose"
+hold_cs = 80
+
+[[scene]]
+keys  = ["x"]
+await = "Delete container"
+hold_cs = 60
+
+[[scene]]
+keys    = ["Enter"]        # Yes → docker rm
+hold_cs = 120              # the row vanishes; the table settles
+
+# Deleting the row the table cursor sat on leaves the table without one, and
+# `display_row_at` resolves a right-click from the focused row (resource.rs) —
+# so with no cursor a body right-click resolves to nothing and no menu opens.
+# One Down re-seats the cursor on the row now under the pointer.
+[[scene]]
+keys    = ["Down"]
+hold_cs = 60
+
+# Once more — and dismissed with Esc, the other way out of a menu.
+[[scene]]
+click   = { x = 20, y = 7, button = "right" }
+await   = "Diagnose"
+hold_cs = 80
+
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 30
+
+# Alt-D, e → Events: the stop/die events we just caused stream in live.
+[[scene]]
+keys    = ["M-d", "e"]
+await   = "ACTION"
+hold_cs = 200
+
+# Alt-D, s → Statistics: live CPU/mem/net/block per container. ←/→ sort
+# the numeric columns.
+[[scene]]
+keys    = ["M-d", "s"]
+await   = "CPU %"
+hold_cs = 200
+
+[[scene]]
+keys    = ["Right", "Right"]   # step the sort column
+hold_cs = 80
+
+# Back to Containers: Ctrl+A selects every filtered row (batch actions).
+[[scene]]
+keys    = ["M-d", "c"]
+hold_cs = 40
+
+[[scene]]
+keys    = ["C-a"]
+hold_cs = 80
+
+[[scene]]
+keys    = ["Esc"]          # clear the selection again
+hold_cs = 30
+
+# -----------------------------------------------------------------------------
+# Act 4 — A desktop, not a pager
+# -----------------------------------------------------------------------------
+
+[[scene]]
+card = { lines = ["A desktop, not a pager", "", "windows you move, resize and tile"], fg = "#fef9c3", bg = "#111", bold = true }
+hold_cs = 250
+
+# Grab the Containers title bar and drag the window down — the pointer
+# overlay shows exactly where the grab happens.
+[[scene]]
+drag    = { from = [40, 3], to = [40, 12], steps = 8 }
+hold_cs = 80
+
+# The menu bar answers the mouse too: a click on a top-level item drops its
+# menu; Esc puts it away again.
+[[scene]]
+click   = { x = 10, y = 1, button = "left" }
+hold_cs = 120
+
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 40
+
+# Stack up a few more windows on top.
+[[scene]]
+keys    = ["M-d", "n"]
+await   = "DRIVER"
+hold_cs = 40
+
+[[scene]]
+keys    = ["M-d", "v"]
+await   = "MOUNTPOINT"
+hold_cs = 40
+
+# F5 zooms the focused window in…
+[[scene]]
+keys    = ["F5"]
+hold_cs = 80
+
+# …and back out.
+[[scene]]
+keys    = ["F5"]
+hold_cs = 60
+
+# Ctrl+F5 = Size/Move: arrows push the window against the screen edge,
+# which resizes it; Enter accepts.
+[[scene]]
+keys    = ["\u001b[15;5~"]   # Ctrl+F5
+hold_cs = 60
+
+[[scene]]
+keys    = ["Right", "Right", "Down"]
+hold_cs = 60
+
+[[scene]]
+keys    = ["Enter"]
+hold_cs = 60
+
+# Alt-W, f → Full screen: the focused window drops its frame and fills the
+# desktop; one press more and it reverts to its framed bounds.
+[[scene]]
+keys    = ["M-w", "f"]
+hold_cs = 150
+
+[[scene]]
+keys    = ["M-w", "f"]
+hold_cs = 150
+
+# Alt-W, t → Tile everything; Alt-W, c → Cascade.
+[[scene]]
+keys    = ["M-w", "t"]
+hold_cs = 100
+
+[[scene]]
+keys    = ["M-w", "c"]
+hold_cs = 100
+
+# F6 / Shift+F6 cycle windows forward and back.
+[[scene]]
+keys    = ["F6"]
+hold_cs = 40
+
+[[scene]]
+keys    = ["\u001b[17;2~"]    # Shift+F6 (F6 = ESC[17~)
+hold_cs = 40
+
+# -----------------------------------------------------------------------------
+# Act 5 — Make it yours
+# -----------------------------------------------------------------------------
+
+[[scene]]
+card = { lines = ["Make it yours", "", "themes, colors, settings — and an AI second opinion"], fg = "#fef9c3", bg = "#111", bold = true }
+hold_cs = 250
+
+# Alt-O, t → Themes… pick another palette; the whole desktop recolors live
+# and the choice persists to the config.
+[[scene]]
+keys    = ["M-o", "t"]
+await   = "preview"
+hold_cs = 80
+
+[[scene]]
+keys    = ["Down", "Down"]
+hold_cs = 40
+
+[[scene]]
+keys    = ["Enter"]
+hold_cs = 120
+
+# Alt-O, e → Edit colors… the palette editor (brief look).
+[[scene]]
+keys    = ["M-o", "e"]
+await   = "Edit colors"
+hold_cs = 80
+
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 30
+
+# Alt-O, s → Settings… the TOML editor; the seeded config is visible at
+# the top (the llm block sits lower in the file).
+[[scene]]
+keys  = ["M-o", "s"]
+await = "latest_shell"
+hold_cs = 100
+
+# F2 saves and live-reloads the config.
+[[scene]]
+keys    = ["F2"]
+hold_cs = 60
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# AI Diagnose on the container under the cursor (running), from the row's
+# context menu. Focus Containers, then Shift+F10: the keyboard route to the
+# same menu the mouse opens.
+[[scene]]
+keys    = ["M-d", "c"]
+hold_cs = 40
+
+[[scene]]
+keys    = ["\u001b[21;2~"]
+await   = "Diagnose"
+hold_cs = 60
+
+[[scene]]
+keys    = ["n"]           # Diag~n~ose…
+hold_cs = 60
+
+# The llama.cpp call is real: collect → analyze → Done. The status line
+# flips to "Done —" when the analysis and playbook have arrived. A 4B model
+# on a local server can take a while — give it two minutes.
+[[scene]]
+keys     = ["PageDown"]     # scrolls the analysis as it lands
+await    = "Done —"
+await_ms = 120000
+hold_cs  = 150
+
+[[scene]]
+keys    = ["F3"]
+hold_cs = 30
+
+# F1 → the shortcut box: every binding on one screen, over the running
+# desktop.
+[[scene]]
+keys    = ["F1"]
+await   = "Shift\\+F10"
+hold_cs = 150
+
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 40
+
+# Help → Check for updates… a live GitHub release lookup. We look, then
+# decline — the tour never installs anything. (The dialog always reports
+# what it checked, so "Checked:" is the handle to wait on.)
+[[scene]]
+keys     = ["M-h", "c"]
+await    = "Checked:"
+await_ms = 30000
+hold_cs  = 250
+
+[[scene]]
+keys    = ["Esc"]
+hold_cs = 30
+
+# -----------------------------------------------------------------------------
+# Act 6 — outro
+# -----------------------------------------------------------------------------
+
+[[scene]]
+card = { lines = ["github.com/supertorpe/tvdocker", "", "docker ps, in a window manager"], fg = "#fef9c3", bg = "#111", bold = true }
+hold_cs = 400

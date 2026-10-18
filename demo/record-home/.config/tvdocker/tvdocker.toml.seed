@@ -1,0 +1,55 @@
+latest_shell = "sh"
+check_updates = true
+mouse = true
+
+[containers.tui_nginx_stable-alpine3_21-slim_2]
+shell = "sh"
+
+[images."<none>"]
+shell = "sh"
+
+[images.nginx]
+shell = "sh"
+
+[keybindings]
+quit = []
+back = []
+help = []
+navigate_down = []
+navigate_up = []
+open_details = []
+open_logs = []
+open_shell = []
+start_stop = []
+restart = []
+delete = []
+search = []
+toggle_selection = []
+select_all = []
+navigate_images = []
+run_image = []
+remove_image = []
+remove_dangling_images = []
+prune_images = []
+jump_top = []
+jump_bottom = []
+sort_direction = []
+logs_export = []
+toggle_timestamps = []
+open_diagnostics = []
+
+[polling]
+containers_ms = 2000
+statistics_ms = 2000
+images_ms = 10000
+networks_ms = 10000
+volumes_ms = 10000
+
+[column_layouts]
+
+[llm]
+provider = "openai"
+model = "qwen3.5-4B"
+base_url = "http://localhost:9090/v1"
+
+[themes]
