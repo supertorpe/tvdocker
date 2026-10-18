@@ -4,7 +4,7 @@ Multi-window Docker TUI built on Turbo Vision (via [tvision-rs](https://github.c
 
 The full feature tour — every window, dialog and live call, recorded from
 [`demo/tvdocker-demo.toml`](./demo/tvdocker-demo.toml) with
-[ansidrama](https://github.com/supertorpe/ansidrama):
+[ansidrama](https://github.com/oetiker/ansidrama):
 
 ![tvdocker — the full feature tour](./demo/img/tvdocker-demo.webp)
 
