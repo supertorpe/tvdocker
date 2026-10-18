@@ -144,8 +144,9 @@ pub fn about_text() -> String {
 /// opens the box and that this content documents the sort keys.
 pub const SHORTCUTS_TEXT: &str = "\
     Tables: ←/→ cycle the sort column, Shift+←/→ flip\n\
-    its direction, Space selects\n\
-    a row, Ctrl-A selects all (filtered).\n\n\
+    its direction, Space selects a row;\n\
+    Ctrl-A selects all; Shift+F10\n\
+    opens the row menu.\n\n\
     Containers: F2 Logs · F4 Shell · Ctrl+E Explorer ·\n\
     Enter Details · Del Delete (confirm);\n\
     F7 pauses log follow.\n\n\
@@ -1010,7 +1011,8 @@ mod tests {
     }
 
     /// `Ctrl+E` opens the Explorer from Containers and from Images — the
-    /// keyboard-only route, since the context menu is mouse-only.
+    /// direct keyboard route (the context menu, Shift+F10, goes through
+    /// the same menu items).
     #[test]
     fn ctrl_e_opens_the_container_and_image_explorers() {
         use crate::views::{containers, images};
@@ -1065,6 +1067,10 @@ mod tests {
         assert!(
             SHORTCUTS_TEXT.contains("Ctrl+L Layers"),
             "the keyboard-only layers route is documented: {SHORTCUTS_TEXT}"
+        );
+        assert!(
+            SHORTCUTS_TEXT.contains("Shift+F10"),
+            "the mouse-free context menu is documented: {SHORTCUTS_TEXT}"
         );
         for visible in [
             "F1 Help",

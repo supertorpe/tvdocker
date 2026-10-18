@@ -203,7 +203,7 @@ pub struct ResourceWindow {
     info: Rc<RefCell<InfoState>>,
     last_revision: u64,
     open: Rc<RefCell<bool>>,
-    /// Cached screen origin for right-click → `popup_menu` (the
+    /// Cached screen origin for right-click/Shift+F10 → `popup_menu` (the
     /// editor/status_line `abs_origin` pattern, `editor.rs:1917`).
     abs_origin: tv::Point,
 }
@@ -500,9 +500,9 @@ impl ResourceWindow {
         t.sort_by(col, dir, ctx);
     }
 
-    /// Open the row context menu at screen position `m.position`, built from
+    /// Open the row context menu at window-local `anchor`, built from
     /// the row the table just focused.
-    fn open_context_menu(&mut self, m: tv::MouseEvent, ctx: &mut Context) {
+    fn open_context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
         let Some(menu) = self.spec.context_menu else {
             return;
         };
@@ -518,8 +518,22 @@ impl ResourceWindow {
         for (label, command) in items {
             builder = builder.command(label, command);
         }
-        let global = m.position + self.abs_origin;
+        let global = anchor + self.abs_origin;
         popup_menu(global, builder.build(), ctx.owner_size(), ctx);
+    }
+
+    /// Where the keyboard route (Shift+F10) opens the menu: the CURSOR
+    /// row's first cell — the point a right-click on that row would use
+    /// (the keyboard has only the cursor; a right-click targets the
+    /// CLICKED row). The caret is the only cursor the upstream Table
+    /// exposes and it is hidden while the filter bar holds focus, so that
+    /// case falls back to the table's top-left; the menu's TARGET is the
+    /// cursor row either way (`open_target` reads the focused row).
+    fn context_anchor(&mut self) -> Option<tv::Point> {
+        let t = self.table_mut()?;
+        let bounds = t.state().get_bounds();
+        let cursor = t.cursor_request().unwrap_or(tv::Point::new(0, 1));
+        Some(tv::Point::new(bounds.a.x + cursor.x, bounds.a.y + cursor.y))
     }
 }
 
@@ -640,6 +654,21 @@ impl View for ResourceWindow {
             return;
         }
 
+        // --- Shift+F10: the mouse-free context menu — the same popup a
+        // right-click opens (§7), anchored at the CURSOR row's cell. The
+        // status pre-route never transforms it (bound nowhere), so it
+        // arrives here as a plain KeyDown, filter bar focus included.
+        if let Event::KeyDown(ke) = ev
+            && ke.key == Key::F(10)
+            && ke.modifiers.shift
+        {
+            if let Some(anchor) = self.context_anchor() {
+                self.open_context_menu_at(anchor, ctx);
+            }
+            ev.clear();
+            return;
+        }
+
         // --- mint the targets the
         // desktop will consume, then re-post ITS command.
         if let Event::Command(cmd) = ev {
@@ -755,7 +784,7 @@ impl View for ResourceWindow {
                 };
                 if let Some(row) = row {
                     self.focus_display_row(row, ctx);
-                    self.open_context_menu(m, ctx);
+                    self.open_context_menu_at(m.position, ctx);
                 }
             } else {
                 // Header (or above): the table opens its own column popup.

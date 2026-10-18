@@ -369,8 +369,37 @@ fn image_explorer_opens_the_window_and_queues_the_listing() {
     );
 }
 
-/// Ctrl+E is the keyboard-only route into the image explorer — the context
-/// menu is mouse-only, so without this the window needs a right-click.
+/// Shift+F10 is the mouse-free context menu for the ACTIVE panel — the
+/// same items the right-click menu builds.
+#[test]
+fn shift_f10_opens_the_explorer_context_menu() {
+    let (mut program, screen, _core, mut task_rx) = start();
+    right_click(&screen, 12, 6);
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('e'), KeyModifiers::default()); // ~E~xplorer
+    // Generous pumps: the window's focus/ctx settle late (the nested
+    // upstream Table queues events past pump 6), and until then the
+    // opening flow's capture still eats keys.
+    pump(&mut program, 10);
+    while task_rx.try_recv().is_ok() {} // drain the two build requests
+
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("new dir…") && text.contains("rename…"),
+        "the explorer context menu is open: {text:?}"
+    );
+}
+
+/// Ctrl+E is the keyboard-only route into the image explorer — the
+/// context menu (Shift+F10/right-click) needs no window opened first.
 #[test]
 fn ctrl_e_opens_the_image_explorer() {
     let (mut program, screen, core, mut task_rx) = start();

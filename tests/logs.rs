@@ -85,3 +85,23 @@ fn esc_clears_the_search_first_then_closes_the_window() {
     pump(&mut program, 4);
     assert!(!open(), "second Esc closes: {}", screen_text(&screen));
 }
+
+/// Shift+F10 opens the logs context menu (timestamps / export) without a
+/// mouse.
+#[test]
+fn shift_f10_opens_the_logs_context_menu() {
+    let (mut program, screen, _core) = start();
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Show timestamps") && text.contains("Export…"),
+        "the logs menu is open: {text:?}"
+    );
+}

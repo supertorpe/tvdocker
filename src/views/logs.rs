@@ -122,7 +122,7 @@ pub struct LogsWindow {
     show_timestamps: bool,
     /// Where the last export landed (test hook, like `table_ids`).
     last_export: Option<PathBuf>,
-    /// Cached screen origin for right-click → `popup_menu` (the
+    /// Cached screen origin for right-click/Shift+F10 → `popup_menu` (the
     /// editor/`status_line` pattern: `abs_origin = ctx.origin()`).
     abs_origin: tv::Point,
     /// Slot open flag — cleared on drop so the window can be reopened.
@@ -295,6 +295,13 @@ impl LogsWindow {
     }
 
     fn right_click_menu(&mut self, m: MouseEvent, ctx: &mut Context) {
+        self.context_menu_at(m.position, ctx);
+    }
+
+    /// The logs context menu (timestamps / export) at window-local
+    /// `anchor` — the right-click point, or the log pane's top-left for
+    /// the keyboard route (a log line has no row menu of its own).
+    fn context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
         let menu = Menu::builder()
             .command(
                 if self.show_timestamps {
@@ -306,7 +313,7 @@ impl LogsWindow {
             )
             .command("Export…", crate::app::CMD_EXPORT_LOGS)
             .build();
-        let global = m.position + self.abs_origin;
+        let global = anchor + self.abs_origin;
         popup_menu(global, menu, ctx.owner_size(), ctx);
     }
 }
@@ -385,6 +392,23 @@ impl View for LogsWindow {
                 ev.clear();
                 return;
             }
+        }
+        // --- Shift+F10: the mouse-free route to the same menu — anchored
+        // at the log pane's top-left (a log has no row to anchor on).
+        if let Event::KeyDown(ke) = ev
+            && ke.key == Key::F(10)
+            && ke.modifiers.shift
+        {
+            let body = self.pane.ids().body;
+            let anchor = self
+                .pane
+                .window_mut()
+                .child_mut(body)
+                .map(|v| v.state().get_bounds().a)
+                .unwrap_or(tv::Point::new(0, 0));
+            self.context_menu_at(anchor, ctx);
+            ev.clear();
+            return;
         }
 
         self.pane.handle_event(ev, ctx);

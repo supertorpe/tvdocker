@@ -213,7 +213,7 @@ pub struct ExplorerWindow {
     /// The last prompt's answered text (the `InputDialog` record, delivered
     /// via `set_modal_data`).
     prompt_value: String,
-    /// Cached screen origin for right-click → `popup_menu` (the
+    /// Cached screen origin for right-click/Shift+F10 → `popup_menu` (the
     /// editor/`status_line` pattern).
     abs_origin: tv::Point,
 }
@@ -716,6 +716,20 @@ impl View for ExplorerWindow {
                 return;
             }
         }
+        // --- Shift+F10: the mouse-free context menu — the same popup a
+        // right-click opens, anchored at the ACTIVE panel's cursor cell
+        // (a right-click targets the CLICKED panel's row; the keyboard
+        // follows the focus).
+        if let Event::KeyDown(ke) = ev
+            && ke.key == Key::F(10)
+            && ke.modifiers.shift
+        {
+            if let Some(anchor) = self.context_anchor() {
+                self.context_menu_at(anchor, ctx);
+            }
+            ev.clear();
+            return;
+        }
         // --- Self-commands (keys/menus/modals post them).
         if let Event::Command(cmd) = ev {
             if *cmd == CMD_EXP_REFRESH {
@@ -878,13 +892,7 @@ impl View for ExplorerWindow {
                 && let Some(remote) = self.panel_at(m.position)
             {
                 self.focus_row_at(remote, m.position, ctx);
-                let items = self.context_menu_items();
-                let mut builder = Menu::builder();
-                for (label, command) in items {
-                    builder = builder.command(label, command);
-                }
-                let global = m.position + self.abs_origin;
-                popup_menu(global, builder.build(), ctx.owner_size(), ctx);
+                self.context_menu_at(m.position, ctx);
                 ev.clear();
                 return;
             }
@@ -1066,6 +1074,35 @@ impl ExplorerWindow {
     /// neither into the image nor onto the host (image-explorer).
     fn read_only(&self) -> bool {
         matches!(self.target, ExplorerTarget::Image(_))
+    }
+
+    /// Where the keyboard route (Shift+F10) opens the menu: the ACTIVE
+    /// panel's cursor cell — the point a right-click on that row would
+    /// use. The caret is the only cursor the upstream Table exposes and
+    /// it is hidden while a filter bar holds focus, so that case falls
+    /// back to the table's top-left (the menu's ITEMS follow the active
+    /// panel either way).
+    fn context_anchor(&mut self) -> Option<tv::Point> {
+        let remote = self.active_remote();
+        let t = self.table_mut(self.panel_table(remote))?;
+        let bounds = t.state().get_bounds();
+        let cursor = t.cursor_request().unwrap_or(tv::Point::new(0, 1));
+        Some(tv::Point::new(bounds.a.x + cursor.x, bounds.a.y + cursor.y))
+    }
+
+    /// The ACTIVE panel's context menu at window-local `anchor` — the
+    /// right-click point, or the keyboard route's cursor cell.
+    fn context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
+        let mut builder = Menu::builder();
+        for (label, command) in self.context_menu_items() {
+            builder = builder.command(label, command);
+        }
+        popup_menu(
+            anchor + self.abs_origin,
+            builder.build(),
+            ctx.owner_size(),
+            ctx,
+        );
     }
 
     /// The context menu for the ACTIVE panel. An image window offers only

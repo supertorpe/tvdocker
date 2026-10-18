@@ -132,6 +132,81 @@ fn right_click_menu_targets_the_clicked_row() {
     );
 }
 
+/// The (row, col) of the first `needle` occurrence in the screen text.
+fn at(text: &str, needle: &str) -> (i32, i32) {
+    for (y, line) in text.lines().enumerate() {
+        if let Some(x) = line.find(needle) {
+            return (y as i32, x as i32);
+        }
+    }
+    panic!("{needle:?} is not on screen: {text:?}");
+}
+
+/// Shift+F10 is the mouse-free context menu: same items and same target
+/// rule (the CURSOR row), anchored at that row's cell.
+#[test]
+fn shift_f10_opens_the_context_menu_for_the_cursor_row() {
+    let (mut program, screen, _core, _task_rx) = start(two_rows());
+    screen.push_key(Key::Down, KeyModifiers::default()); // ROW 2 (webbeta, exited)
+    pump(&mut program, 2);
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Details") && text.contains("Delete") && text.contains("start"),
+        "context menu open, built from the CURSOR row's state (exited ⇒ start): {text:?}"
+    );
+    // Placement: the popup opens below-right of the anchor, so its FIRST
+    // item sits two rows under the row it was opened for.
+    let (row_y, row_x) = at(&text, "webbeta");
+    let (item_y, item_x) = at(&text, "Explorer");
+    assert_eq!(
+        item_y,
+        row_y + 2,
+        "the menu opens AT the cursor row: {text:?}"
+    );
+    assert!(
+        item_x.abs_diff(row_x) <= 2,
+        "…and at its left edge (row x={row_x}, menu x={item_x}): {text:?}"
+    );
+}
+
+/// Shift+F10 opens the ROW menu and never arms the menu bar — that is
+/// plain F10's binding, and tvision matches key events including
+/// modifiers.
+#[test]
+fn shift_f10_opens_the_row_menu_not_the_menu_bar() {
+    let (mut program, screen, _core, mut task_rx) = start(two_rows());
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    assert!(text.contains("Details"), "the row menu is open: {text:?}");
+    screen.push_key(Key::Esc, KeyModifiers::default());
+    pump(&mut program, 4);
+    // Enter still means Details for the cursor row: had Shift+F10 armed
+    // the menu bar (plain F10's binding), this Enter would instead open
+    // the bar's File popup (`chrome.rs::f10_then_enter_opens_the_file_menu`
+    // pins that route).
+    screen.push_key(Key::Enter, KeyModifiers::default());
+    pump(&mut program, 5);
+    assert!(
+        matches!(task_rx.try_recv(), Ok(TaskReq::Inspect { id }) if id == "id-alpha"),
+        "Enter still opens Details — the menu bar was never armed"
+    );
+}
+
 #[test]
 fn enter_opens_details_for_the_cursor_row() {
     let (mut program, screen, _core, mut task_rx) = start(two_rows());
