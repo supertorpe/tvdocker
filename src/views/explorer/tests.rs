@@ -892,3 +892,36 @@ fn drop_sends_remove_image_helper() {
         "the window reaps its helper"
     );
 }
+
+/// Windows ▸ Full screen reaches ExplorerWindow's inner window: enter Desktop
+/// frameless, one press reverts with the frame and bounds back.
+#[test]
+fn full_screen_toggles_the_explorer_window() {
+    use tv::Fullscreen;
+    let (mut w, _core, _rx) = window();
+    let orig = w.win.state().get_bounds();
+    let mut consumed = false;
+    crate::testutil::with_ctx(|ctx| {
+        ctx.set_owner_size(tv::Point::new(80, 25));
+        let mut ev = Event::Command(crate::app::CMD_FULLSCREEN);
+        w.handle_event(&mut ev, ctx);
+        consumed = ev.is_nothing();
+    });
+    assert!(consumed, "ExplorerWindow consumes CMD_FULLSCREEN");
+    assert_eq!(w.win.fullscreen(), Fullscreen::Desktop, "enters Desktop");
+    assert!(!w.win.bordered(), "frameless");
+    assert_eq!(
+        w.win.state().get_bounds(),
+        Rect::new(0, 0, 80, 25),
+        "fills the owner"
+    );
+
+    crate::testutil::with_ctx(|ctx| {
+        ctx.set_owner_size(tv::Point::new(80, 25));
+        let mut ev = Event::Command(crate::app::CMD_FULLSCREEN);
+        w.handle_event(&mut ev, ctx);
+    });
+    assert_eq!(w.win.fullscreen(), Fullscreen::Off, "one press reverts");
+    assert!(w.win.bordered(), "frame back");
+    assert_eq!(w.win.state().get_bounds(), orig, "bounds restored");
+}

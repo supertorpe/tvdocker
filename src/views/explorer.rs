@@ -898,13 +898,19 @@ impl View for ExplorerWindow {
             }
         }
         self.redraw_texts(ctx);
-        self.win.handle_event(ev, ctx);
+        // Windows ▸ Full screen: this window owns the inner `win` directly,
+        // so the toggle happens here (before anything else sees the event).
+        let full = crate::app::take_fullscreen(ev, &mut self.win, ctx);
+        if !full {
+            self.win.handle_event(ev, ctx);
+        }
         // Zoom / fullscreen re-bound the inner window's group directly
         // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
         // reaches this window's `change_bounds`; reconcile so the panels and
         // their breadcrumb/filter/hint children follow the new client area (and
-        // the tables re-publish their scroll bars).
-        if self.win.state().size != before {
+        // the tables re-publish their scroll bars). The toggle runs the
+        // reconcile even when only the BORDER flipped (size unchanged).
+        if full || self.win.state().size != before {
             self.reapply_layout();
             self.win.on_bounds_changed(ctx);
         }

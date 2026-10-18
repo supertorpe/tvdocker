@@ -311,6 +311,154 @@ mod tests {
         assert_eq!(got, want.status, "status row tracks the shrink");
     }
 
+    /// Drive `CMD_FULLSCREEN` through a wrapper's real `handle_event` with a
+    /// desktop-sized owner (the pump sets this via the desktop group's phase
+    /// bracket). Returns whether the wrapper consumed the event.
+    fn press_fullscreen(w: &mut dyn View) -> bool {
+        let mut consumed = false;
+        crate::testutil::with_ctx(|ctx| {
+            ctx.set_owner_size(Point::new(80, 25));
+            let mut ev = tv::event::Event::Command(crate::app::CMD_FULLSCREEN);
+            w.handle_event(&mut ev, ctx);
+            consumed = ev.is_nothing();
+        });
+        consumed
+    }
+
+    /// The full-screen toggle reaches the inner window through PaneWindow:
+    /// enter Desktop frameless, revert to Off with the frame and the
+    /// pre-fullscreen bounds back — and the pane children follow both ways.
+    #[test]
+    fn full_screen_toggles_the_pane_window_and_children_follow() {
+        use tv::Fullscreen;
+        let orig = Rect::new(2, 1, 78, 23);
+        let (win, ids) = build_pane_window(orig, "probe", 1, dummy(), dummy(), |rect, _bar| {
+            let mut d = dummy();
+            d.state_mut().set_bounds(rect);
+            d
+        });
+        let mut pane = PaneWindow { window: win, ids };
+        let body = pane.ids.body;
+
+        assert!(
+            press_fullscreen(&mut pane),
+            "PaneWindow consumes CMD_FULLSCREEN"
+        );
+        assert_eq!(
+            pane.window_mut().fullscreen(),
+            Fullscreen::Desktop,
+            "first press enters Desktop"
+        );
+        assert_eq!(
+            pane.state().get_bounds(),
+            Rect::new(0, 0, 80, 25),
+            "the window fills its owner"
+        );
+        assert!(!pane.window_mut().bordered(), "and drops the frame");
+        let want = pane_rects(pane.state().size);
+        assert_eq!(
+            pane.window_mut().child_mut(body).unwrap().state().get_bounds(),
+            want.body,
+            "pane children re-lay out to the fullscreen size"
+        );
+
+        assert!(
+            press_fullscreen(&mut pane),
+            "the second press is consumed too"
+        );
+        assert_eq!(
+            pane.window_mut().fullscreen(),
+            Fullscreen::Off,
+            "one press reverts (no Screen hop)"
+        );
+        assert!(pane.window_mut().bordered(), "the frame comes back");
+        assert_eq!(
+            pane.state().get_bounds(),
+            orig,
+            "the pre-fullscreen bounds are restored"
+        );
+        let want = pane_rects(pane.state().size);
+        assert_eq!(
+            pane.window_mut().child_mut(body).unwrap().state().get_bounds(),
+            want.body,
+            "children relayout back to the framed client"
+        );
+    }
+
+    /// The same toggle through CompactWindow (the Diagnostics shell window).
+    #[test]
+    fn full_screen_toggles_the_compact_window() {
+        use tv::Fullscreen;
+        let orig = Rect::new(2, 1, 78, 23);
+        let (win, ids) =
+            build_compact_window(orig, "diag", 1, dummy(), |rect| {
+                let mut d = dummy();
+                d.state_mut().set_bounds(rect);
+                d
+            });
+        let mut cw = CompactWindow { window: win, ids };
+
+        assert!(press_fullscreen(&mut cw), "CompactWindow consumes it");
+        assert_eq!(cw.window_mut().fullscreen(), Fullscreen::Desktop);
+        assert!(!cw.window_mut().bordered());
+        assert_eq!(cw.state().get_bounds(), Rect::new(0, 0, 80, 25));
+
+        assert!(press_fullscreen(&mut cw));
+        assert_eq!(cw.window_mut().fullscreen(), Fullscreen::Off);
+        assert!(cw.window_mut().bordered());
+        assert_eq!(cw.state().get_bounds(), orig, "bounds restored");
+    }
+
+    /// The same toggle through ScrollWindow (the Details document window).
+    #[test]
+    fn full_screen_toggles_the_scroll_window() {
+        use tv::Fullscreen;
+        let orig = Rect::new(2, 1, 78, 23);
+        let (win, ids) =
+            build_scroll_window(orig, "details", 7, |rect, _bar| {
+                let mut d = dummy();
+                d.state_mut().set_bounds(rect);
+                d
+            });
+        let mut sw = ScrollWindow { window: win, ids };
+
+        assert!(press_fullscreen(&mut sw), "ScrollWindow consumes it");
+        assert_eq!(sw.window_mut().fullscreen(), Fullscreen::Desktop);
+        assert_eq!(sw.state().get_bounds(), Rect::new(0, 0, 80, 25));
+
+        assert!(press_fullscreen(&mut sw));
+        assert_eq!(sw.window_mut().fullscreen(), Fullscreen::Off);
+        assert_eq!(sw.state().get_bounds(), orig, "bounds restored");
+    }
+
+    /// The same toggle through ScrollStatusWindow (the shell window, which the
+    /// desktop inserts directly — no outer wrapper).
+    #[test]
+    fn full_screen_toggles_the_scroll_status_window() {
+        use tv::Fullscreen;
+        let orig = Rect::new(2, 1, 78, 23);
+        let (win, ids) = build_scroll_status_window(
+            orig,
+            "shell",
+            9,
+            dummy(),
+            |rect, _bar| {
+                let mut d = dummy();
+                d.state_mut().set_bounds(rect);
+                d
+            },
+        );
+        let mut sw = ScrollStatusWindow { window: win, ids };
+
+        assert!(press_fullscreen(&mut sw), "ScrollStatusWindow consumes it");
+        assert_eq!(sw.window_mut().fullscreen(), Fullscreen::Desktop);
+        assert_eq!(sw.state().get_bounds(), Rect::new(0, 0, 80, 25));
+
+        assert!(press_fullscreen(&mut sw));
+        assert_eq!(sw.window_mut().fullscreen(), Fullscreen::Off);
+        assert_eq!(sw.state().get_bounds(), orig, "bounds restored");
+    }
+
     #[test]
     fn pane_scroll_bar_is_not_selectable_so_tab_skips_it() {
         // Tab cycles filter ↔ table; the bar must not stop the trip.
@@ -570,12 +718,20 @@ impl View for PaneWindow {
 
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
         let before = self.window.state().size;
-        self.window.handle_event(ev, ctx);
+        // Windows ▸ Full screen: toggle HERE — this wrapper owns the inner
+        // window, so the command never reaches (or is swallowed by) children.
+        let full = crate::app::take_fullscreen(ev, &mut self.window, ctx);
+        if !full {
+            self.window.handle_event(ev, ctx);
+        }
         // Zoom / fullscreen re-bound the inner window's group directly
         // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
         // reaches this wrapper's `change_bounds`; reconcile so the pane children
-        // (and their scroll bars) follow the new client area.
-        if self.window.state().size != before {
+        // (and their scroll bars) follow the new client area. The toggle also
+        // runs the reconcile when only the BORDER flipped (size unchanged):
+        // `set_bordered`'s grow-mode reflow would otherwise leave the children
+        // where the frame used to be.
+        if full || self.window.state().size != before {
             apply_pane_layout(&mut self.window, &self.ids);
             self.window.on_bounds_changed(ctx);
         }
@@ -703,12 +859,16 @@ impl View for CompactWindow {
 
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
         let before = self.window.state().size;
-        self.window.handle_event(ev, ctx);
+        // Windows ▸ Full screen: this wrapper owns the inner window.
+        let full = crate::app::take_fullscreen(ev, &mut self.window, ctx);
+        if !full {
+            self.window.handle_event(ev, ctx);
+        }
         // Zoom / fullscreen re-bound the inner window's group directly
         // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
         // reaches this wrapper's `change_bounds`; reconcile so the compact
-        // children follow the new client area.
-        if self.window.state().size != before {
+        // children follow the new client area (also after a border-only flip).
+        if full || self.window.state().size != before {
             apply_compact_layout(&mut self.window, &self.ids);
             self.window.on_bounds_changed(ctx);
         }
@@ -831,12 +991,16 @@ impl View for ScrollWindow {
 
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
         let before = self.window.state().size;
-        self.window.handle_event(ev, ctx);
+        // Windows ▸ Full screen: this wrapper owns the inner window.
+        let full = crate::app::take_fullscreen(ev, &mut self.window, ctx);
+        if !full {
+            self.window.handle_event(ev, ctx);
+        }
         // Zoom / fullscreen re-bound the inner window's group directly
         // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
         // reaches this wrapper's `change_bounds`; reconcile so the body/bar
-        // follow the new client area.
-        if self.window.state().size != before {
+        // follow the new client area (also after a border-only flip).
+        if full || self.window.state().size != before {
             apply_scroll_layout(&mut self.window, &self.ids);
             self.window.on_bounds_changed(ctx);
         }
@@ -959,12 +1123,16 @@ impl View for ScrollStatusWindow {
 
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut tv::Context) {
         let before = self.window.state().size;
-        self.window.handle_event(ev, ctx);
+        // Windows ▸ Full screen: this wrapper owns the inner window.
+        let full = crate::app::take_fullscreen(ev, &mut self.window, ctx);
+        if !full {
+            self.window.handle_event(ev, ctx);
+        }
         // Zoom / fullscreen re-bound the inner window's group directly
         // (`Window::maximize` -> `locate` -> `group.change_bounds`), which never
         // reaches this wrapper's `change_bounds`; reconcile so the status/body/
-        // bar follow the new client area.
-        if self.window.state().size != before {
+        // bar follow the new client area (also after a border-only flip).
+        if full || self.window.state().size != before {
             apply_scroll_status_layout(&mut self.window, &self.ids);
             self.window.on_bounds_changed(ctx);
         }

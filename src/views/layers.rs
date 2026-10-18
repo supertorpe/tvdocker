@@ -1031,7 +1031,11 @@ impl View for LayersWindow {
         let before = self.win.state().size;
         self.window_keys(ev, ctx);
         self.sync_from_core();
-        self.win.handle_event(ev, ctx);
+        // Windows ▸ Full screen: this window owns the inner `win` directly.
+        let full = crate::app::take_fullscreen(ev, &mut self.win, ctx);
+        if !full {
+            self.win.handle_event(ev, ctx);
+        }
         // The layer table's cursor owns `selected` (arrow keys and clicks
         // both land here through the delegation above), keyed by row id so
         // sorting and the layer filter don't shift it. Bounded by the
@@ -1048,7 +1052,8 @@ impl View for LayersWindow {
         // Zoom / fullscreen re-bound the inner window's group directly,
         // bypassing this window's `change_bounds` (the Explorer's
         // reconcile): keep the child rects following the new client area.
-        if self.win.state().size != before {
+        // The full-screen toggle also runs it when only the BORDER flipped.
+        if full || self.win.state().size != before {
             self.reapply_layout();
             self.win.on_bounds_changed(ctx);
             self.dirty = true; // the layout changed: re-push the models

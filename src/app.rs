@@ -15,6 +15,43 @@ use crate::core::{ActionReq, AppCore, AppMsg, TaskReq};
 use crate::domain;
 use crate::domain::config::Keybindings;
 
+/// Windows ▸ Full screen: toggle the focused window between
+/// frameless fullscreen (`Fullscreen::Desktop`, entered) and its normal
+/// framed state (reverted). The window wrapper reads its own
+/// `Window::fullscreen()` and jumps straight to the target, so one
+/// press reverts from either fullscreen mode — no `Off → Desktop →
+/// Screen` cycling.
+pub const CMD_FULLSCREEN: Command = Command::custom("tvdocker.fullscreen");
+
+/// Windows ▸ Full screen's handler: if `ev` is [`CMD_FULLSCREEN`], jump the
+/// window between fullscreen modes — from `Fullscreen::Off` enter
+/// [`Fullscreen::Desktop`] (frameless, filling the desktop); from *either*
+/// fullscreen mode revert straight to `Off` (frame back, pre-fullscreen
+/// bounds restored) — one press either way, never the library's
+/// `Off → Desktop → Screen` cycle. Consumes the event and returns `true`;
+/// foreign events pass through untouched.
+///
+/// Called by each window wrapper in its own `handle_event` (the seam that
+/// already owns the inner [`tv::Window`]), so the toggle applies to the
+/// focused window and the wrappers' size-reconcile still runs afterwards.
+pub fn take_fullscreen(ev: &mut tv::event::Event, win: &mut tv::Window, ctx: &mut tv::Context) -> bool {
+    use tv::Fullscreen;
+    if let tv::event::Event::Command(c) = ev
+        && *c == CMD_FULLSCREEN
+    {
+        let target = if win.fullscreen() == Fullscreen::Off {
+            Fullscreen::Desktop
+        } else {
+            Fullscreen::Off
+        };
+        win.set_fullscreen(target, ctx);
+        ev.clear();
+        true
+    } else {
+        false
+    }
+}
+
 /// Help → Shortcuts (F1): opens the shortcuts box (`SHORTCUTS_TEXT`).
 pub const CMD_HELP: Command = Command::custom("tvdocker.help");
 /// Help → About.
@@ -446,11 +483,18 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
 }
 
 /// Menu bar : File / Docker / Windows / Options / Help — no disabled
-/// stubs.
+/// stubs. The tree itself lives in [`app_menu`] so tests can inspect
+/// items without a live `MenuBar` (tvision keeps `MenuBar::menu()`
+/// behind its own `cfg(test)`).
 pub fn init_menu_bar(r: Rect) -> Option<Box<dyn View>> {
     let mut r = r;
     r.b.y = r.a.y + 1;
-    let menu = Menu::builder()
+    Some(Box::new(MenuBar::new(r, app_menu())))
+}
+
+/// The full menu tree for [`init_menu_bar`].
+pub fn app_menu() -> Menu {
+    Menu::builder()
         .submenu("~F~ile", alt('f'), |m| {
             m.command_key("~E~xit", Command::QUIT, alt('x'), "Alt-X")
         })
@@ -465,6 +509,7 @@ pub fn init_menu_bar(r: Rect) -> Option<Box<dyn View>> {
         .submenu("~W~indows", alt('w'), |m| {
             m.command("~S~ize/Move", Command::RESIZE)
                 .command("~Z~oom", Command::ZOOM)
+                .command("~F~ull screen", CMD_FULLSCREEN)
                 .command("~T~ile", Command::TILE)
                 .command("~C~ascade", Command::CASCADE)
                 .command("~N~ext", Command::NEXT)
@@ -483,8 +528,7 @@ pub fn init_menu_bar(r: Rect) -> Option<Box<dyn View>> {
                 .command("~C~heck for updates…", CMD_CHECK_UPDATES)
                 .command("~A~bout", CMD_ABOUT)
         })
-        .build();
-    Some(Box::new(MenuBar::new(r, menu)))
+        .build()
 }
 
 /// Options ▸ Themes… : run the picker modally, then — only on OK — install
@@ -867,6 +911,123 @@ mod tests {
     use super::*;
     use tv::Event;
     use tv::HelpCtx;
+
+    /// Windows ▸ Full screen exists, is bound to `CMD_FULLSCREEN`, and sits
+    /// with the other window-state commands (right after Zoom).
+    #[test]
+    fn windows_menu_has_a_full_screen_item() {
+        use tv::menu::MenuItem;
+        let menu = app_menu();
+        let windows = menu
+            .items
+            .iter()
+            .find_map(|it| match it {
+                MenuItem::SubMenu { name, menu, .. } if name.contains("indows") => Some(menu),
+                _ => None,
+            })
+            .expect("Windows submenu");
+        let items: Vec<(String, Command)> = windows
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                MenuItem::Command { name, command, .. } => Some((name.clone(), *command)),
+                _ => None,
+            })
+            .collect();
+        let pos = items
+            .iter()
+            .position(|(_, c)| *c == CMD_FULLSCREEN)
+            .unwrap_or_else(|| panic!("Full screen item bound to CMD_FULLSCREEN: {items:?}"));
+        assert!(
+            items[pos].0.contains("ull screen"),
+            "the item reads Full screen: {:?}",
+            items[pos].0
+        );
+        let zoom = items
+            .iter()
+            .position(|(_, c)| *c == Command::ZOOM)
+            .expect("Zoom is in the Windows submenu");
+        assert!(
+            pos > zoom,
+            "Full screen groups with the window-state commands after Zoom: {items:?}"
+        );
+    }
+
+    /// `take_fullscreen` is the single toggle seam: from `Off` it enters
+    /// `Desktop` (frameless, fills the desktop); from *either* fullscreen
+    /// mode it reverts to `Off` in one press — restoring the framed window
+    /// and its pre-fullscreen bounds. Foreign events pass through untouched.
+    #[test]
+    fn take_fullscreen_enters_desktop_and_reverts_in_one_press() {
+        use tv::{Event, Fullscreen, Point};
+        let orig = Rect::new(5, 3, 45, 18);
+        crate::testutil::with_ctx(|ctx| {
+            ctx.set_owner_size(Point::new(80, 25));
+            let mut win = tv::Window::new(orig, Some("probe".into()), 1);
+            let mut ev = Event::Command(CMD_FULLSCREEN);
+            assert!(
+                take_fullscreen(&mut ev, &mut win, ctx),
+                "the command is consumed"
+            );
+            assert!(ev.is_nothing(), "and the event is cleared");
+            assert_eq!(
+                win.fullscreen(),
+                Fullscreen::Desktop,
+                "first press enters Desktop"
+            );
+            assert!(!win.bordered(), "fullscreen hides the frame");
+
+            // Second press reverts straight to Off (not Screen).
+            let mut ev = Event::Command(CMD_FULLSCREEN);
+            assert!(take_fullscreen(&mut ev, &mut win, ctx));
+            assert_eq!(win.fullscreen(), Fullscreen::Off, "one press reverts");
+            assert!(win.bordered(), "the frame comes back");
+            assert_eq!(
+                win.state().get_bounds(),
+                orig,
+                "the pre-fullscreen bounds are restored"
+            );
+        });
+    }
+
+    /// Even a window parked in `Screen` (nothing in tvdocker enters it, but
+    /// the toggle must not depend on that) reverts to `Off`.
+    #[test]
+    fn take_fullscreen_reverts_screen_mode_too() {
+        use tv::{Event, Fullscreen, Point};
+        crate::testutil::with_ctx(|ctx| {
+            ctx.set_owner_size(Point::new(80, 25));
+            let mut win = tv::Window::new(Rect::new(0, 0, 40, 12), Some("probe".into()), 1);
+            win.set_fullscreen(Fullscreen::Screen, ctx);
+            assert_eq!(win.fullscreen(), Fullscreen::Screen);
+            let mut ev = Event::Command(CMD_FULLSCREEN);
+            assert!(take_fullscreen(&mut ev, &mut win, ctx));
+            assert_eq!(win.fullscreen(), Fullscreen::Off);
+            assert!(win.bordered());
+        });
+    }
+
+    /// A foreign event is not consumed and changes nothing.
+    #[test]
+    fn take_fullscreen_ignores_foreign_events() {
+        use tv::{Event, Key, KeyEvent, Point};
+        crate::testutil::with_ctx(|ctx| {
+            ctx.set_owner_size(Point::new(80, 25));
+            let mut win = tv::Window::new(Rect::new(5, 3, 45, 18), Some("probe".into()), 1);
+            let mut ev = Event::Command(Command::ZOOM);
+            assert!(
+                !take_fullscreen(&mut ev, &mut win, ctx),
+                "another command passes through"
+            );
+            assert!(
+                matches!(&ev, Event::Command(c) if *c == Command::ZOOM),
+                "the event is untouched"
+            );
+            let mut ev = Event::KeyDown(KeyEvent::from(Key::F(5)));
+            assert!(!take_fullscreen(&mut ev, &mut win, ctx));
+            assert!(matches!(&ev, Event::KeyDown(_)), "keys pass through too");
+        });
+    }
 
     #[test]
     fn about_names_the_running_version() {

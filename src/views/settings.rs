@@ -199,7 +199,12 @@ impl View for SettingsWindow {
                 *self.open.borrow_mut() = false;
             }
         }
-        self.win.handle_event(ev, ctx);
+        // Windows ▸ Full screen: Settings owns the EditWindow-hosted inner
+        // window (`EditWindow.window`); its children are grow-mode tracked, so
+        // — like ZOOM today — no wrapper reconcile is needed here.
+        if !crate::app::take_fullscreen(ev, &mut self.win.window, ctx) {
+            self.win.handle_event(ev, ctx);
+        }
     }
 
     fn set_modal_answer(&mut self, cmd: Command) {
@@ -409,6 +414,48 @@ mod tests {
         assert!(
             core.borrow().last_error.is_none(),
             "these are notes, not failures"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Windows ▸ Full screen reaches the Settings window's EditWindow-hosted
+    /// inner window: enter Desktop, one press reverts with frame and bounds.
+    #[test]
+    fn full_screen_toggles_the_settings_window() {
+        use tv::Fullscreen;
+        let (dir, path) = scratch("fullscreen");
+        let (mut w, _core, _open) = window(path);
+        let orig = w.win.window.state().get_bounds();
+        let mut consumed = false;
+        crate::testutil::with_ctx(|ctx| {
+            ctx.set_owner_size(tv::Point::new(80, 25));
+            let mut ev = Event::Command(crate::app::CMD_FULLSCREEN);
+            w.handle_event(&mut ev, ctx);
+            consumed = ev.is_nothing();
+        });
+        assert!(consumed, "SettingsWindow consumes CMD_FULLSCREEN");
+        assert_eq!(
+            w.win.window.fullscreen(),
+            Fullscreen::Desktop,
+            "enters Desktop"
+        );
+        assert!(!w.win.window.bordered(), "frameless");
+
+        crate::testutil::with_ctx(|ctx| {
+            ctx.set_owner_size(tv::Point::new(80, 25));
+            let mut ev = Event::Command(crate::app::CMD_FULLSCREEN);
+            w.handle_event(&mut ev, ctx);
+        });
+        assert_eq!(
+            w.win.window.fullscreen(),
+            Fullscreen::Off,
+            "one press reverts"
+        );
+        assert!(w.win.window.bordered(), "frame back");
+        assert_eq!(
+            w.win.window.state().get_bounds(),
+            orig,
+            "bounds restored"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

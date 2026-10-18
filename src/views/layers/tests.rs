@@ -882,3 +882,32 @@ fn the_summary_line_names_the_selected_layer_and_keeps_a_decimal() {
         "no round-up to 100: {summary:?}"
     );
 }
+
+/// Windows ▸ Full screen reaches LayersWindow's inner window: enter Desktop,
+/// one press reverts with frame and bounds back.
+#[test]
+fn full_screen_toggles_the_layers_window() {
+    use tv::Fullscreen;
+    let mut w = window_with(analysis());
+    let orig = w.win.state().get_bounds();
+    let mut consumed = false;
+    crate::testutil::with_ctx(|ctx| {
+        ctx.set_owner_size(tv::Point::new(80, 25));
+        let mut ev = tv::event::Event::Command(crate::app::CMD_FULLSCREEN);
+        w.handle_event(&mut ev, ctx);
+        consumed = ev.is_nothing();
+    });
+    assert!(consumed, "LayersWindow consumes CMD_FULLSCREEN");
+    assert_eq!(w.win.fullscreen(), Fullscreen::Desktop, "enters Desktop");
+    assert!(!w.win.bordered(), "frameless");
+    assert_eq!(w.win.state().get_bounds(), tv::Rect::new(0, 0, 80, 25));
+
+    crate::testutil::with_ctx(|ctx| {
+        ctx.set_owner_size(tv::Point::new(80, 25));
+        let mut ev = tv::event::Event::Command(crate::app::CMD_FULLSCREEN);
+        w.handle_event(&mut ev, ctx);
+    });
+    assert_eq!(w.win.fullscreen(), Fullscreen::Off, "one press reverts");
+    assert!(w.win.bordered(), "frame back");
+    assert_eq!(w.win.state().get_bounds(), orig, "bounds restored");
+}
