@@ -22,6 +22,13 @@ pub struct Column {
     pub label: String,
     pub width: i32,
     pub align: Align,
+    /// Stretch weight (0 = fixed): spare cells go to the flex columns by
+    /// weight, so a column can claim "whatever is left" without knowing the
+    /// pane width up front (upstream `ColumnSpec::flex`).
+    pub flex: u16,
+    /// The narrowest the layout may shrink this column to (upstream
+    /// `ColumnSpec::min_width`, at least 1).
+    pub min_width: i32,
 }
 
 impl Column {
@@ -31,14 +38,38 @@ impl Column {
             label: label.into(),
             width,
             align,
+            flex: 0,
+            min_width: 1,
         }
+    }
+
+    /// Builder: let this column stretch into spare width with `weight`
+    /// (0 = fixed). Combined with [`min_width`](Self::min_width) the column
+    /// fills the pane but never drops below the floor — a narrower pane
+    /// overflows and scrolls instead of squeezing it.
+    pub fn flex(mut self, weight: u16) -> Self {
+        self.flex = weight;
+        self
+    }
+
+    /// Builder: the narrowest the layout may shrink this column to.
+    pub fn min_width(mut self, min_width: i32) -> Self {
+        self.min_width = min_width;
+        self
     }
 }
 
 /// Translate a tvdocker [`Column`] into an upstream [`ColumnSpec`]: the label
-/// and preferred width always, right-aligned when the column asks for it.
+/// and preferred width always, right-aligned when the column asks for it,
+/// carrying the stretch weight and the width floor when it has them.
 pub fn to_spec(col: &Column) -> ColumnSpec {
-    let spec = ColumnSpec::new(col.label.clone(), col.width);
+    let mut spec = ColumnSpec::new(col.label.clone(), col.width);
+    if col.flex > 0 {
+        spec = spec.flex(col.flex);
+    }
+    if col.min_width > 1 {
+        spec = spec.min_width(col.min_width);
+    }
     match col.align {
         Align::Left => spec,
         Align::Right => spec.right(),
@@ -217,5 +248,23 @@ mod tests {
     fn to_spec_maps_right_alignment() {
         let spec = to_spec(&Column::new("SIZE", 8, Align::Right));
         assert_eq!(spec.align, tv::widgets::table::Align::Right);
+    }
+
+    #[test]
+    fn to_spec_defaults_to_a_fixed_column() {
+        let spec = to_spec(&Column::new("CMP", 3, Align::Left));
+        assert_eq!(spec.flex, 0, "no stretch unless asked");
+        assert_eq!(spec.min_width, 1, "the upstream shrink floor");
+    }
+
+    #[test]
+    fn to_spec_carries_the_flex_weight_and_the_width_floor() {
+        // The COMMAND column fills whatever the pane leaves: flex gives it
+        // the spare cells, min_width keeps the "never below 12 cells" rule
+        // (a narrower pane overflows and scrolls instead of squeezing it).
+        let spec = to_spec(&Column::new("COMMAND", 0, Align::Left).flex(1).min_width(12));
+        assert_eq!(spec.flex, 1, "the column stretches into spare cells");
+        assert_eq!(spec.min_width, 12, "the readability floor travels too");
+        assert_eq!(spec.width, 0, "start from scratch, then stretch");
     }
 }

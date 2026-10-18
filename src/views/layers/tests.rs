@@ -668,9 +668,71 @@ fn the_path_filter_bar_narrows_the_tree_as_you_type() {
     assert!(win.visible_rows().iter().any(|r| r.path == "/etc/hosts"));
 }
 
-/// A child's current bounds (the bars' placement assertions).
-fn child_bounds(win: &mut LayersWindow, id: tv::ViewId) -> Rect {
-    win.win.child_mut(id).unwrap().state().get_bounds()
+/// Tab follows the Explorer's Ruling 3: exactly two stops — the focus
+/// toggles between the two tables — and a focused filter escapes back to
+/// ITS OWN table instead of crossing panes.
+#[test]
+fn tab_toggles_between_the_two_tables_and_lets_a_filter_escape() {
+    let mut win = window_with(analysis());
+    crate::testutil::with_ctx(|ctx| {
+        win.win.state_mut().state.focused = true;
+        win.win.focus_descendant(win.layer_table, ctx);
+    });
+    crate::testutil::send_key(&mut win, Key::Tab);
+    assert!(
+        win.is_focused(win.tree_table),
+        "Tab crosses to the tree table"
+    );
+    crate::testutil::send_key(&mut win, Key::Tab);
+    assert!(win.is_focused(win.layer_table), "…and back again");
+    // A focused filter escapes to its OWN pane's table (the Explorer rule).
+    crate::testutil::with_ctx(|ctx| {
+        win.win.focus_descendant(win.tree_filter, ctx);
+    });
+    crate::testutil::send_key(&mut win, Key::Tab);
+    assert!(
+        win.is_focused(win.tree_table),
+        "the path bar's Tab lands on the tree table"
+    );
+    crate::testutil::with_ctx(|ctx| {
+        win.win.focus_descendant(win.layer_filter, ctx);
+    });
+    crate::testutil::send_key(&mut win, Key::Tab);
+    assert!(
+        win.is_focused(win.layer_table),
+        "the layer bar's Tab lands on the layer table"
+    );
+}
+
+/// The layer area and the tree area are separated by a tvision-rs
+/// `Splitter`: a vertical divider runs at x=32 for an 80×24 window — the
+/// old layout's blank gap column — for every row of the middle region
+/// (summary row and inefficient strip excluded).
+#[test]
+fn a_divider_separates_the_layer_and_tree_areas() {
+    let mut win = window_with(analysis());
+    let screen = testutil::render_view(80, 24, &mut win);
+    let text = testutil::text(&screen);
+    let lines: Vec<&str> = text.lines().collect();
+    let cell = |line: &str, x: usize| line.chars().nth(x);
+    for (y, line) in lines.iter().enumerate().take(20).skip(2) {
+        assert_eq!(cell(line, 32), Some('│'), "the divider at x=32 on row {y}");
+    }
+    assert_ne!(
+        cell(lines[20], 32),
+        Some('│'),
+        "the divider stops above the inefficient strip"
+    );
+}
+
+/// A descendant's bounds in WINDOW coordinates: the tables, bars and
+/// filters now live inside the splitter's panes, so the lookup walks the
+/// tree accumulating origins (direct children pass their own origin).
+fn child_bounds(win: &LayersWindow, id: tv::ViewId) -> Rect {
+    let origin = win.win.state().get_bounds().a;
+    win.win
+        .descendant_global_bounds(id, origin)
+        .expect("descendant exists")
 }
 
 /// `redraw` with a Context that KEEPS its deferred queue, so a test can
@@ -687,23 +749,39 @@ fn redraw_capturing_deferred(win: &mut LayersWindow) -> Vec<tv::Deferred> {
 }
 
 /// The two tables give their right-most client column to a vertical scroll
-/// bar (the `widgets::scroll_rects` body+bar convention): the bar is one
-/// column wide and starts exactly where its table's body ends.
+/// bar (the `widgets::scroll_rects` body+bar convention, pane-local): the
+/// bar is one column wide and starts exactly where its table's body ends.
+/// At 80×24 the splitter grants the left pane 31 cells (77 of content at
+/// 40/60, largest-remainder), so the divider sits at x=32 and the layer
+/// bar one column right of the old gap.
 #[test]
 fn layer_and_tree_tables_each_reserve_a_scroll_bar_column() {
-    let r = layers_rects(tv::Point::new(80, 24));
-    assert_eq!(r.layer_table, Rect::new(1, 3, 30, 20));
-    assert_eq!(r.layer_bar, Rect::new(30, 3, 31, 20));
-    assert_eq!(r.tree_table, Rect::new(33, 3, 78, 20));
-    assert_eq!(r.tree_bar, Rect::new(78, 3, 79, 20));
+    let win = window_with(analysis());
+    let (table, bar) = (win.layer_table, win.layer_bar);
+    let (tree_table, tree_bar) = (win.tree_table, win.tree_bar);
+    let table = child_bounds(&win, table);
+    let bar = child_bounds(&win, bar);
+    let tree_table = child_bounds(&win, tree_table);
+    let tree_bar = child_bounds(&win, tree_bar);
+    assert_eq!(table.b.x, bar.a.x, "the layer bar abuts its table");
+    assert_eq!(tree_table.b.x, tree_bar.a.x, "the tree bar abuts its table");
+    assert_eq!(bar.b.x - bar.a.x, 1, "one column per bar");
+    assert_eq!(tree_bar.b.x - tree_bar.a.x, 1, "one column per bar");
+    assert_eq!(table, Rect::new(1, 3, 31, 20));
+    assert_eq!(bar, Rect::new(31, 3, 32, 20));
+    assert_eq!(tree_table, Rect::new(33, 3, 78, 20));
+    assert_eq!(tree_bar, Rect::new(78, 3, 79, 20));
 }
 
-/// Degenerate widths must never produce an inverted bar rect.
+/// Degenerate widths must never produce an inverted bar rect — through the
+/// whole chain: window → splitter → pane → bar.
 #[test]
 fn the_scroll_bar_rects_stay_ordered_at_degenerate_sizes() {
     for w in 1..8 {
-        let r = layers_rects(tv::Point::new(w, 4));
-        for bar in [r.layer_bar, r.tree_bar] {
+        let mut win = window_with(analysis());
+        win.change_bounds(Rect::new(0, 0, w, 4));
+        for id in [win.layer_bar, win.tree_bar] {
+            let bar = child_bounds(&win, id);
             assert!(bar.a.x <= bar.b.x && bar.a.y <= bar.b.y, "w={w}: {bar:?}");
         }
     }
@@ -715,12 +793,11 @@ fn the_scroll_bar_rects_stay_ordered_at_degenerate_sizes() {
 fn both_tables_get_a_vertical_scroll_bar_that_tab_skips() {
     let mut win = window_with(analysis());
     let (layer_bar, tree_bar) = (win.layer_bar, win.tree_bar);
-    let r = layers_rects(win.win.state().size);
-    assert_eq!(child_bounds(&mut win, layer_bar), r.layer_bar);
-    assert_eq!(child_bounds(&mut win, tree_bar), r.tree_bar);
+    assert_eq!(child_bounds(&win, layer_bar), Rect::new(31, 3, 32, 20));
+    assert_eq!(child_bounds(&win, tree_bar), Rect::new(78, 3, 79, 20));
     for id in [layer_bar, tree_bar] {
         assert!(
-            !win.win.child_mut(id).unwrap().state().options.selectable,
+            !win.win.find_mut(id).unwrap().state().options.selectable,
             "the bar participates in neither Tab order nor focus"
         );
     }
@@ -750,15 +827,22 @@ fn each_table_publishes_its_row_range_to_its_bar() {
     assert_eq!(bar_max(win.tree_bar), Some(tree_rows - 1));
 }
 
-/// Zoom / resize re-derives the bars' rects with the tables'.
+/// Zoom / resize re-derives the panes' rects with the window's, and the
+/// bars follow their tables through the whole chain.
 #[test]
 fn the_bars_follow_the_tables_through_a_resize() {
     let mut win = window_with(analysis());
-    win.change_bounds(Rect::new(0, 0, 60, 20));
     let (layer_bar, tree_bar) = (win.layer_bar, win.tree_bar);
-    let r = layers_rects(win.win.state().size);
-    assert_eq!(child_bounds(&mut win, layer_bar), r.layer_bar);
-    assert_eq!(child_bounds(&mut win, tree_bar), r.tree_bar);
+    let before = child_bounds(&win, layer_bar);
+    win.change_bounds(Rect::new(0, 0, 60, 20));
+    let bar = child_bounds(&win, layer_bar);
+    let tree = child_bounds(&win, tree_bar);
+    let table = child_bounds(&win, win.layer_table);
+    assert_ne!(bar, before, "the bar moved with the resize");
+    assert_eq!(table.b.x, bar.a.x, "…and still abuts its table");
+    assert_eq!(bar.b.x - bar.a.x, 1, "…one column wide");
+    // The tree side ends where the client does (right = 60-1).
+    assert_eq!(tree.b.x, 59, "the tree bar hugs the window's right edge");
 }
 
 /// The bars are VISIBLE: each table's right-most column renders the
@@ -778,10 +862,12 @@ fn the_scroll_bars_render_in_the_tables_right_most_columns() {
     };
     let cell = |line: &str, x: usize| line.chars().nth(x);
     // The bar column of each table (window coords == screen coords here).
+    // The divider occupies x=32, so the layer bar sits at x=31 — one
+    // column right of the old blank gap — while the tree bar keeps x=78.
     let header = row_containing("CMP");
     let body = row_containing("FROM");
     let foot = row_containing("▼");
-    for (x, name) in [(30, "layer"), (78, "tree")] {
+    for (x, name) in [(31, "layer"), (78, "tree")] {
         assert_eq!(cell(header, x), Some('▲'), "{name} bar's up arrow");
         assert_eq!(cell(body, x), Some('▓'), "{name} bar's thumb");
         assert_eq!(cell(foot, x), Some('▼'), "{name} bar's down arrow");
@@ -830,9 +916,12 @@ fn tree_rows_render_connectors_symlink_targets_permissions_and_ids() {
     assert_eq!(cell("/bin", 4), "", "a synthesised dir carries no mode");
 }
 
-/// The attribute columns only appear when the pane is wide enough for
-/// them (dive drops the attributes in a constrained layout): PATH keeps
-/// the leftover, and each attribute column claims a fixed slice of it.
+/// The PATH column takes whatever the fixed columns leave, and does it by
+/// STRETCHING: flex lets the table re-derive the leftover on every layout
+/// (resize, splitter drag). The 20-cell rule stays a column-SET rule (the
+/// attribute thresholds) — at render time PATH has no floor, so it can
+/// absorb the table body's one-cell blank lead (upstream `TEXT_X`) and
+/// never squeezes the fixed columns out.
 #[test]
 fn the_tree_columns_adapt_to_the_pane_width() {
     let labels = |width: i32| -> Vec<String> {
@@ -847,20 +936,28 @@ fn the_tree_columns_adapt_to_the_pane_width() {
     );
     assert_eq!(labels(42), vec!["PATH", "CHANGE", "SIZE", "PERM"]);
     assert_eq!(labels(30), vec!["PATH", "CHANGE", "SIZE"]);
-    // The PATH column keeps whatever the fixed columns leave over.
-    assert!(tree_columns(60)[0].width >= 16, "PATH stays readable");
+    let path = to_spec(&tree_columns(60)[0]);
+    assert_eq!(path.flex, 1, "PATH stretches to fill the pane");
+    assert_eq!(
+        path.min_width, 1,
+        "no render floor: PATH absorbs the squeeze, PERM stays whole"
+    );
 }
 
-/// The layer pane is the narrow one now, so its COMMAND column takes the
-/// leftover width instead of a fixed 28 cells.
+/// The COMMAND column fills the rest of the layer pane: no fixed width, no
+/// 40-cell cap — flex gives it every cell CMP(3) and SIZE(8) leave, and
+/// min_width keeps the documented "never below 12" floor (a narrower pane
+/// clips and the table scrolls instead).
 #[test]
 fn the_layer_command_column_takes_the_leftover_width() {
-    let cols = layer_columns(30);
+    let cols = layer_columns();
     assert_eq!(
         cols.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
         vec!["CMP", "SIZE", "COMMAND"]
     );
-    assert_eq!(cols[2].width, 19, "30 - CMP(3) - SIZE(8)");
+    let spec = to_spec(&cols[2]);
+    assert_eq!(spec.flex, 1, "COMMAND stretches into the spare cells");
+    assert_eq!(spec.min_width, 12, "the readability floor travels with it");
 }
 
 /// The summary line names the selected layer (its diff id, the way dive's

@@ -2,7 +2,12 @@
 //! colour-coded change tree on the right, and the efficiency details at the
 //! bottom. Mirrors the Explorer's window shape (two `Table`s over
 //! `RowModel`s, a `Drop`-cleared reopen flag) but is a separate window —
-//! the container-based Image Explorer is untouched.
+//! the container-based Image Explorer is untouched. A tvision-rs
+//! `Splitter` draws the draggable divider between the two areas (its two
+//! placeholder panes carry the 40/60 split; the content children stay
+//! flat window children, which is what upstream focus/Tab traversal
+//! expects), and the COMMAND/PATH columns stretch (flex) to fill whatever
+//! their pane leaves.
 use crate::core::{AppCore, TaskReq};
 use crate::domain::layers::{Analysis, Compare, Comparer, DiffType, Kind, Tree};
 use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
@@ -13,7 +18,10 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::widgets::{SelectionMode, SortDir, Table};
-use tv::{Context, HelpCtx, Rect, Role, ScrollBar, View, ViewState, Window, delegate};
+use tv::{
+    Constraints, Context, HelpCtx, Rect, Role, ScrollBar, Splitter, View, ViewState, Window,
+    delegate,
+};
 
 /// Help context while a Layers window is focused.
 pub const HELP_CTX: HelpCtx = HelpCtx::custom("tvdocker.layers");
@@ -27,21 +35,27 @@ const LAYER_TABLE_KEY: &str = "layers.layers";
 /// The persisted column-layout key for the change tree.
 const TREE_TABLE_KEY: &str = "layers.tree";
 
-/// The layer table's columns for a `width`-wide pane: CMP and SIZE are
-/// fixed, the command line takes the leftover (never below 12 cells — a
-/// shorter pane clips instead, and the table still scrolls).
-fn layer_columns(width: i32) -> Vec<Column> {
+/// The layer table's columns: CMP and SIZE are fixed, COMMAND stretches
+/// into every cell they leave (flex), never below 12 cells — a pane
+/// narrower than the floor clips and the table still scrolls. The width
+/// comes from the table's own layout pass, so it follows resizes AND
+/// splitter drags without re-deriving the set.
+fn layer_columns() -> Vec<Column> {
     vec![
         Column::new("CMP", 3, Align::Left),
         Column::new("SIZE", 8, Align::Right),
-        Column::new("COMMAND", (width - 11).clamp(12, 40), Align::Left),
+        Column::new("COMMAND", 0, Align::Left).flex(1).min_width(12),
     ]
 }
 
-/// The change tree's columns for a `width`-wide pane: PATH takes whatever
-/// the fixed columns leave, and the attribute columns — dive's UID:GID
-/// and Permission — appear only when a readable path still fits beside
-/// them (dive drops the attributes entirely in a constrained layout).
+/// The change tree's columns for a `width`-wide pane: PATH stretches into
+/// whatever the fixed columns leave (flex), and the attribute columns —
+/// dive's UID:GID and Permission — appear only when a readable path still
+/// fits beside them (dive drops the attributes entirely in a constrained
+/// layout). The 20-cell PATH floor is a COLUMN-SET rule (the attribute
+/// thresholds below), not a render floor: the table body leaves its
+/// first cell blank (upstream `TEXT_X`), so at render time PATH absorbs
+/// the one-cell squeeze exactly like it always did.
 fn tree_columns(width: i32) -> Vec<Column> {
     const CHANGE: i32 = 2;
     const SIZE: i32 = 8;
@@ -52,7 +66,7 @@ fn tree_columns(width: i32) -> Vec<Column> {
     // attribute columns only claim their slice when 20 cells still stay.
     const MIN_PATH: i32 = 20;
     let mut cols = vec![
-        Column::new("PATH", 0, Align::Left),
+        Column::new("PATH", 0, Align::Left).flex(1),
         Column::new("CHANGE", CHANGE, Align::Left),
         Column::new("SIZE", SIZE, Align::Right),
     ];
@@ -62,20 +76,21 @@ fn tree_columns(width: i32) -> Vec<Column> {
     if width >= MIN_PATH + CHANGE + SIZE + PERM {
         cols.push(Column::new("PERM", PERM, Align::Left));
     }
-    let fixed: i32 = cols.iter().map(|c| c.width).sum();
-    cols[0].width = (width - fixed).max(MIN_PATH);
     cols
 }
 
-/// Child rectangles for a Layers window of `size` (frame included): a
-/// details line, two filter bars, the two tables over the middle — each
-/// giving its right-most client column to its vertical scroll bar (the
+/// Child rectangles for a Layers window of `size` (frame included), with
+/// the layer/tree divider at window-client column `mid`: a details line,
+/// two filter bars, the two tables over the middle — each giving its
+/// right-most client column to its vertical scroll bar (the
 /// [`crate::widgets::scroll_rects`] body+bar convention) — and the
-/// inefficient-paths strip above the bottom border.
-fn layers_rects(size: tv::Point) -> LayersRects {
+/// inefficient-paths strip above the bottom border. `mid` is the divider
+/// column the [`Splitter`] resolved (its left pane spans columns
+/// `1..mid`), so dragging the divider re-derives every middle rect.
+fn layers_rects(size: tv::Point, mid: i32) -> LayersRects {
     let right = (size.x - 1).max(1); // exclusive client right (frame = size.x-1)
     let bottom = (size.y - 1).max(1); // exclusive client bottom (frame = size.y-1)
-    let mid = ((size.x * 2) / 5).clamp(1, right); // the layer/tree split (40/60)
+    let mid = mid.clamp(1, right); // the layer/tree divider column
     let first_table = 3.min(bottom); // filters end at row 3 — no blank line (the explorer's formula)
     // `bottom - 3`: the strip needs its header AND two path rows (the
     // design's "list of inefficient paths"); `bottom - 2` left room for a
@@ -84,13 +99,16 @@ fn layers_rects(size: tv::Point) -> LayersRects {
     let last_table = details_y.min(bottom);
     // One column per bar, taken from its own table's right edge; the
     // `.max(…)`/`.min(…)` pairs keep every rect ordered (never inverted,
-    // never past the client) even at degenerate widths.
-    let layer_body_right = (mid - 2).max(1);
-    let layer_bar_right = (mid - 1).max(layer_body_right);
+    // never past the client) even at degenerate widths. The left pane
+    // spans columns `1..mid` (its last column is the bar), the tree side
+    // starts at `mid + 1` (the divider owns `mid`).
+    let layer_body_right = (mid - 1).max(1);
+    let layer_bar_right = mid.max(layer_body_right);
     let tree_body_right = (right - 1).max(mid + 1).min(right);
     let tree_bar_right = right.max(tree_body_right);
     LayersRects {
         summary: Rect::new(1, 1, right, 2.min(bottom)),
+        split: Rect::new(1, 2.min(bottom), right, details_y),
         layer_filter: Rect::new(1, 2.min(bottom), mid - 1, 3.min(bottom)),
         tree_filter: Rect::new(mid + 1, 2.min(bottom), right, 3.min(bottom)),
         layer_table: Rect::new(1, first_table, layer_body_right, last_table),
@@ -105,6 +123,9 @@ fn layers_rects(size: tv::Point) -> LayersRects {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LayersRects {
     summary: Rect,
+    /// The splitter's own rect (mid-independent): summary bottom to strip
+    /// top, the full client width.
+    split: Rect,
     layer_filter: Rect,
     tree_filter: Rect,
     layer_table: Rect,
@@ -124,6 +145,17 @@ pub struct LayersWindow {
     /// The image id (the slot key and the `TaskReq` image).
     key: String,
     open: Rc<RefCell<bool>>,
+    /// The layout splitter: two placeholder panes between the layer and
+    /// tree areas. Its divider replaces the old blank gap column and can
+    /// be dragged; the content children stay FLAT and follow the pane
+    /// widths through [`Self::reapply_layout`].
+    splitter: tv::ViewId,
+    /// The splitter's left placeholder pane (its width carries the split).
+    layer_pane: tv::ViewId,
+    /// The left pane width the content rects were last derived from —
+    /// [`Self::split_moved`] compares it against the live pane to detect a
+    /// dragged divider.
+    split_left: i32,
     layer_table: tv::ViewId,
     /// The layer table's vertical scroll bar (its right-most column).
     layer_bar: tv::ViewId,
@@ -497,7 +529,10 @@ pub fn build(
     let title = format!("Layers — {label}");
     let mut win = Window::new(bounds, Some(title), WINDOW_NUMBER);
     let size = win.state().size;
-    let r = layers_rects(size);
+    // Provisional mid — re-derived below, once the splitter resolves its
+    // panes; only the mid-independent rects (summary/strip/split) are
+    // read before that.
+    let r = layers_rects(size, (size.x * 2) / 5);
 
     let summary = Rc::new(RefCell::new(String::new()));
     let layer_sink = Rc::new(RefCell::new(String::new()));
@@ -525,13 +560,45 @@ pub fn build(
         )
     };
     let mut comparer = Comparer::new();
-    // The columns follow each pane's body width: the attribute columns
-    // (UID:GID, PERM) only claim a slice when a readable PATH still fits
-    // beside them, and COMMAND takes whatever the layer pane leaves.
-    let layer_width = r.layer_table.b.x - r.layer_table.a.x;
+    // The layer columns need no width: COMMAND stretches (flex). The tree's
+    // attribute columns (UID:GID, PERM) still follow the pane — decided
+    // against the width the SOLVER grants the right pane.
+    let layer_cols = layer_columns();
+
+    // --- The splitter: two placeholder panes over the window's middle
+    // region (40/60 weights, the old fixed split as the default). The
+    // CONTENT children below stay FLAT window children — upstream focus
+    // and Tab traversal are a direct-children affair (`focus_descendant`'s
+    // doc: "this focuses the link within its owning group, not the full
+    // ancestor chain") — so the splitter is the layout/divider device:
+    // `reapply_layout` derives every middle rect from the resolved left
+    // pane width, and `split_moved` catches a dragged divider. Inserted
+    // FIRST, it also draws behind the content that overlaps its region.
+    let mut split = Splitter::cols();
+    let layer_pane = split.insert(
+        Box::new(tv::Group::new(Rect::new(0, 0, 1, 1))),
+        Constraints::weight(2),
+    );
+    split.insert(
+        Box::new(tv::Group::new(Rect::new(0, 0, 1, 1))),
+        Constraints::weight(3),
+    );
+    split.change_bounds(r.split);
+    let split_left = split
+        .find_mut(layer_pane)
+        .map_or(0, |pane| pane.state().size.x);
+    // The real divider column: the splitter's left edge plus the width
+    // the solver granted the left pane (its own coordinate space is
+    // 0-based, so the divider sits one column past the pane).
+    let r = layers_rects(size, r.split.a.x + split_left);
     let tree_width = r.tree_table.b.x - r.tree_table.a.x;
-    let layer_cols = layer_columns(layer_width);
     let tree_cols = tree_columns(tree_width);
+
+    // Seed all three tables with what the first `redraw` would produce
+    // (the ResourceWindow's build-seeded `initial_model`): the redraw now
+    // runs AFTER the child routing, so without this a fresh window's
+    // first event would land on empty tables. This is the ONE deep clone
+    // per open — the `Rc` wrap keeps every later event cheap.
     let (seed_layers, seed_tree, seed_inefficient) = match seeded.as_deref() {
         Some(a) if !a.layers.is_empty() => {
             let tree = comparer.tree(&a.layers, Compare::Single, 0).clone();
@@ -544,6 +611,7 @@ pub fn build(
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
+    let splitter = win.insert_child(Box::new(split));
     let summary_id = win.insert_child(Box::new(SharedLine::new(
         r.summary,
         Rc::clone(&summary),
@@ -595,6 +663,9 @@ pub fn build(
         task_tx,
         key,
         open,
+        splitter,
+        layer_pane,
+        split_left,
         layer_table,
         layer_bar,
         tree_table,
@@ -864,6 +935,25 @@ impl LayersWindow {
     fn window_keys(&mut self, ev: &mut Event, ctx: &mut Context) {
         let Event::KeyDown(ke) = ev else { return };
         match (ke.key, ke.modifiers.ctrl) {
+            // Tab: exactly two stops (the Explorer's Ruling 3). The window
+            // intercepts BEFORE the children run, so the nested groups'
+            // hierarchical traversal never fires: the focus toggles
+            // between the two tables, and a focused filter escapes back
+            // to ITS OWN pane's table (Shift+Tab behaves like Tab — tv
+            // has no `BackTab` variant).
+            (Key::Tab, false) => {
+                let target = if self.is_focused(self.tree_filter) {
+                    self.tree_table
+                } else if self.is_focused(self.layer_filter) || self.is_focused(self.tree_table) {
+                    // A filter escapes to its own table; the layer table
+                    // crosses to the tree table.
+                    self.layer_table
+                } else {
+                    self.tree_table
+                };
+                self.win.focus_descendant(target, ctx);
+                ev.clear();
+            }
             // Ctrl chords the FilterBar never consumes.
             (Key::Char('t'), true) => {
                 self.toggle_mode();
@@ -973,11 +1063,40 @@ impl LayersWindow {
         }
     }
 
-    /// Re-derive the child rects for the CURRENT window size and hand each
-    /// child its new bounds (the Explorer's `reapply_layout`): without it
-    /// the children keep their BUILD-time rects and freeze on resize.
+    /// The left pane's CURRENT width (the splitter re-resolves its panes
+    /// on every `change_bounds`, so this is the live divider position).
+    fn split_left_width(&mut self) -> Option<i32> {
+        self.win
+            .find_mut(self.layer_pane)
+            .map(|pane| pane.state().size.x)
+    }
+
+    /// Did the divider move since the content rects were last applied?
+    /// A mouse drag lands inside `win.handle_event`; the keyboard resize
+    /// broker applies its nudge after dispatch — both show up here.
+    fn split_moved(&mut self) -> bool {
+        self.split_left_width() != Some(self.split_left)
+    }
+
+    /// Re-derive the child rects for the CURRENT window size and the
+    /// CURRENT divider position (the Explorer's `reapply_layout`): bound
+    /// the splitter (its panes resolve), read back the left pane's width,
+    /// then hand every child its rect from `layers_rects(size, mid)` —
+    /// without it the children keep their BUILD-time rects and freeze on
+    /// resize or a dragged divider.
     fn reapply_layout(&mut self) {
-        let r = layers_rects(self.win.state().size);
+        let size = self.win.state().size;
+        // Pass 1: only the split rect matters for this call (the summary
+        // and strip rects are mid-independent), and it lets the panes
+        // resolve for the CURRENT window size.
+        let r = layers_rects(size, self.split_left);
+        if let Some(v) = self.win.child_mut(self.splitter) {
+            v.change_bounds(r.split);
+        }
+        let left = self.split_left_width().unwrap_or(0);
+        self.split_left = left;
+        // Pass 2: the divider column the resolver actually picked.
+        let r = layers_rects(size, r.split.a.x + left);
         for (id, rect) in [
             (self.summary_id, r.summary),
             (self.layer_filter, r.layer_filter),
@@ -1029,6 +1148,13 @@ impl View for LayersWindow {
     /// of the SAME event.
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         let before = self.win.state().size;
+        // A divider nudge the keyboard-resize broker applied AFTER the
+        // previous dispatch shows up here (the mouse-drag case is caught
+        // by the same check below the delegation).
+        if self.split_moved() {
+            self.reapply_layout();
+            self.dirty = true; // the layout changed: re-push the models
+        }
         self.window_keys(ev, ctx);
         self.sync_from_core();
         // Windows ▸ Full screen: this window owns the inner `win` directly.
@@ -1052,8 +1178,9 @@ impl View for LayersWindow {
         // Zoom / fullscreen re-bound the inner window's group directly,
         // bypassing this window's `change_bounds` (the Explorer's
         // reconcile): keep the child rects following the new client area.
-        // The full-screen toggle also runs it when only the BORDER flipped.
-        if full || self.win.state().size != before {
+        // The full-screen toggle also runs it when only the BORDER flipped,
+        // and a dragged divider re-derives the middle rects the same way.
+        if full || self.win.state().size != before || self.split_moved() {
             self.reapply_layout();
             self.win.on_bounds_changed(ctx);
             self.dirty = true; // the layout changed: re-push the models
