@@ -332,20 +332,43 @@ fn the_window_titles_itself_and_lists_every_layer() {
     assert!(text.contains("Efficiency"), "{text}");
 }
 
+/// Ctrl+T's observable (spec §10's acceptance): the window title cannot
+/// change at runtime in tvision-rs 0.17 (verified exhaustively), so the
+/// compare mode is rendered as a prefix on the always-visible summary
+/// line. The old name of this test claimed it checked "the title" while
+/// it only ever asserted the `mode` field.
 #[test]
-fn ctrl_t_toggles_the_compare_mode_and_the_title() {
+fn ctrl_t_toggles_the_compare_mode_and_the_summary_indicator() {
     let mut win = window_with(three_layer_analysis());
     assert_eq!(win.mode, Compare::Single);
+    assert!(
+        win.summary.borrow().starts_with(" Current layer · "),
+        "Single mode is announced on row 1: {:?}",
+        *win.summary.borrow()
+    );
     testutil::send_event(
         &mut win,
         Event::KeyDown(KeyEvent::new(Key::Char('t'), mods(true))),
     );
     assert_eq!(win.mode, Compare::Aggregated, "Ctrl+T flips the mode");
+    assert!(
+        win.summary.borrow().starts_with(" Aggregated · "),
+        "…and so is Aggregated mode: {:?}",
+        *win.summary.borrow()
+    );
+    // The indicator reaches the SCREEN — row 1 is always visible.
+    let text = testutil::text(&testutil::render_view(80, 24, &mut win));
+    assert!(text.contains("Aggregated · Total"), "{text}");
     testutil::send_event(
         &mut win,
         Event::KeyDown(KeyEvent::new(Key::Char('t'), mods(true))),
     );
     assert_eq!(win.mode, Compare::Single);
+    assert!(
+        win.summary.borrow().starts_with(" Current layer · "),
+        "back to Single mode: {:?}",
+        *win.summary.borrow()
+    );
 }
 
 #[test]

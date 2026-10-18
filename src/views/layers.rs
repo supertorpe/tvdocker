@@ -537,14 +537,24 @@ impl LayersWindow {
         }
     }
 
-    /// The summary line (`SharedLine`, row 1): the totals, or the loading
-    /// line with the current byte count. Written from `build` and every
-    /// `redraw` — so it follows the data and the progress ticks through
-    /// the same dirty gate the tables use.
+    /// The summary line (`SharedLine`, row 1): the compare-mode indicator
+    /// plus the totals, or the loading line with the current byte count.
+    /// Written from `build` and every `redraw` — so it follows the data,
+    /// the mode and the progress ticks through the same dirty gate the
+    /// tables use.
+    ///
+    /// Finding 2's ruling: the window TITLE cannot change at runtime in
+    /// tvision-rs 0.17 (`Window::set_title` is `pub(crate)` with no
+    /// external path to the title), so spec §10's "the toggle changes the
+    /// title" acceptance is served by row 1, which is always visible.
     fn write_summary(&self) {
+        let mode = match self.mode {
+            Compare::Single => "Current layer",
+            Compare::Aggregated => "Aggregated",
+        };
         *self.summary.borrow_mut() = match &self.analysis {
             Some(a) => format!(
-                " Total {}   Efficiency {:.0}%   Potential wasted space {}",
+                " {mode} · Total {}   Efficiency {:.0}%   Potential wasted space {}",
                 crate::views::resource::format_size(a.layers.iter().map(|l| l.size as i64).sum()),
                 a.efficiency * 100.0,
                 crate::views::resource::format_size(a.wasted_bytes as i64),
@@ -558,7 +568,7 @@ impl LayersWindow {
                     .copied()
                     .unwrap_or(0);
                 format!(
-                    " Analyzing {} ({})…",
+                    " {mode} · Analyzing {} ({})…",
                     crate::views::resource::format_size(progress as i64),
                     self.key
                 )
