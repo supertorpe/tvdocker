@@ -111,6 +111,15 @@ pub const CMD_VOLUME_EXPLORER: Command = Command::custom("tvdocker.volume_explor
 /// opener (hop 2).
 pub const CMD_REQ_IMAGE_EXPLORER: Command = Command::custom("tvdocker.req_image_explorer");
 pub const CMD_IMAGE_EXPLORER: Command = Command::custom("tvdocker.image_explorer");
+/// "Image" jump from the Containers context menu: `CMD_REQ_IMAGE` is the
+/// menu request (hop 1 — the window mints the container id); `CMD_SHOW_IMAGE`
+/// is the desktop's opener (hop 2 — open/focus Images, then focus the row).
+pub const CMD_REQ_IMAGE: Command = Command::custom("tvdocker.req_image");
+pub const CMD_SHOW_IMAGE: Command = Command::custom("tvdocker.show_image");
+/// Broadcast: a window with a queued `AppCore::focus_request` should move
+/// its cursor there (the desktop cannot reach a window's table — it holds
+/// only a `ViewId`, so the request rides the core and a broadcast).
+pub const CMD_FOCUS_REQUEST: Command = Command::custom("tvdocker.focus_request");
 /// Layers from the Images window (image-layer explorer): `CMD_REQ_*` is
 /// the context-menu request (hop 1); `CMD_LAYERS` is the desktop's opener.
 pub const CMD_REQ_IMAGE_LAYERS: Command = Command::custom("tvdocker.req_image_layers");

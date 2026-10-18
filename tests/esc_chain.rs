@@ -18,6 +18,7 @@ fn core_with_rows() -> Rc<RefCell<AppCore>> {
         id: id.into(),
         name: name.into(),
         image: "img".into(),
+        image_id: "sha256:img".into(),
         state: "running".into(),
         status: "Up".into(),
         ports: "80/tcp".into(),

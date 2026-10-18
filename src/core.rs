@@ -367,6 +367,10 @@ pub struct AppCore {
     /// Which resource those targets belong to (the desktop's
     /// confirm/finish maps ids → `TaskReq` by kind).
     pub pending_kind: PendingKind,
+    /// One-shot row-focus request for the Images window (the
+    /// "Image" context-menu jump): the desktop sets the image row id,
+    /// the open window takes it once on the focus broadcast.
+    pub focus_request: Option<String>,
     /// Last Explorer listing per window+side, keyed `"{key}:{'h'|'r'}"`;
     /// the window applies only path-matching entries.
     pub explorer: HashMap<String, ExplorerListing>,
@@ -405,6 +409,7 @@ impl AppCore {
             info: None,
             pending_targets: Vec::new(),
             pending_kind: PendingKind::default(),
+            focus_request: None,
             explorer: HashMap::new(),
             image_layers: HashMap::new(),
             layers_progress: HashMap::new(),
@@ -461,6 +466,18 @@ impl AppCore {
     /// queue can never fire twice.
     pub fn take_pending(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_targets)
+    }
+
+    /// Queue the image row id the Images window should put its cursor
+    /// on (the "Image" jump's data hop — `Command` carries no payload).
+    pub fn set_focus_request(&mut self, row_id: String) {
+        self.focus_request = Some(row_id);
+    }
+
+    /// Take the queued focus row (window side) — destructive, so a
+    /// stale request can never re-fire on a later open.
+    pub fn take_focus_request(&mut self) -> Option<String> {
+        self.focus_request.take()
     }
 
     /// Apply one bridged message (the reducer,).
@@ -677,6 +694,21 @@ mod tests {
         assert!(
             core.take_pending().is_empty(),
             "take is destructive — no stale second action"
+        );
+    }
+
+    /// The Images-window focus request (the "Image" menu jump): the
+    /// desktop sets it, the open Images window takes it once — a stale
+    /// request must never re-fire on a later open.
+    #[test]
+    fn focus_request_round_trips_through_set_and_take() {
+        let mut core = AppCore::new();
+        assert!(core.take_focus_request().is_none(), "nothing queued yet");
+        core.set_focus_request("sha256:abc".into());
+        assert_eq!(core.take_focus_request().as_deref(), Some("sha256:abc"));
+        assert!(
+            core.take_focus_request().is_none(),
+            "take is destructive — no stale second jump"
         );
     }
 
@@ -968,6 +1000,7 @@ mod tests {
             id: state.to_string(),
             name: format!("c-{state}"),
             image: "img".into(),
+            image_id: "sha256:img".into(),
             state: state.into(),
             status: "Up".into(),
             ports: String::new(),

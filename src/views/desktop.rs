@@ -159,7 +159,7 @@ impl TvdockerDesktop {
         let _ = self.actions.send(ActionReq::PollNow);
         let slot = &self.slots[kind as usize];
         if let Some(id) = Self::open_id(slot) {
-            ctx.request_focus(id); // already open → focus 
+            ctx.request_focus(id); // already open → focus
             return;
         }
         let step = self.cascade.get();
@@ -360,6 +360,27 @@ impl TvdockerDesktop {
             .entry(target)
             .or_insert_with(Slot::new);
         Self::record(slot, vid);
+    }
+
+    /// Image jump: open/focus the Images window, then queue the row-focus
+    /// request for it and broadcast (the desktop holds only a `ViewId` —
+    /// there is no view-lookup to reach the window's table directly).
+    /// A pruned image (no row) still opens the window; the cursor just
+    /// stays put.
+    fn open_images_for_container(&mut self, ctx: &mut Context) {
+        let Some(container_id) = self.core.borrow_mut().take_pending().into_iter().next() else {
+            return;
+        };
+        // Focus requests are one-shot: clear any stale one BEFORE opening,
+        // so a menu-open can never jump to a leftover row.
+        self.core.borrow_mut().take_focus_request();
+        self.open_or_focus(Win::Images, ctx);
+        let row =
+            crate::views::images::image_row_id_for_container(&self.core.borrow(), &container_id);
+        if let Some(row_id) = row {
+            self.core.borrow_mut().set_focus_request(row_id);
+            ctx.broadcast(crate::app::CMD_FOCUS_REQUEST, None);
+        }
     }
 
     /// Open an Explorer on the queued id — containers, volumes and images
@@ -831,6 +852,11 @@ impl View for TvdockerDesktop {
             }
             if *cmd == crate::app::CMD_IMAGE_EXPLORER {
                 self.open_explorer(ExplorerKind::Image, ctx);
+                ev.clear();
+                return;
+            }
+            if *cmd == crate::app::CMD_SHOW_IMAGE {
+                self.open_images_for_container(ctx);
                 ev.clear();
                 return;
             }

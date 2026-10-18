@@ -194,6 +194,7 @@ mod tests {
             id: state.to_string(),
             name: format!("c-{state}"),
             image: "img".into(),
+            image_id: "sha256:img".into(),
             state: state.into(),
             status: "Up".into(),
             ports: String::new(),

@@ -59,6 +59,28 @@ pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
     )]
 }
 
+/// The Images-window row id for a container's image: the container's
+/// `image_id` wins (exact — the only match that survives multi-tag
+/// images, whose rows keep just the first repo tag); then the
+/// `repo:tag` / implicit-`latest` name forms. `None` when the image is
+/// not in the list (pruned while the container outlived it).
+pub fn image_row_id_for_container(core: &AppCore, container_id: &str) -> Option<String> {
+    let container = core.containers.iter().find(|c| c.id == container_id)?;
+    if !container.image_id.is_empty()
+        && let Some(row) = core.images.iter().find(|i| i.id == container.image_id)
+    {
+        return Some(row.id.clone());
+    }
+    let name =
+        |i: &crate::domain::docker::images::ImageEntry| format!("{}:{}", i.repository, i.tag);
+    core.images
+        .iter()
+        .find(|i| {
+            name(i) == container.image || (container.image == i.repository && i.tag == "latest")
+        })
+        .map(|i| i.id.clone())
+}
+
 /// The Images context menu: run form, remove,
 /// and the two batch sweeps. Hot letters are menu-scoped .
 pub fn context_menu(_core: &AppCore, _id: &str) -> Vec<(String, tv::Command)> {
@@ -166,5 +188,80 @@ mod tests {
             .filter(|(l, _)| l.to_lowercase().contains("~e~"))
             .count();
         assert_eq!(hot, 1, "exactly one `e` hotspot: {items:?}");
+    }
+
+    fn img(id: &str, repo: &str, tag: &str) -> crate::domain::docker::images::ImageEntry {
+        crate::domain::docker::images::ImageEntry {
+            id: id.into(),
+            repository: repo.into(),
+            tag: tag.into(),
+            size: 1_000,
+        }
+    }
+
+    fn cont(
+        id: &str,
+        image: &str,
+        image_id: &str,
+    ) -> crate::domain::docker::containers::ContainerSummary {
+        crate::domain::docker::containers::ContainerSummary {
+            id: id.into(),
+            name: id.into(),
+            image: image.into(),
+            image_id: image_id.into(),
+            state: "running".into(),
+            status: "Up".into(),
+            ports: String::new(),
+            project: String::new(),
+            health: String::new(),
+        }
+    }
+
+    /// The jump resolves a container to its Images-window row id.
+    #[test]
+    fn image_row_id_resolves_by_id_then_repo_tag_then_implicit_latest() {
+        let mut core = AppCore::new();
+        core.apply(crate::core::AppMsg::Images(vec![
+            img("sha256:aaa", "nginx", "1.27"),
+            img("sha256:bbb", "redis", "latest"),
+            // Multi-tag image: `summarize` keeps the FIRST repo tag, so a
+            // container using the other tag can only resolve by id.
+            img("sha256:ccc", "app", "prod"),
+        ]));
+        core.apply(crate::core::AppMsg::Containers(vec![
+            // Exact id match — the primary path.
+            cont("c1", "something-else:1", "sha256:aaa"),
+            // `repo:tag` name match.
+            cont("c2", "redis:latest", "sha256:missing"),
+            // Implicit `latest` (`docker run nginx` → row `nginx:latest`).
+            cont("c3", "redis", "sha256:missing"),
+            // No image row at all.
+            cont("c4", "gone:1", "sha256:missing"),
+        ]));
+        assert_eq!(
+            image_row_id_for_container(&core, "c1").as_deref(),
+            Some("sha256:aaa"),
+            "container image id wins"
+        );
+        assert_eq!(
+            image_row_id_for_container(&core, "c2").as_deref(),
+            Some("sha256:bbb"),
+            "repo:tag name match"
+        );
+        assert_eq!(
+            image_row_id_for_container(&core, "c3").as_deref(),
+            Some("sha256:bbb"),
+            "implicit latest"
+        );
+        assert_eq!(
+            image_row_id_for_container(&core, "c4"),
+            None,
+            "pruned image: no row to jump to"
+        );
+        assert_eq!(
+            image_row_id_for_container(&core, "unknown"),
+            None,
+            "unknown container id"
+        );
     }
 }

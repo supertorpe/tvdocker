@@ -714,3 +714,87 @@ fn run_form_esc_sends_nothing() {
          (without the form, Esc's chain closes the active window): {text:?}"
     );
 }
+
+/// The container fixtures' image is `sha256:img`; the list puts it SECOND,
+/// so a cursor that never moved would target `sha256:other` instead. Del
+/// acts on the cursor row ⇒ the `RemoveImage` id is the observable proof
+/// that the jump put the cursor on the container's image.
+#[test]
+fn image_menu_jump_opens_images_with_the_container_image_under_the_cursor() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![
+        image_row("sha256:other", "zzz", "1"),
+        image_row("sha256:img", "nginx", "1.27"),
+    ]));
+    right_click(&screen, 12, 6); // ROW 1 (webalpha)
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('i'), KeyModifiers::default()); // ~I~mage
+    pump(&mut program, 16); // the Images status def lands ~9 pumps after open
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveImage { id }) if id == "sha256:img"
+        ),
+        "Del targeted the container's image row — the jump moved the cursor"
+    );
+}
+
+/// A pruned image (no row to jump to) must not swallow the request: the
+/// Images window still opens.
+#[test]
+fn image_menu_jump_still_opens_images_when_the_image_is_gone() {
+    let (mut program, screen, _core, _task_rx) = start(two_rows());
+    // No images seeded at all — the container's image is not in the list.
+    right_click(&screen, 12, 6); // ROW 1 (webalpha)
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('i'), KeyModifiers::default()); // ~I~mage
+    pump(&mut program, 10);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Images"),
+        "the Images window opened anyway: {text:?}"
+    );
+}
+
+/// The jump with the Images window ALREADY open: the desktop focuses the
+/// existing window (no second one) and the open window applies the focus
+/// request — same cursor proof via Del.
+#[test]
+fn image_menu_jump_moves_the_cursor_in_an_already_open_images_window() {
+    let (mut program, screen, core, mut task_rx) = start(two_rows());
+    core.borrow_mut().apply(AppMsg::Images(vec![
+        image_row("sha256:other", "zzz", "1"),
+        image_row("sha256:img", "nginx", "1.27"),
+    ]));
+    screen.push_event(Event::Command(app::CMD_OPEN_IMAGES));
+    pump(&mut program, 12); // Images window open + def landed
+    // Jump from the Containers window (F6 Next cycles back to it).
+    screen.push_key(
+        Key::F(6),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    right_click(&screen, 12, 6); // ROW 1 (webalpha)
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('i'), KeyModifiers::default()); // ~I~mage
+    pump(&mut program, 16);
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveImage { id }) if id == "sha256:img"
+        ),
+        "the cursor moved to row 2 in the already-open window (it started \
+         on row 1 = sha256:other — an unmoved cursor would target that)"
+    );
+}

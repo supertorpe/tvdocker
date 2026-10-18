@@ -68,6 +68,7 @@ pub fn context_menu(core: &AppCore, id: &str) -> Vec<(String, tv::Command)> {
         .is_some_and(|c| c.state == "running");
     vec![
         ("~E~xplorer".to_string(), crate::app::CMD_REQ_EXPLORER),
+        ("~I~mage".to_string(), crate::app::CMD_REQ_IMAGE),
         ("~D~etails".to_string(), crate::app::CMD_REQ_DETAILS),
         ("~L~ogs".to_string(), crate::app::CMD_REQ_LOGS),
         ("~S~hell".to_string(), crate::app::CMD_REQ_SHELL),
@@ -127,6 +128,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             image: "img".into(),
+            image_id: "sha256:img".into(),
             state: state.into(),
             status: "Up".into(),
             ports: "80/tcp".into(),
@@ -229,5 +231,32 @@ mod tests {
             .filter(|(l, _)| l.replace('~', "").to_lowercase().contains('n'))
             .count();
         assert_eq!(n, 1, "exactly one 'n' hotspot: {items:?}");
+    }
+
+    /// The "Image" jump exists and is the only `i`/`I` hotspot
+    /// (the hot letter is the `~`-marked char — a raw-text scan would
+    /// false-match "Di**i**agnose…"'s unmarked letters).
+    #[test]
+    fn context_menu_offers_image() {
+        let core = core_with(vec![container("id-a", "web", "running")]);
+        let items = context_menu(&core.borrow(), "id-a");
+        assert!(
+            items
+                .iter()
+                .any(|(l, c)| { l.replace('~', "") == "Image" && *c == crate::app::CMD_REQ_IMAGE }),
+            "Image present: {items:?}"
+        );
+        let hot = |l: &str| -> Vec<char> {
+            let b = l.as_bytes();
+            (1..b.len().saturating_sub(1))
+                .filter(|&i| b[i - 1] == b'~' && b[i + 1] == b'~')
+                .filter_map(|i| l[i..].chars().next())
+                .collect()
+        };
+        let n = items
+            .iter()
+            .filter(|(l, _)| hot(l).iter().any(|c| *c == 'i' || *c == 'I'))
+            .count();
+        assert_eq!(n, 1, "exactly one 'i' hotspot: {items:?}");
     }
 }

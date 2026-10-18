@@ -15,6 +15,9 @@ pub struct ContainerSummary {
     pub id: String,
     pub name: String,
     pub image: String,
+    /// The image id the container was created from (`sha256:…`) —
+    /// the Images-window row key the "Image" menu jump resolves on.
+    pub image_id: String,
     pub state: String,
     pub status: String,
     pub ports: String,
@@ -84,6 +87,7 @@ pub fn summarize(c: BollardSummary) -> ContainerSummary {
         id: c.id.unwrap_or_default(),
         name,
         image: c.image.unwrap_or_default(),
+        image_id: c.image_id.unwrap_or_default(),
         state: c.state.unwrap_or_default(),
         status,
         ports,
@@ -124,6 +128,7 @@ mod tests {
         BollardSummary {
             names: Some(vec!["/myproj_web_1".to_string()]),
             image: Some("nginx:1.27".to_string()),
+            image_id: Some("sha256:111122223333".to_string()),
             state: Some("running".to_string()),
             status: Some("Up 3 days (healthy)".to_string()),
             id: Some("abc123".to_string()),
@@ -147,6 +152,7 @@ mod tests {
         assert_eq!(s.name, "myproj_web_1");
         assert_eq!(s.id, "abc123");
         assert_eq!(s.image, "nginx:1.27");
+        assert_eq!(s.image_id, "sha256:111122223333");
         assert_eq!(s.state, "running");
     }
 

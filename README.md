@@ -4,6 +4,7 @@ Multi-window Docker TUI built on Turbo Vision (via [tvision-rs](https://github.c
 
 <img src="./img/screenshot.png" width="1261" />
 
+
 ## Build & test
 
 Everything runs in the pinned container — no host toolchain required:
@@ -64,10 +65,10 @@ Everything runs in the pinned container — no host toolchain required:
 | on an image | `Ctrl+E` | **Image Explorer** — the image's filesystem, read-only |
 | on an image | `Ctrl+L` | **Layers ×N** — the layer list with the colour-coded change tree, efficiency score and potential wasted space; also **Layers…** in the context menu |
 | on an image | `F2` | **Run…** — the validated run form |
-| on a row | `Shift+F10` | context menu (mouse-free right-click): Explorer, Details, Logs, Shell, **Diagnose…**, Start/Stop, Delete |
+| on a row | `Shift+F10` | context menu (mouse-free right-click): Explorer, Details, Logs, Shell, **Diagnose…**, Start/Stop, Delete (containers add **Image** — jumps to the Images window with the container's image under the cursor) |
 | Options menu | `Alt+O` | **Settings** — the TOML editor (`F2` saves + live-reloads) |  
 
-Right-click a row — or press `Shift+F10` on it — for the **context menu** (Details/Logs/Shell, Start/Stop, Delete, Diagnose…, Explorer); `Del` deletes with confirmation; `Ctrl+O` opens the **column picker** (runtime-only — reopening resets it).
+Right-click a row — or press `Shift+F10` on it — for the **context menu** (Details/Logs/Shell, Start/Stop, Delete, Diagnose…, Explorer; containers also **Image**, which opens the Images window with that container's image selected); `Del` deletes with confirmation; `Ctrl+O` opens the **column picker** (runtime-only — reopening resets it).
 
 Opening an item already on screen focuses it instead of duplicating it, windows cascade (+2/+1) and shrink to fit, and each keeps its own filter (`Esc` clears selection → filter → close). `Ctrl+A` selects the filtered rows; the status line shows the focused window's contextual shortcuts and hides them under `F10`.
 

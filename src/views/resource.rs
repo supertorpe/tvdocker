@@ -615,6 +615,42 @@ impl View for ResourceWindow {
             ev.clear();
             return;
         }
+        // --- The "Image" jump's data hop: a focus request queued in the
+        // core, delivered by broadcast (the desktop holds only a
+        // `ViewId` — no way to reach a window's table directly). Only the
+        // Images window acts; every other window leaves the request
+        // queued for its recipient.
+        if let Event::Broadcast { command, .. } = ev
+            && *command == crate::app::CMD_FOCUS_REQUEST
+            && self.spec.kind == Some(crate::core::PendingKind::Images)
+        {
+            let requested = self.core.borrow_mut().take_focus_request();
+            if let Some(row_id) = requested {
+                let key = RowKey(row_id);
+                let present = self.table_mut().is_some_and(|t| {
+                    let model = t.model();
+                    (0..model.row_count()).any(|r| model.row_key(r) == key)
+                });
+                if !present {
+                    // The row is hidden behind an active filter — the
+                    // explicit jump outweighs it (Esc/type-to-filter
+                    // restores a filter anyway).
+                    if !self.sink.borrow().is_empty() {
+                        if let Some(fb) = self.filter_mut() {
+                            fb.clear();
+                        } else {
+                            self.sink.borrow_mut().clear();
+                        }
+                        self.refresh_rows(ctx);
+                    }
+                }
+                if let Some(t) = self.table_mut() {
+                    t.set_focused_key(&key, ctx);
+                }
+            }
+            ev.clear();
+            return;
+        }
         // --- The status pre-route's form of the same chord:
         // KeyDown → Event::Command(CMD_SELECT_ALL) when the contextual def's
         // key binding is active. Identical behavior, shared `select_all()`.
@@ -682,6 +718,8 @@ impl View for ResourceWindow {
                 Some(crate::app::CMD_VOLUME_EXPLORER)
             } else if *cmd == crate::app::CMD_REQ_IMAGE_EXPLORER {
                 Some(crate::app::CMD_IMAGE_EXPLORER)
+            } else if *cmd == crate::app::CMD_REQ_IMAGE {
+                Some(crate::app::CMD_SHOW_IMAGE)
             } else if *cmd == crate::app::CMD_REQ_IMAGE_LAYERS {
                 Some(crate::app::CMD_LAYERS)
             } else if *cmd == crate::app::CMD_REQ_SHELL {
@@ -733,6 +771,7 @@ impl View for ResourceWindow {
                         | crate::app::CMD_REQ_LOGS
                         | crate::app::CMD_REQ_SHELL
                         | crate::app::CMD_REQ_EXPLORER
+                        | crate::app::CMD_REQ_IMAGE
                         | crate::app::CMD_REQ_VOLUME_EXPLORER
                         | crate::app::CMD_REQ_DIAGNOSTICS
                         | crate::app::CMD_REQ_IMAGE_EXPLORER
@@ -1034,6 +1073,7 @@ mod tests {
                 id: id.into(),
                 name: name.into(),
                 image: "img".into(),
+                image_id: "sha256:img".into(),
                 state: state.into(),
                 status: "Up".into(),
                 ports: "80/tcp".into(),
@@ -1099,6 +1139,7 @@ mod tests {
                 id: id.into(),
                 name: name.into(),
                 image: "img".into(),
+                image_id: "sha256:img".into(),
                 state: state.into(),
                 status: "Up".into(),
                 ports: "80/tcp".into(),
@@ -1182,6 +1223,7 @@ mod tests {
                 id: "id-a".into(),
                 name: "web".into(),
                 image: "img".into(),
+                image_id: "sha256:img".into(),
                 state: "running".into(),
                 status: "Up".into(),
                 ports: "80/tcp".into(),
@@ -1289,6 +1331,120 @@ mod tests {
             out.iter()
                 .any(|e| matches!(e, Event::Command(c) if *c == crate::app::CMD_LAYERS)),
             "the desktop's command was re-posted"
+        );
+    }
+
+    /// The "Image" request mints the CURSOR container row and re-posts
+    /// the desktop's opener (the two-hop, like Explorer).
+    #[test]
+    fn two_hop_image_mints_the_cursor_container_and_posts_the_desktop_opener() {
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut().apply(AppMsg::Containers(vec![
+            crate::domain::docker::containers::ContainerSummary {
+                id: "id-a".into(),
+                name: "web".into(),
+                image: "img".into(),
+                image_id: "sha256:img".into(),
+                state: "running".into(),
+                status: "Up".into(),
+                ports: String::new(),
+                project: String::new(),
+                health: String::new(),
+            },
+        ]));
+        let mut w = crate::views::containers::build(
+            Rc::clone(&core),
+            Rect::new(2, 1, 78, 23),
+            None,
+            Rc::new(RefCell::new(true)),
+        );
+        let mut out = std::collections::VecDeque::new();
+        let mut timers = tv::TimerQueue::new();
+        let mut deferred: Vec<tv::Deferred> = Vec::new();
+        {
+            let mut ctx = Context::new(&mut out, &mut timers, 0, &mut deferred);
+            let mut ev = Event::Command(crate::app::CMD_REQ_IMAGE);
+            w.handle_event(&mut ev, &mut ctx);
+        }
+        assert_eq!(
+            core.borrow().pending_targets,
+            vec!["id-a".to_string()],
+            "one cursor-row container id"
+        );
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, Event::Command(c) if *c == crate::app::CMD_SHOW_IMAGE)),
+            "the desktop's opener was re-posted: {out:?}"
+        );
+    }
+
+    /// The focus-request broadcast moves the Images window's cursor to
+    /// the queued row — and is inert on other windows and when nothing
+    /// is queued.
+    #[test]
+    fn focus_broadcast_moves_the_images_cursor_and_is_inert_elsewhere() {
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        core.borrow_mut().apply(AppMsg::Images(vec![
+            crate::domain::docker::images::ImageEntry {
+                id: "sha256:aaa".into(),
+                repository: "nginx".into(),
+                tag: "1.27".into(),
+                size: 1_000,
+            },
+            crate::domain::docker::images::ImageEntry {
+                id: "sha256:bbb".into(),
+                repository: "redis".into(),
+                tag: "latest".into(),
+                size: 1_000,
+            },
+        ]));
+        let broadcast = |w: &mut ResourceWindow, core: &Rc<RefCell<AppCore>>| {
+            core.borrow_mut()
+                .set_focus_request("sha256:bbb".to_string());
+            let mut ev = Event::Broadcast {
+                command: crate::app::CMD_FOCUS_REQUEST,
+                source: None,
+            };
+            let mut out = std::collections::VecDeque::new();
+            let mut timers = tv::TimerQueue::new();
+            let mut deferred: Vec<tv::Deferred> = Vec::new();
+            let mut ctx = Context::new(&mut out, &mut timers, 0, &mut deferred);
+            w.handle_event(&mut ev, &mut ctx);
+        };
+
+        // The Images window: cursor jumps to the requested row.
+        let mut images = crate::views::images::build(
+            Rc::clone(&core),
+            Rect::new(2, 1, 78, 23),
+            Rc::new(RefCell::new(true)),
+        );
+        broadcast(&mut images, &core);
+        assert_eq!(
+            images
+                .table_mut()
+                .and_then(|t| t.focused_key())
+                .map(|k| k.0),
+            Some("sha256:bbb".to_string()),
+            "cursor on the requested image row"
+        );
+
+        // A Containers window: the broadcast is inert (its kind differs) —
+        // and the request stays queued for the real recipient.
+        let containers_core = Rc::new(RefCell::new(AppCore::new()));
+        containers_core
+            .borrow_mut()
+            .apply(AppMsg::Containers(vec![]));
+        let mut containers = crate::views::containers::build(
+            Rc::clone(&containers_core),
+            Rect::new(2, 1, 78, 23),
+            None,
+            Rc::new(RefCell::new(true)),
+        );
+        broadcast(&mut containers, &containers_core);
+        assert_eq!(
+            containers_core.borrow().focus_request,
+            Some("sha256:bbb".to_string()),
+            "a non-Images window must not consume the request"
         );
     }
 }
