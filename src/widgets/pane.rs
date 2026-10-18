@@ -357,7 +357,11 @@ mod tests {
         assert!(!pane.window_mut().bordered(), "and drops the frame");
         let want = pane_rects(pane.state().size);
         assert_eq!(
-            pane.window_mut().child_mut(body).unwrap().state().get_bounds(),
+            pane.window_mut()
+                .child_mut(body)
+                .unwrap()
+                .state()
+                .get_bounds(),
             want.body,
             "pane children re-lay out to the fullscreen size"
         );
@@ -379,7 +383,11 @@ mod tests {
         );
         let want = pane_rects(pane.state().size);
         assert_eq!(
-            pane.window_mut().child_mut(body).unwrap().state().get_bounds(),
+            pane.window_mut()
+                .child_mut(body)
+                .unwrap()
+                .state()
+                .get_bounds(),
             want.body,
             "children relayout back to the framed client"
         );
@@ -390,12 +398,11 @@ mod tests {
     fn full_screen_toggles_the_compact_window() {
         use tv::Fullscreen;
         let orig = Rect::new(2, 1, 78, 23);
-        let (win, ids) =
-            build_compact_window(orig, "diag", 1, dummy(), |rect| {
-                let mut d = dummy();
-                d.state_mut().set_bounds(rect);
-                d
-            });
+        let (win, ids) = build_compact_window(orig, "diag", 1, dummy(), |rect| {
+            let mut d = dummy();
+            d.state_mut().set_bounds(rect);
+            d
+        });
         let mut cw = CompactWindow { window: win, ids };
 
         assert!(press_fullscreen(&mut cw), "CompactWindow consumes it");
@@ -414,12 +421,11 @@ mod tests {
     fn full_screen_toggles_the_scroll_window() {
         use tv::Fullscreen;
         let orig = Rect::new(2, 1, 78, 23);
-        let (win, ids) =
-            build_scroll_window(orig, "details", 7, |rect, _bar| {
-                let mut d = dummy();
-                d.state_mut().set_bounds(rect);
-                d
-            });
+        let (win, ids) = build_scroll_window(orig, "details", 7, |rect, _bar| {
+            let mut d = dummy();
+            d.state_mut().set_bounds(rect);
+            d
+        });
         let mut sw = ScrollWindow { window: win, ids };
 
         assert!(press_fullscreen(&mut sw), "ScrollWindow consumes it");
@@ -437,17 +443,11 @@ mod tests {
     fn full_screen_toggles_the_scroll_status_window() {
         use tv::Fullscreen;
         let orig = Rect::new(2, 1, 78, 23);
-        let (win, ids) = build_scroll_status_window(
-            orig,
-            "shell",
-            9,
-            dummy(),
-            |rect, _bar| {
-                let mut d = dummy();
-                d.state_mut().set_bounds(rect);
-                d
-            },
-        );
+        let (win, ids) = build_scroll_status_window(orig, "shell", 9, dummy(), |rect, _bar| {
+            let mut d = dummy();
+            d.state_mut().set_bounds(rect);
+            d
+        });
         let mut sw = ScrollStatusWindow { window: win, ids };
 
         assert!(press_fullscreen(&mut sw), "ScrollStatusWindow consumes it");

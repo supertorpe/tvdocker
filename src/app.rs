@@ -34,7 +34,11 @@ pub const CMD_FULLSCREEN: Command = Command::custom("tvdocker.fullscreen");
 /// Called by each window wrapper in its own `handle_event` (the seam that
 /// already owns the inner [`tv::Window`]), so the toggle applies to the
 /// focused window and the wrappers' size-reconcile still runs afterwards.
-pub fn take_fullscreen(ev: &mut tv::event::Event, win: &mut tv::Window, ctx: &mut tv::Context) -> bool {
+pub fn take_fullscreen(
+    ev: &mut tv::event::Event,
+    win: &mut tv::Window,
+    ctx: &mut tv::Context,
+) -> bool {
     use tv::Fullscreen;
     if let tv::event::Event::Command(c) = ev
         && *c == CMD_FULLSCREEN

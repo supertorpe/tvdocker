@@ -452,11 +452,7 @@ mod tests {
             "one press reverts"
         );
         assert!(w.win.window.bordered(), "frame back");
-        assert_eq!(
-            w.win.window.state().get_bounds(),
-            orig,
-            "bounds restored"
-        );
+        assert_eq!(w.win.window.state().get_bounds(), orig, "bounds restored");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
