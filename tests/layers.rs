@@ -289,3 +289,114 @@ fn ctrl_t_and_a_reshape_the_tree_through_the_real_key_path() {
         "the second Ctrl+T returns to Single: {text}"
     );
 }
+
+/// A tree of `n` files under `prefix`, each named `b##`. The tag lets a test
+/// read WHICH pane scrolled straight off the screen.
+fn tree_of_many(prefix: &str, n: usize) -> Tree {
+    let mut t = Tree::new();
+    for i in 0..n {
+        t.add_path(entry(&format!("/{prefix}/b{i:02}"), "v1"));
+    }
+    t
+}
+
+/// 30 layers whose COMMAND cells are `A00..A29`, each holding the SAME 30
+/// `b##` files. Identical trees matter: wheeling the layer pane moves its
+/// cursor, and `selected` follows the cursor, so the tree pane rebuilds. With
+/// every layer's tree equal, that rebuild yields the same 30 rows — so a
+/// change in ONE pane can only have come from the wheel, never from the
+/// selection moving underneath the assertion.
+fn many_layer_analysis() -> Analysis {
+    analysis_of(
+        (0..30)
+            .map(|i| {
+                layer(
+                    i,
+                    &format!("A{i:02}"),
+                    1_000_000,
+                    tree_of_many("d", 30),
+                    &[],
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The lowest `A##`/`b##` tag still on screen — that pane's
+/// top-of-viewport row, or `None` when the pane shows none of them.
+fn top_visible(text: &str, tag: u8) -> Option<usize> {
+    (0..60).find(|i| text.contains(&format!("{}{:02}", tag as char, i)))
+}
+
+/// Wheel down `times`. The group fans the wheel to every child without
+/// hit-testing, so the position only has to be plausible.
+fn wheel_down(h: &mut common::AppHarness, times: usize) {
+    for _ in 0..times {
+        h.screen
+            .push_event(Event::MouseWheel(tv::event::MouseEvent {
+                position: tv::Point::new(10, 10),
+                wheel: tv::event::MouseWheel::Down,
+                ..tv::event::MouseEvent::default()
+            }));
+        // Each tick steps the bar, which broadcasts, which queues a
+        // ScrollSync deferred — a few pumps to settle. A real wheel tick is
+        // far slower than this loop, so this models the gap, not starves it.
+        pump(&mut h.program, 8);
+    }
+}
+
+/// The wheel must scroll the pane that holds the focus.
+///
+/// `Group::handle_event` fans `MouseWheel` out to every child in REVERSE
+/// insertion order and stops at the first consumer, and only the `ScrollBar`s
+/// handle it. This window inserts `layer_bar` before `tree_bar`, so the tree
+/// bar was reached first and consumed every scroll — the layer pane could not
+/// receive a wheel at all, exactly as the Explorer's host pane could not.
+#[test]
+fn the_mouse_wheel_scrolls_the_focused_pane() {
+    let mut h = app_start(|core| seed(core, many_layer_analysis()));
+    open_layers(&mut h);
+    let seeded = screen_text(&h.screen);
+    assert_eq!(
+        top_visible(&seeded, b'A'),
+        Some(0),
+        "the layer pane starts at its top: {seeded}"
+    );
+    assert_eq!(
+        top_visible(&seeded, b'b'),
+        Some(0),
+        "the tree pane starts at its top: {seeded}"
+    );
+
+    // The layer table owns the focus on open (`request_initial_focus`), so
+    // the wheel belongs to it. 8 ticks x 3 rows clears the ~16-row viewport.
+    wheel_down(&mut h, 8);
+    let after_left = screen_text(&h.screen);
+    let left_top = top_visible(&after_left, b'A');
+    assert!(
+        left_top.is_some_and(|t| t > 0),
+        "the wheel scrolled the FOCUSED layer pane (top={left_top:?}): {after_left}"
+    );
+    assert_eq!(
+        top_visible(&after_left, b'b'),
+        Some(0),
+        "…and left the unfocused tree pane alone: {after_left}"
+    );
+
+    // Tab crosses to the tree table: now the wheel must scroll IT, and the
+    // layer pane must stay exactly where it was.
+    h.screen.push_key(Key::Tab, KeyModifiers::default());
+    pump(&mut h.program, 4);
+    wheel_down(&mut h, 8);
+    let after_right = screen_text(&h.screen);
+    let right_top = top_visible(&after_right, b'b');
+    assert!(
+        right_top.is_some_and(|t| t > 0),
+        "the wheel scrolled the FOCUSED tree pane (top={right_top:?}): {after_right}"
+    );
+    assert_eq!(
+        top_visible(&after_right, b'A'),
+        left_top,
+        "…and left the layer pane where it was: {after_right}"
+    );
+}

@@ -943,6 +943,66 @@ fn apply_scroll_layout(win: &mut Window, ids: &ScrollIds) {
     }
 }
 
+/// Deliver a mouse wheel to one specific scroll bar, then re-assert the value
+/// the bar just chose. Returns `true` when `ev` WAS a wheel — the event is
+/// consumed, so the caller must `return` without delegating it to its children.
+///
+/// Two windows with side-by-side scroll bars need this, and neither can rely on
+/// the default routing:
+///
+/// * **Routing.** `Group::handle_event` fans `MouseWheel` out to every child in
+///   REVERSE insertion order and stops at the first consumer, and only
+///   `ScrollBar`s handle the wheel. Whichever bar was inserted LAST therefore
+///   wins every scroll no matter which pane holds the focus — the Explorer's
+///   host pane and the Layers pane both went dead while the right-hand bar
+///   responded. Calling this with the FOCUSED pane's bar makes focus decide.
+///
+/// * **Stall.** The wheel makes the BAR the source of truth, but the list
+///   viewer's cursor disagrees, and `list_viewer::focus_item` reconciles by
+///   pushing the cursor row back into the bar — also deferred, and queued a
+///   pass EARLIER, so in the deferred drain that write-back lands after ours
+///   and wins. The bar snaps back to the cursor row, the sync reads the stale
+///   cursor, and the pane never scrolls past it: every tick went `3 -> 6 ->
+///   3`, forever stuck on the first step. Re-asserting our value as a deferred
+///   puts ours LAST in the drain, so the sync that follows reads OUR value and
+///   the cursor catches up instead of fighting back.
+///
+/// The bar ignores the position for the wheel (it only reads the direction),
+/// but the coordinates are localized into the bar's frame anyway — matching
+/// what `Group::deliver` would have done — so a future position-aware bar
+/// still behaves.
+pub fn wheel_scrolls_bar(
+    win: &mut Window,
+    bar: ViewId,
+    ev: &mut tv::event::Event,
+    ctx: &mut tv::Context,
+) -> bool {
+    let tv::event::Event::MouseWheel(m) = ev else {
+        return false;
+    };
+    let m = *m;
+    let mut local = tv::event::Event::MouseWheel(m);
+    let stepped = {
+        let Some(child) = win.child_mut(bar) else {
+            ev.clear();
+            return true;
+        };
+        if let tv::event::Event::MouseWheel(lm) = &mut local {
+            lm.position -= child.state().get_bounds().a;
+        }
+        child.handle_event(&mut local, ctx);
+        child
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<ScrollBar>())
+            .map(|sb| sb.value)
+    };
+    if let Some(value) = stepped {
+        ctx.request_scroll_bar_params(bar, Some(value), None, None, None, None);
+    }
+    ev.clear();
+    true
+}
+
 /// Window wrapper for the scroll layout: re-derives the body/bar rects on every
 /// [`View::change_bounds`] (zoom / Size-Move / terminal clamps), the
 /// [`PaneWindow`] pattern.

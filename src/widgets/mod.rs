@@ -13,7 +13,7 @@ pub use pane::{
     CompactIds, CompactRects, CompactWindow, PaneIds, PaneRects, PaneWindow, ScrollIds,
     ScrollRects, ScrollStatusIds, ScrollStatusRects, ScrollStatusWindow, ScrollWindow,
     build_compact_window, build_pane_window, build_scroll_status_window, build_scroll_window,
-    compact_rects, pane_rects, scroll_rects, scroll_status_rects,
+    compact_rects, pane_rects, scroll_rects, scroll_status_rects, wheel_scrolls_bar,
 };
 pub use resource_table::{Align, Column, RowModel, TableRow, to_spec};
 pub use shared_line::SharedLine;

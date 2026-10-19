@@ -959,54 +959,21 @@ impl View for ExplorerWindow {
                 return;
             }
         }
-        // --- Mouse wheel: the group fans this out to EVERY child in reverse
-        // insertion order and stops at the first one that consumes it, and
-        // only the `ScrollBar`s handle the wheel. Since this window inserts
-        // `host_bar` BEFORE `remote_bar`, the remote bar was reached first and
-        // consumed every scroll — so the wheel always drove the right panel
-        // and could never reach the host at all. Deliver it to the ACTIVE
-        // panel's bar instead (the same focus-follows routing the keys use),
-        // localized into the bar's frame exactly as the group's `deliver`
-        // would have done, and always consume it so no sibling steals it.
-        if let Event::MouseWheel(m) = ev {
-            let m = *m;
+        // --- Mouse wheel: hand it to the ACTIVE panel's scroll bar. The
+        // default routing would fan it to every child in reverse insertion
+        // order and let `remote_bar` (inserted last) win it regardless of
+        // focus, and the list viewer's cursor write-back would then stall the
+        // bar on its first step — [`wheel_scrolls_bar`] documents both, and
+        // does the localization and the re-assert that beats the write-back.
+        if let Event::MouseWheel(_) = ev {
             let bar = if self.active_remote() {
                 self.remote.bar
             } else {
                 self.host.bar
             };
-            let mut local = Event::MouseWheel(m);
-            let stepped = {
-                let Some(v) = self.win.child_mut(bar) else {
-                    ev.clear();
-                    return;
-                };
-                if let Event::MouseWheel(lm) = &mut local {
-                    lm.position -= v.state().get_bounds().a;
-                }
-                v.handle_event(&mut local, ctx);
-                v.as_any_mut()
-                    .and_then(|a| a.downcast_mut::<tv::widgets::ScrollBar>())
-                    .map(|sb| sb.value)
-            };
-            if let Some(value) = stepped {
-                // Re-assert the value the bar just chose, as a DEFERRED.
-                //
-                // The wheel made the BAR the source of truth, but the table's
-                // cursor disagrees, and `list_viewer::focus_item` reconciles
-                // by pushing the cursor row back into the bar — also deferred.
-                // That write-back was queued a pass EARLIER, so in the deferred
-                // drain it lands after ours and wins: the bar snapped back to
-                // the cursor row, the sync then read the stale cursor, and the
-                // panel never scrolled past it (a stable stall, which is why
-                // only the first tick ever appeared to move anything). Queueing
-                // our own write behind it makes ours the LAST write in the
-                // drain, so the sync that follows reads OUR value and the
-                // cursor catches up instead of fighting back.
-                ctx.request_scroll_bar_params(bar, Some(value), None, None, None, None);
+            if crate::widgets::wheel_scrolls_bar(&mut self.win, bar, ev, ctx) {
+                return;
             }
-            ev.clear();
-            return;
         }
         self.redraw_texts(ctx);
         // Windows ▸ Full screen: this window owns the inner `win` directly,

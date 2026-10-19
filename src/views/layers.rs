@@ -1157,6 +1157,22 @@ impl View for LayersWindow {
         }
         self.window_keys(ev, ctx);
         self.sync_from_core();
+        // --- Mouse wheel: hand it to the FOCUSED pane's scroll bar. The
+        // default routing would fan it to every child in reverse insertion
+        // order and let `tree_bar` (inserted last) win it regardless of focus,
+        // and the list viewer's cursor write-back would then stall the bar on
+        // its first step — [`wheel_scrolls_bar`] documents both, and does the
+        // localization and the re-assert that beats the write-back.
+        if let Event::MouseWheel(_) = ev {
+            let bar = if self.is_focused(self.tree_table) {
+                self.tree_bar
+            } else {
+                self.layer_bar
+            };
+            if crate::widgets::wheel_scrolls_bar(&mut self.win, bar, ev, ctx) {
+                return;
+            }
+        }
         // Windows ▸ Full screen: this window owns the inner `win` directly.
         let full = crate::app::take_fullscreen(ev, &mut self.win, ctx);
         if !full {
