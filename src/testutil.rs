@@ -63,3 +63,27 @@ pub fn text(handle: &HeadlessHandle) -> String {
     }
     out
 }
+
+/// The popup menus a deferred batch opened (`Deferred::OpenMenuBox`) —
+/// how a test asserts that a header right-click opened the table's
+/// column popup, or a body right-click the row context menu.
+pub fn menus_opened(deferred: &[Deferred]) -> Vec<tv::menu::Menu> {
+    deferred
+        .iter()
+        .filter_map(|d| match d {
+            Deferred::OpenMenuBox { menu, .. } => Some(menu.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A menu's item labels, `~` hot markers stripped.
+pub fn menu_labels(menu: &tv::menu::Menu) -> Vec<String> {
+    menu.items
+        .iter()
+        .map(|i| match i {
+            tv::menu::MenuItem::Command { name, .. } => name.replace('~', ""),
+            _ => String::new(),
+        })
+        .collect()
+}

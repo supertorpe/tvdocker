@@ -22,7 +22,7 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
-use tv::widgets::{ScrollBar, SelectionMode, Separators, SortDir, Table};
+use tv::widgets::{ScrollBar, SelectionMode, Separators, Table};
 use tv::{Command, Context, DrawCtx, FieldValue, Rect, Role, View, ViewState, Window, delegate};
 
 /// Help context while an Explorer window is focused .
@@ -430,6 +430,19 @@ impl ExplorerWindow {
         None
     }
 
+    /// Does window-local `pos` fall on the header row of the panel whose
+    /// table bounds contain it? (Table-local y == 0 is the header row;
+    /// any lower row is body.)
+    fn on_header(&mut self, pos: tv::Point) -> bool {
+        let Some(remote) = self.panel_at(pos) else {
+            return false;
+        };
+        let id = self.panel_table(remote);
+        self.win
+            .child_mut(id)
+            .is_some_and(|v| v.state().get_bounds().a.y == pos.y)
+    }
+
     /// Focus the panel `remote` and the row under window-local `pos`: the
     /// table is focused through the window group, then a synthetic left
     /// press is delivered to the table through a throwaway `Context` so the
@@ -465,53 +478,13 @@ impl ExplorerWindow {
     /// DESCENDING, as the old table did), or flip the direction on
     /// Shift+←/→. The upstream `Table` only exposes `TABLE_SORT_NEXT`
     /// (forward, ascending) and `TABLE_SORT_FLIP`, so the window keeps
-    /// tvdocker's documented cycle and drives [`Table::sort_by`] itself.
+    /// tvdocker's documented cycle and drives [`Table::sort_by`] itself
+    /// (the shared [`crate::widgets::cycle_table_sort`]).
     fn cycle_sort(&mut self, remote: bool, forward: bool, flip: bool, ctx: &mut Context) {
         let id = self.panel_table(remote);
-        let Some(t) = self.table_mut(id) else {
-            return;
-        };
-        let layout = t.column_layout();
-        let n = layout.len();
-        if n == 0 {
-            return;
+        if let Some(t) = self.table_mut(id) {
+            crate::widgets::cycle_table_sort(t, forward, flip, ctx);
         }
-        let mut visible = vec![false; n];
-        for s in &layout {
-            if s.column < n {
-                visible[s.column] = !s.hidden;
-            }
-        }
-        let current = t.sort_spec();
-        let (col, dir) = if flip {
-            match current {
-                Some((c, d)) => (c, d.flip()),
-                None => match (0..n).find(|&i| visible[i]) {
-                    Some(c) => (c, SortDir::Asc),
-                    None => return,
-                },
-            }
-        } else {
-            let step: i64 = if forward { 1 } else { -1 };
-            // No sort yet: start one past the first / last column so the first
-            // step lands ON it.
-            let start = current.map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
-            let mut found = None;
-            let mut probe = start;
-            for _ in 0..n {
-                probe = (probe + step).rem_euclid(n as i64);
-                let i = probe as usize;
-                if visible[i] {
-                    found = Some(i);
-                    break;
-                }
-            }
-            match found {
-                Some(c) => (c, if forward { SortDir::Asc } else { SortDir::Desc }),
-                None => return,
-            }
-        };
-        t.sort_by(col, dir, ctx);
     }
 }
 
@@ -528,6 +501,12 @@ pub fn build(
 ) -> ExplorerWindow {
     let title = format!("Explorer — {label}");
     let mut win = Window::new(bounds, Some(title), WINDOW_NUMBER);
+    // Set ONCE on the window's state — the status line keys off the
+    // focused window's help ctx (the ResourceWindow/logs pattern:
+    // `Group::get_help_ctx` falls back to this state when every focused
+    // leaf yields NO_CONTEXT), so the Explorer def (Ctrl+O, F5, Del)
+    // applies while this window has the focus.
+    win.state_mut().help_ctx = HELP_CTX;
     let size = win.state().size;
     let r = explorer_rects(size);
 
@@ -689,6 +668,21 @@ impl View for ExplorerWindow {
                 table_key,
                 &ColumnLayoutCfg::from_states(&states),
             );
+            ev.clear();
+            return;
+        }
+        // --- Ctrl+O (the status pre-route's `TABLE_COLUMNS`): the upstream
+        // Table opens its header popup. Hand the command to the ACTIVE
+        // panel's table directly so it works even while a filter bar holds
+        // the focus (the ResourceWindow rule).
+        if let Event::Command(cmd) = ev
+            && *cmd == Command::TABLE_COLUMNS
+        {
+            let remote = self.active_remote();
+            let id = self.panel_table(remote);
+            if let Some(t) = self.table_mut(id) {
+                t.handle_event(ev, ctx);
+            }
             ev.clear();
             return;
         }
@@ -926,33 +920,35 @@ impl View for ExplorerWindow {
         // bare MouseDown in the pump would otherwise hold keys until a
         // MouseUp that a click-only stream never sends). A press on the
         // table's HEADER row is the table's own (click-to-sort / resize /
-        // move), so it is forwarded to the group. A DOUBLE-click
+        // move / column popup), so it is forwarded to the group. A DOUBLE-click
         // (`m.flags.double_click`, synthesized by the pump) OPENS the row —
         // the file-manager convention, the same request Enter makes.
-        // Right-click opens the context menu (the ResourceWindow precedent).
+        // Right-click on a body row opens the context menu (the
+        // ResourceWindow precedent); on the header row it opens the
+        // table's column-visibility popup.
         if let Event::MouseDown(m) = ev {
             let m = *m;
             if m.buttons.left
                 && let Some(remote) = self.panel_at(m.position)
+                && !self.on_header(m.position)
             {
-                let table_id = self.panel_table(remote);
-                // Table-local y == 0 is the header row; any lower row is body.
-                let on_header = self
-                    .win
-                    .child_mut(table_id)
-                    .is_some_and(|v| v.state().get_bounds().a.y == m.position.y);
-                if !on_header {
-                    self.focus_row_at(remote, m.position, ctx);
-                    if m.flags.double_click {
-                        self.enter(ctx); // climbs/descends; a no-op on files
-                    }
-                    ev.clear();
-                    return;
+                self.focus_row_at(remote, m.position, ctx);
+                if m.flags.double_click {
+                    self.enter(ctx); // climbs/descends; a no-op on files
                 }
+                ev.clear();
+                return;
             }
+            // Right-click: a BODY row focuses it and opens the file menu;
+            // the HEADER row is the table's own — the press falls through
+            // to the group, whose mouse-down auto-select focuses the clicked
+            // table and the table opens its column-visibility popup (the
+            // containers-view behavior; that auto-select is also what routes
+            // the popup's toggle commands back to THIS panel's table).
             if m.buttons.right
                 && !m.buttons.left
                 && let Some(remote) = self.panel_at(m.position)
+                && !self.on_header(m.position)
             {
                 self.focus_row_at(remote, m.position, ctx);
                 self.context_menu_at(m.position, ctx);

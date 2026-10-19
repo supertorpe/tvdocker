@@ -195,8 +195,8 @@ pub fn about_text() -> String {
 pub const SHORTCUTS_TEXT: &str = "\
     Tables: ←/→ cycle the sort column, Shift+←/→ flip\n\
     its direction, Space selects a row;\n\
-    Ctrl-A selects all; Shift+F10\n\
-    opens the row menu.\n\n\
+    Ctrl-A selects all; Ctrl+O columns;\n\
+    Shift+F10 opens the row menu.\n\n\
     Containers: F2 Logs · F4 Shell · Ctrl+E Explorer ·\n\
     Enter Details · Del Delete (confirm);\n\
     F7 pauses log follow.\n\n\
@@ -206,10 +206,10 @@ pub const SHORTCUTS_TEXT: &str = "\
     Volumes: Enter Explorer · Del Delete.\n\
     Explorer: Tab panels · / filter · n/N new · r rename · X copy · Del delete.\n\n\
     Diagnose: right-click a container →\n\
-    Diagnose…, one window per container.\n\n\
+    Diagnose…, one per container.\n\n\
     Settings: Options → Settings… edits\n\
-    tvdocker.toml; F2 saves + live-reloads.\n\n\
-    Esc closes menus/dialogs; inside a shell window\n\
+    tvdocker.toml; F2 saves + reloads.\n\n\
+    Esc closes menus/dialogs; in a shell window\n\
     Esc, Tab, arrows and Ctrl-keys go to the terminal.";
 
 /// A `Ctrl`-chord `KeyEvent`.
@@ -305,7 +305,8 @@ fn status_hidden(d: StatusItemsBuilder, kb: &Keybindings) -> StatusItemsBuilder 
 ///    Del, Ctrl+O — all bound.
 /// 2. The three picker tables (Images/Networks/Volumes): visible
 ///    `F1…F10`, hidden Alt-X/chords/Ctrl+O (no `^A` — §5 scopes it
-///    to Containers). Events/Statistics: no def (universal).
+///    to Containers). Events/Statistics/Layers: hidden Ctrl+O only
+///    (the app-wide column popup).
 /// 3. Logs: visible `F1…F10` + `F7 Follow`, hidden Alt-X/chords
 ///    (no `^A` — logs have no selection, a binding would be dead).
 /// 4. Universal: the bar with Alt-X visible.
@@ -352,16 +353,7 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                     k(&kb.select_all, ctrl_chord(Key::Char('a'))),
                     CMD_SELECT_ALL,
                 )
-                .key_item(
-                    KeyEvent::new(
-                        Key::Char('o'),
-                        KeyModifiers {
-                            ctrl: true,
-                            ..KeyModifiers::default()
-                        },
-                    ),
-                    Command::TABLE_COLUMNS,
-                )
+                .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
         })
         // Images: visible F2 = Run…; hidden Del.
         .def_one_of([crate::views::images::HELP_CTX], |d| {
@@ -395,49 +387,22 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                     ),
                     CMD_REQ_IMAGE_LAYERS,
                 )
-                .key_item(
-                    KeyEvent::new(
-                        Key::Char('o'),
-                        KeyModifiers {
-                            ctrl: true,
-                            ..KeyModifiers::default()
-                        },
-                    ),
-                    Command::TABLE_COLUMNS,
-                )
+                .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
         })
         // Networks: hidden Del; Ctrl+O.
         .def_one_of([crate::views::networks::HELP_CTX], |d| {
             status_hidden(status_always(d, kb), kb)
                 .key_item(k(&kb.delete, KeyEvent::from(Key::Delete)), CMD_REQ_DELETE)
-                .key_item(
-                    KeyEvent::new(
-                        Key::Char('o'),
-                        KeyModifiers {
-                            ctrl: true,
-                            ..KeyModifiers::default()
-                        },
-                    ),
-                    Command::TABLE_COLUMNS,
-                )
+                .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
         })
         // Volumes: Enter opens Explorer, Del, Ctrl+O.
         .def_one_of([crate::views::volumes::HELP_CTX], |d| {
             status_hidden(status_always(d, kb), kb)
                 .key_item(KeyEvent::from(Key::Enter), CMD_REQ_VOLUME_EXPLORER)
                 .key_item(k(&kb.delete, KeyEvent::from(Key::Delete)), CMD_REQ_DELETE)
-                .key_item(
-                    KeyEvent::new(
-                        Key::Char('o'),
-                        KeyModifiers {
-                            ctrl: true,
-                            ..KeyModifiers::default()
-                        },
-                    ),
-                    Command::TABLE_COLUMNS,
-                )
+                .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
         })
-        // Explorer: F5 Refresh, Del.
+        // Explorer: F5 Refresh, Del; Ctrl+O.
         .def_one_of([crate::views::explorer::HELP_CTX], |d| {
             status_hidden(status_always(d, kb), kb)
                 .item(
@@ -449,7 +414,25 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                     k(&kb.delete, KeyEvent::from(Key::Delete)),
                     crate::views::explorer::CMD_EXP_DELETE,
                 )
+                .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
         })
+        // Layers: only the app-wide Ctrl+O (sorting is ←/→ here like
+        // everywhere else; the rest are the window's own printable keys).
+        .def_one_of([crate::views::layers::HELP_CTX], |d| {
+            status_hidden(status_always(d, kb), kb)
+                .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
+        })
+        // Events/Statistics: read-only tables — only the app-wide Ctrl+O.
+        .def_one_of(
+            [
+                crate::views::events::HELP_CTX,
+                crate::views::statistics::HELP_CTX,
+            ],
+            |d| {
+                status_hidden(status_always(d, kb), kb)
+                    .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
+            },
+        )
         .def_one_of([crate::views::logs::HELP_CTX], |d| {
             status_hidden(status_always(d, kb), kb).item(
                 "~F7~ Follow",
@@ -1116,6 +1099,39 @@ mod tests {
         assert_eq!(transform(HELP_CTX, ctrl_a), Event::Command(CMD_SELECT_ALL));
     }
 
+    /// Ctrl+O is the app-wide "columns" chord: the status pre-route turns
+    /// it into `TABLE_COLUMNS` — the header's column-visibility popup —
+    /// in EVERY table window's context.
+    #[test]
+    fn ctrl_o_transforms_to_the_columns_command_in_every_table_context() {
+        let ctrl_o = || {
+            Event::KeyDown(KeyEvent::new(
+                Key::Char('o'),
+                KeyModifiers {
+                    ctrl: true,
+                    ..KeyModifiers::default()
+                },
+            ))
+        };
+        for (name, ctx) in [
+            ("containers", crate::views::containers::HELP_CTX),
+            ("images", crate::views::images::HELP_CTX),
+            ("networks", crate::views::networks::HELP_CTX),
+            ("volumes", crate::views::volumes::HELP_CTX),
+            ("events", crate::views::events::HELP_CTX),
+            ("statistics", crate::views::statistics::HELP_CTX),
+            ("explorer", crate::views::explorer::HELP_CTX),
+            ("layers", crate::views::layers::HELP_CTX),
+        ] {
+            let out = transform(ctx, ctrl_o());
+            assert_eq!(
+                out,
+                Event::Command(Command::TABLE_COLUMNS),
+                "{name} binds Ctrl+O to the column popup"
+            );
+        }
+    }
+
     #[test]
     fn alt_x_and_enter_still_transform_while_a_window_is_focused() {
         // hidden ≠ unbound.
@@ -1272,6 +1288,7 @@ mod tests {
             "←/→ cycle the sort column",
             "Shift+←/→",
             "Ctrl-A selects all",
+            "Ctrl+O columns",
             "Enter Explorer",
             // …and the menu entries that no status bar shows:
             "Options → Settings…",

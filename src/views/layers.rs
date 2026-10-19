@@ -9,6 +9,7 @@
 //! expects), and the COMMAND/PATH columns stretch (flex) to fill whatever
 //! their pane leaves.
 use crate::core::{AppCore, TaskReq};
+use crate::domain::config::{ColumnLayoutCfg, TvdockerConfig};
 use crate::domain::layers::{Analysis, Compare, Comparer, DiffType, Kind, Tree};
 use crate::widgets::resource_table::{RowModel, TableRow, to_spec};
 use crate::widgets::{Align, Column, FilterBar, SharedLine};
@@ -17,10 +18,10 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
-use tv::widgets::{SelectionMode, Separators, SortDir, Table};
+use tv::widgets::{SelectionMode, Separators, Table};
 use tv::{
-    Constraints, Context, HelpCtx, Rect, Role, ScrollBar, Splitter, View, ViewState, Window,
-    delegate,
+    Command, Constraints, Context, HelpCtx, Rect, Role, ScrollBar, Splitter, View, ViewState,
+    Window, delegate,
 };
 
 /// Help context while a Layers window is focused.
@@ -34,6 +35,8 @@ pub const WINDOW_NUMBER: i16 = 12;
 const LAYER_TABLE_KEY: &str = "layers.layers";
 /// The persisted column-layout key for the change tree.
 const TREE_TABLE_KEY: &str = "layers.tree";
+/// The persisted column-layout key for the inefficient-paths strip.
+const INEFFICIENT_TABLE_KEY: &str = "layers.inefficient";
 
 /// The layer table's columns: CMP and SIZE are fixed, COMMAND stretches
 /// into every cell they leave (flex), never below 12 cells — a pane
@@ -179,11 +182,11 @@ pub struct LayersWindow {
     mode: Compare,
     /// Directories the user collapsed (the root is never collapsed).
     collapsed: HashSet<String>,
-    /// The column sets this window was BUILT with: a `Table` takes its
-    /// column specs once, so `redraw` and the sort step must agree with
-    /// the build-time pane width, never the current one (a resize clips
-    /// the widest column instead of re-deriving the set).
-    layer_columns: Vec<Column>,
+    /// The change-tree column set this window was BUILT with: a `Table`
+    /// takes its column specs once, so `redraw` must agree with the
+    /// build-time pane width, never the current one (a resize clips the
+    /// widest column instead of re-deriving the set). The layer set needs
+    /// no copy — nothing rebuilds its rows per column.
     tree_columns: Vec<Column>,
     /// Change types currently hidden (A/R/M/U toggles), indexed by
     /// [`diff_index`] — `DiffType` carries no `Hash`, so a fixed array
@@ -235,11 +238,7 @@ fn make_table(
         .with_selection_mode(SelectionMode::Single)
         .with_model(Box::new(RowModel::new(rows)));
     table.state_mut().options.selectable = true;
-    if let Some(cfg) = crate::domain::config::TvdockerConfig::load()
-        .0
-        .column_layout(key)
-        .cloned()
-    {
+    if let Some(cfg) = TvdockerConfig::load().0.column_layout(key).cloned() {
         table.set_column_layout(&cfg.to_states());
     }
     table
@@ -529,6 +528,12 @@ pub fn build(
 ) -> LayersWindow {
     let title = format!("Layers — {label}");
     let mut win = Window::new(bounds, Some(title), WINDOW_NUMBER);
+    // Set ONCE on the window's state — the status line keys off the
+    // focused window's help ctx (the ResourceWindow/logs pattern:
+    // `Group::get_help_ctx` falls back to this state when every focused
+    // leaf yields NO_CONTEXT), so the Layers def (Ctrl+O) applies while
+    // this window has the focus.
+    win.state_mut().help_ctx = HELP_CTX;
     let size = win.state().size;
     // Provisional mid — re-derived below, once the splitter resolves its
     // panes; only the mid-independent rects (summary/strip/split) are
@@ -634,7 +639,7 @@ pub fn build(
     let layer_table = win.insert_child(Box::new(make_table(
         r.layer_table,
         LAYER_TABLE_KEY,
-        layer_cols.clone(),
+        layer_cols,
         seed_layers,
         Some(layer_bar),
     )));
@@ -648,7 +653,7 @@ pub fn build(
     )));
     let inefficient_table = win.insert_child(Box::new(make_table(
         r.inefficient,
-        "layers.inefficient",
+        INEFFICIENT_TABLE_KEY,
         vec![
             Column::new("COUNT", 6, Align::Right),
             Column::new("WASTED", 10, Align::Right),
@@ -674,7 +679,6 @@ pub fn build(
         inefficient_table,
         layer_filter,
         tree_filter,
-        layer_columns: layer_cols,
         tree_columns: tree_cols,
         summary_id,
         summary,
@@ -866,7 +870,7 @@ impl LayersWindow {
 
     /// The tree path of the right table's focused row (`None` while
     /// nothing is rendered yet). The row's KEY is the path, so this stays
-    /// correct under a Ctrl+O sort — an index into [`Self::visible_rows`]
+    /// correct under a column sort — an index into [`Self::visible_rows`]
     /// would not.
     fn focused_tree_path(&mut self) -> Option<String> {
         self.table_mut(self.tree_table)?.focused_key().map(|k| k.0)
@@ -896,24 +900,28 @@ impl LayersWindow {
         self.is_focused(self.layer_filter) || self.is_focused(self.tree_filter)
     }
 
-    /// Ctrl+O: step the focused table's sort to the next column, ascending
-    /// (the Explorer's `cycle_sort`, without the hidden-column probe — these
-    /// tables have no hidden columns).
-    fn cycle_sort(&mut self, forward: bool, ctx: &mut Context) {
-        let on_tree = self.is_focused(self.tree_table);
-        let (id, n) = if on_tree {
-            (self.tree_table, self.tree_columns.len())
+    /// The table that owns the focus — or, while a pane's filter bar holds
+    /// it, that pane's table (the layer table when neither pane does): the
+    /// target of Ctrl+O's column popup and of the ←/→ sort step.
+    fn focused_table(&mut self) -> tv::ViewId {
+        if self.is_focused(self.tree_table) || self.is_focused(self.tree_filter) {
+            self.tree_table
+        } else if self.is_focused(self.inefficient_table) {
+            self.inefficient_table
         } else {
-            (self.layer_table, self.layer_columns.len())
-        };
-        let Some(t) = self.table_mut(id) else { return };
-        let step: i64 = if forward { 1 } else { -1 };
-        let start = t
-            .sort_spec()
-            .map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
-        let col = ((start + step).rem_euclid(n as i64)) as usize;
-        t.sort_by(col, if forward { SortDir::Asc } else { SortDir::Desc }, ctx);
-        self.dirty = true; // the row order changed (the `t` borrow ends here)
+            self.layer_table
+        }
+    }
+
+    /// ←/→: step table `id`'s sort to the next/previous VISIBLE column
+    /// (backward lands descending, as the old table did; Shift flips the
+    /// current direction instead of stepping) — the app-wide convention,
+    /// through the shared [`crate::widgets::cycle_table_sort`].
+    fn cycle_sort(&mut self, id: tv::ViewId, forward: bool, flip: bool, ctx: &mut Context) {
+        if let Some(t) = self.table_mut(id) {
+            crate::widgets::cycle_table_sort(t, forward, flip, ctx);
+        }
+        self.dirty = true; // the row order may have changed
     }
 
     /// `/` (spec §7): send the filter bar of the pane that owns the focus.
@@ -928,13 +936,28 @@ impl LayersWindow {
     }
 
     /// The window's own keys (design §7): expand/collapse, the
-    /// compare-mode toggle, the four change-type filters, Ctrl+O's sort
+    /// compare-mode toggle, the four change-type filters, the ←/→ sort
     /// step and `/`'s filter focus. Only mutates state or moves focus —
     /// `handle_event` delegates to the children and redraws after this
     /// returns. The printables are gated on no filter bar being focused
     /// (the Explorer's rule): a focused bar swallows them for typing.
     fn window_keys(&mut self, ev: &mut Event, ctx: &mut Context) {
         let Event::KeyDown(ke) = ev else { return };
+        // --- Sort keys (←/→ cycle the column, Shift flips the direction):
+        // the app-wide table convention (the F1 box's "Tables" line). Only
+        // when a TABLE holds the focus (a filter keeps its own ←/→ caret
+        // movement); the window owns the cycle because the upstream Table
+        // command layer only has forward-ascending and flip.
+        if matches!(ke.key, Key::Left | Key::Right)
+            && (self.is_focused(self.layer_table)
+                || self.is_focused(self.tree_table)
+                || self.is_focused(self.inefficient_table))
+        {
+            let id = self.focused_table();
+            self.cycle_sort(id, ke.key == Key::Right, ke.modifiers.shift, ctx);
+            ev.clear();
+            return;
+        }
         match (ke.key, ke.modifiers.ctrl) {
             // Tab: exactly two stops (the Explorer's Ruling 3). The window
             // intercepts BEFORE the children run, so the nested groups'
@@ -955,13 +978,12 @@ impl LayersWindow {
                 self.win.focus_descendant(target, ctx);
                 ev.clear();
             }
-            // Ctrl chords the FilterBar never consumes.
+            // Ctrl chords the FilterBar never consumes. Ctrl+O is NOT
+            // here: the status pre-route turns it into
+            // `Command::TABLE_COLUMNS` (the column popup), which
+            // `handle_event` hands to the active pane's table.
             (Key::Char('t'), true) => {
                 self.toggle_mode();
-                ev.clear();
-            }
-            (Key::Char('o'), true) => {
-                self.cycle_sort(true, ctx);
                 ev.clear();
             }
             (key, false) if !self.filter_focused() => match key {
@@ -1149,6 +1171,49 @@ impl View for LayersWindow {
     /// of the SAME event.
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         let before = self.win.state().size;
+        // --- The upstream Table arranged its columns (resize / move / show /
+        // hide): persist the new layout for that table's key. The broadcast
+        // carries the table's own id as `source`.
+        if let Event::Broadcast { command, source } = ev
+            && *command == Command::TABLE_COLUMNS_CHANGED
+        {
+            let key = if *source == Some(self.layer_table) {
+                Some(LAYER_TABLE_KEY)
+            } else if *source == Some(self.tree_table) {
+                Some(TREE_TABLE_KEY)
+            } else if *source == Some(self.inefficient_table) {
+                Some(INEFFICIENT_TABLE_KEY)
+            } else {
+                None
+            };
+            if let (Some(source), Some(key)) = (*source, key) {
+                let states = self
+                    .table_mut(source)
+                    .map(|t| t.column_layout())
+                    .unwrap_or_default();
+                let _ = TvdockerConfig::set_column_layout_in_file(
+                    &TvdockerConfig::path(),
+                    key,
+                    &ColumnLayoutCfg::from_states(&states),
+                );
+                ev.clear();
+                return;
+            }
+        }
+        // --- Ctrl+O (the status pre-route's `TABLE_COLUMNS`): the upstream
+        // Table opens its header popup. Hand the command to the ACTIVE
+        // pane's table directly so it works even while a filter bar holds
+        // the focus (the ResourceWindow rule).
+        if let Event::Command(cmd) = ev
+            && *cmd == Command::TABLE_COLUMNS
+        {
+            let id = self.focused_table();
+            if let Some(t) = self.table_mut(id) {
+                t.handle_event(ev, ctx);
+            }
+            ev.clear();
+            return;
+        }
         // A divider nudge the keyboard-resize broker applied AFTER the
         // previous dispatch shows up here (the mouse-drag case is caught
         // by the same check below the delegation).

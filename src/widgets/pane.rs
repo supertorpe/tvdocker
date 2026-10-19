@@ -573,7 +573,8 @@ mod tests {
     }
 }
 
-use tv::{DrawCtx, Point, Rect, ScrollBar, View, ViewId, Window, delegate};
+use tv::widgets::{SortDir, Table};
+use tv::{Context, DrawCtx, Point, Rect, ScrollBar, View, ViewId, Window, delegate};
 
 /// Child rectangles for the standard pane, derived from the WINDOW size
 /// (frame included): the frame owns row `h-1` and column `w-1`, so the
@@ -1001,6 +1002,66 @@ pub fn wheel_scrolls_bar(
     }
     ev.clear();
     true
+}
+
+/// Step `t`'s sort to the next/previous VISIBLE column — the app-wide ←/→
+/// table convention (the F1 box's "Tables" line), shared by the
+/// ResourceWindow, the Explorer panels and the three Layers tables. The
+/// window owns the cycle because the upstream `Table` command layer only
+/// exposes forward-ascending (`TABLE_SORT_NEXT`) and flip
+/// (`TABLE_SORT_FLIP`):
+///
+/// * `forward` steps right (ascending) or left (backward lands
+///   descending, as the old table did); a fresh table starts ON its
+///   first/last visible column.
+/// * `flip` flips the current column's direction instead of stepping
+///   (Shift+←/→); with no sort yet it starts ascending on the first
+///   visible column.
+///
+/// Hidden columns are skipped (driven off [`Table::column_layout`]), so
+/// the arrows never sort by a column the user hid.
+pub fn cycle_table_sort(t: &mut Table, forward: bool, flip: bool, ctx: &mut Context) {
+    let layout = t.column_layout();
+    let n = layout.len();
+    if n == 0 {
+        return;
+    }
+    let mut visible = vec![false; n];
+    for s in &layout {
+        if s.column < n {
+            visible[s.column] = !s.hidden;
+        }
+    }
+    let current = t.sort_spec();
+    let (col, dir) = if flip {
+        match current {
+            Some((c, d)) => (c, d.flip()),
+            None => match (0..n).find(|&i| visible[i]) {
+                Some(c) => (c, SortDir::Asc),
+                None => return,
+            },
+        }
+    } else {
+        let step: i64 = if forward { 1 } else { -1 };
+        // No sort yet: start one past the first / last column so the first
+        // step lands ON it.
+        let start = current.map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
+        let mut found = None;
+        let mut probe = start;
+        for _ in 0..n {
+            probe = (probe + step).rem_euclid(n as i64);
+            let i = probe as usize;
+            if visible[i] {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(c) => (c, if forward { SortDir::Asc } else { SortDir::Desc }),
+            None => return,
+        }
+    };
+    t.sort_by(col, dir, ctx);
 }
 
 /// Window wrapper for the scroll layout: re-derives the body/bar rects on every

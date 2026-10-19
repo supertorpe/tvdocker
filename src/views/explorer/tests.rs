@@ -1,5 +1,6 @@
 use super::*;
 use crate::domain::docker::explorer::ExplorerEntry;
+use crate::testutil::{menu_labels, menus_opened};
 
 fn entry(name: &str, is_dir: bool) -> ExplorerEntry {
     ExplorerEntry {
@@ -1183,6 +1184,134 @@ fn the_scroll_bars_render_in_the_panels_right_most_columns() {
         assert_eq!(cell(lines[12], x), Some('▓'), "{name} bar's trough");
         assert_eq!(cell(lines[20], x), Some('▼'), "{name} bar's down arrow");
     }
+}
+
+/// Deliver a `MouseDown` at window-local `(x, y)` (`right` selects the
+/// right button) through a Context that KEEPS its deferred queue,
+/// returning the popup menus the event opened.
+fn mouse_menus(w: &mut ExplorerWindow, x: i32, y: i32, right: bool) -> Vec<tv::Menu> {
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = Event::MouseDown(tv::MouseEvent {
+            position: tv::Point::new(x, y),
+            buttons: tv::event::MouseButtons {
+                left: !right,
+                right,
+                ..Default::default()
+            },
+            ..tv::MouseEvent::default()
+        });
+        w.handle_event(&mut ev, &mut ctx);
+    }
+    menus_opened(&deferred)
+}
+
+/// Deliver a command through a Context that KEEPS its deferred queue,
+/// returning the popup menus it opened.
+fn command_menus(w: &mut ExplorerWindow, cmd: Command) -> Vec<tv::Menu> {
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = Event::Command(cmd);
+        w.handle_event(&mut ev, &mut ctx);
+    }
+    menus_opened(&deferred)
+}
+
+/// A right-click on a panel's HEADER row opens that table's column
+/// popup (the containers-view behavior) — never the file context menu.
+#[test]
+fn right_click_on_a_panel_header_opens_the_column_popup() {
+    let (mut w, _core, _rx) = window();
+    seed(
+        &mut w,
+        ExplorerTarget::Container("c1".into()),
+        "/",
+        vec![entry("d", false)],
+    );
+    let id = w.panel_table(false);
+    let bounds = child_bounds(&mut w, id);
+    let got: Vec<String> = mouse_menus(&mut w, bounds.a.x + 2, bounds.a.y, true)
+        .iter()
+        .flat_map(menu_labels)
+        .collect();
+    for column in ["NAME", "SIZE", "MODIFIED"] {
+        assert!(
+            got.iter().any(|l| l.ends_with(column)),
+            "the host columns are offered: {got:?}"
+        );
+    }
+    assert!(
+        !got.iter().any(|l| l.contains("Refresh")),
+        "the header opens no file menu: {got:?}"
+    );
+}
+
+/// A right-click on a body row still opens the file context menu for the
+/// clicked row — and never the column popup.
+#[test]
+fn right_click_on_a_body_row_keeps_the_row_menu() {
+    let (mut w, _core, _rx) = window();
+    seed(
+        &mut w,
+        ExplorerTarget::Container("c1".into()),
+        "/",
+        vec![entry("d", false)],
+    );
+    let id = w.panel_table(false);
+    let bounds = child_bounds(&mut w, id);
+    let got: Vec<String> = mouse_menus(&mut w, bounds.a.x + 2, bounds.a.y + 1, true)
+        .iter()
+        .flat_map(menu_labels)
+        .collect();
+    assert!(
+        got.iter().any(|l| l.contains("Refresh")),
+        "the body row opens its file menu: {got:?}"
+    );
+    assert!(
+        !got.iter().any(|l| l.ends_with("NAME")),
+        "the body opens no column popup: {got:?}"
+    );
+}
+
+/// The status pre-route's Ctrl+O (`Command::TABLE_COLUMNS`) opens the
+/// active panel's column popup even while that panel's filter bar holds
+/// the focus (the resource windows' rule).
+#[test]
+fn the_columns_command_opens_the_popup_with_the_filter_focused() {
+    let (mut w, _core, _rx) = window();
+    crate::testutil::with_ctx(|ctx| {
+        w.win.focus_descendant(w.host.filter, ctx);
+    });
+    let got: Vec<String> = command_menus(&mut w, Command::TABLE_COLUMNS)
+        .iter()
+        .flat_map(menu_labels)
+        .collect();
+    for column in ["NAME", "SIZE", "MODIFIED"] {
+        assert!(
+            got.iter().any(|l| l.ends_with(column)),
+            "Ctrl+O offers the host columns: {got:?}"
+        );
+    }
+}
+
+/// The window reports its help context, so the status line switches to
+/// the Explorer def while it is focused (Ctrl+O's column popup, F5,
+/// Del). Without it `Group::get_help_ctx` yields NO_CONTEXT from every
+/// child and the bar stays on the universal def — no window keys bound.
+#[test]
+fn the_window_reports_its_help_context() {
+    let (w, _core, _rx) = window();
+    assert_eq!(
+        w.win.state().help_ctx,
+        HELP_CTX,
+        "the status line keys off it"
+    );
 }
 
 /// 0.18: both panels' tables rule their column separators — a `│` between

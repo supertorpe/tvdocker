@@ -16,7 +16,7 @@ use std::rc::Rc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
 use tv::widgets::table::TableModel;
-use tv::widgets::{RowKey, SelectionMode, Separators, SortDir, SortKey, Table};
+use tv::widgets::{RowKey, SelectionMode, Separators, SortKey, Table};
 use tv::{Command, Context, DrawCtx, HelpCtx, Rect, Role, View, ViewState, delegate};
 
 /// A resource's context-menu builder: the window's core and the clicked
@@ -455,50 +455,9 @@ impl ResourceWindow {
     /// ascending) and `TABLE_SORT_FLIP`, so the window keeps tvdocker's
     /// documented cycle and drives [`Table::sort_by`] itself.
     fn cycle_sort(&mut self, forward: bool, flip: bool, ctx: &mut Context) {
-        let Some(t) = self.table_mut() else {
-            return;
-        };
-        let layout = t.column_layout();
-        let n = layout.len();
-        if n == 0 {
-            return;
+        if let Some(t) = self.table_mut() {
+            crate::widgets::cycle_table_sort(t, forward, flip, ctx);
         }
-        let mut visible = vec![false; n];
-        for s in &layout {
-            if s.column < n {
-                visible[s.column] = !s.hidden;
-            }
-        }
-        let current = t.sort_spec();
-        let (col, dir) = if flip {
-            match current {
-                Some((c, d)) => (c, d.flip()),
-                None => match (0..n).find(|&i| visible[i]) {
-                    Some(c) => (c, SortDir::Asc),
-                    None => return,
-                },
-            }
-        } else {
-            let step: i64 = if forward { 1 } else { -1 };
-            // No sort yet: start one past the first / last column so the first
-            // step lands ON it.
-            let start = current.map_or(if forward { -1 } else { n as i64 }, |(c, _)| c as i64);
-            let mut found = None;
-            let mut probe = start;
-            for _ in 0..n {
-                probe = (probe + step).rem_euclid(n as i64);
-                let i = probe as usize;
-                if visible[i] {
-                    found = Some(i);
-                    break;
-                }
-            }
-            match found {
-                Some(c) => (c, if forward { SortDir::Asc } else { SortDir::Desc }),
-                None => return,
-            }
-        };
-        t.sort_by(col, dir, ctx);
     }
 
     /// Open the row context menu at window-local `anchor`, built from

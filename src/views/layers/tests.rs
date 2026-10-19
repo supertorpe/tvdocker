@@ -1,8 +1,10 @@
 use super::*;
 use crate::domain::layers::{Analysis, DiffType, Entry, Kind, Layer, Tree, hash_bytes};
 use crate::testutil;
+use crate::testutil::menu_labels;
 use tv::Role;
 use tv::event::{Key, KeyEvent, KeyModifiers};
+use tv::widgets::SortDir;
 
 fn mods(ctrl: bool) -> KeyModifiers {
     KeyModifiers {
@@ -121,6 +123,20 @@ fn window_with(a: Analysis) -> LayersWindow {
     );
     sync_and_draw(&mut win);
     win
+}
+
+/// The window reports its help context, so the status line switches to
+/// the Layers def while it is focused (Ctrl+O's column popup). Without
+/// it `Group::get_help_ctx` yields NO_CONTEXT from every child and the
+/// bar stays on the universal def — no window keys bound.
+#[test]
+fn the_window_reports_its_help_context() {
+    let win = window_with(analysis());
+    assert_eq!(
+        win.win.state().help_ctx,
+        HELP_CTX,
+        "the status line keys off it"
+    );
 }
 
 /// 0.18: every table in the layers window rules its column separators.
@@ -1019,4 +1035,187 @@ fn full_screen_toggles_the_layers_window() {
     assert_eq!(w.win.fullscreen(), Fullscreen::Off, "one press reverts");
     assert!(w.win.bordered(), "frame back");
     assert_eq!(w.win.state().get_bounds(), orig, "bounds restored");
+}
+
+/// Focus the window group and descend to `id` — the pump pass the
+/// explorer/layers tests recreate before children report `focused`.
+fn focus_table(win: &mut LayersWindow, id: tv::ViewId) {
+    testutil::with_ctx(|ctx| {
+        win.win.state_mut().state.focused = true;
+        win.win.settle_currency(ctx);
+        win.win.focus_descendant(id, ctx);
+    });
+}
+
+/// A shift modifier.
+fn shift() -> KeyModifiers {
+    KeyModifiers {
+        shift: true,
+        ..KeyModifiers::default()
+    }
+}
+
+/// A right `MouseDown` at window-local `(x, y)`, through a Context that
+/// KEEPS its deferred queue; returns the popup menus it opened.
+fn right_click_menus(win: &mut LayersWindow, x: i32, y: i32) -> Vec<tv::Menu> {
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = tv::event::Event::MouseDown(tv::MouseEvent {
+            position: tv::Point::new(x, y),
+            buttons: tv::event::MouseButtons {
+                right: true,
+                ..Default::default()
+            },
+            ..tv::MouseEvent::default()
+        });
+        win.handle_event(&mut ev, &mut ctx);
+    }
+    testutil::menus_opened(&deferred)
+}
+
+/// A command through a Context that KEEPS its deferred queue; returns the
+/// popup menus it opened.
+fn command_menus(win: &mut LayersWindow, cmd: tv::Command) -> Vec<tv::Menu> {
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = tv::event::Event::Command(cmd);
+        win.handle_event(&mut ev, &mut ctx);
+    }
+    testutil::menus_opened(&deferred)
+}
+
+/// A right-click on ANY of the three tables' header rows opens that
+/// table's column popup — the containers-view behavior, per table.
+#[test]
+fn right_click_on_any_table_header_opens_its_column_popup() {
+    let mut win = window_with(analysis());
+    for (id, column) in [
+        (win.layer_table, "COMMAND"),
+        (win.tree_table, "CHANGE"),
+        (win.inefficient_table, "WASTED"),
+    ] {
+        let bounds = win
+            .win
+            .child_mut(id)
+            .expect("table child")
+            .state()
+            .get_bounds();
+        let got: Vec<String> = right_click_menus(&mut win, bounds.a.x + 2, bounds.a.y)
+            .iter()
+            .flat_map(menu_labels)
+            .collect();
+        assert!(
+            got.iter().any(|l| l.ends_with(column)),
+            "table {id:?} offers its columns: {got:?}"
+        );
+    }
+}
+
+/// Ctrl+O (the status pre-route's `TABLE_COLUMNS`) opens the active
+/// pane's column popup — even while that pane's filter bar holds the
+/// focus (the resource windows' rule).
+#[test]
+fn the_columns_command_opens_the_active_panes_column_popup() {
+    let mut win = window_with(analysis());
+    let tree = win.tree_table;
+    focus_table(&mut win, tree);
+    testutil::with_ctx(|ctx| {
+        win.win.focus_descendant(win.tree_filter, ctx);
+    });
+    let got: Vec<String> = command_menus(&mut win, tv::Command::TABLE_COLUMNS)
+        .iter()
+        .flat_map(menu_labels)
+        .collect();
+    assert!(
+        got.iter().any(|l| l.ends_with("CHANGE")),
+        "the tree columns are offered: {got:?}"
+    );
+}
+
+/// ←/→ step the focused table's sort to the next/previous column and
+/// Shift flips the direction — the app-wide table convention the F1 box
+/// documents; the Layers window's former Ctrl+O sort step, re-homed.
+#[test]
+fn arrow_keys_cycle_the_focused_tables_sort_column() {
+    let mut win = window_with(analysis());
+    let layer = win.layer_table;
+    focus_table(&mut win, layer);
+    let sort = |win: &mut LayersWindow| win.table_mut(layer).expect("table child").sort_spec();
+    testutil::send_key(&mut win, Key::Right);
+    assert_eq!(
+        sort(&mut win),
+        Some((0, SortDir::Asc)),
+        "→ lands on the first column"
+    );
+    testutil::send_key_mods(&mut win, Key::Right, shift());
+    assert_eq!(
+        sort(&mut win),
+        Some((0, SortDir::Desc)),
+        "Shift+→ flips the direction"
+    );
+    testutil::send_key(&mut win, Key::Left);
+    assert_eq!(
+        sort(&mut win),
+        Some((2, SortDir::Desc)),
+        "← walks backward (descending) onto the last column"
+    );
+}
+
+/// A focused filter bar keeps its own ←/→ caret movement: no sort step.
+#[test]
+fn arrows_do_not_sort_while_a_filter_bar_holds_the_focus() {
+    let mut win = window_with(analysis());
+    let layer = win.layer_table;
+    focus_table(&mut win, layer);
+    testutil::send_key(&mut win, Key::Char('/'));
+    assert!(
+        win.is_focused(win.layer_filter),
+        "the layer bar holds focus"
+    );
+    testutil::send_key(&mut win, Key::Right);
+    assert_eq!(
+        win.table_mut(layer).expect("table child").sort_spec(),
+        None,
+        "no sort from the filter bar"
+    );
+}
+
+/// A column-arrangement broadcast from ANY of the three tables persists
+/// that table's layout under its own `[column_layouts]` key — the
+/// Explorer/ResourceWindow rule (without it the user's column choices
+/// die with the window).
+#[test]
+fn a_columns_changed_broadcast_persists_the_tables_layout() {
+    let path = std::env::temp_dir().join(format!(
+        "tvdocker-layers-columns-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    crate::domain::config::TvdockerConfig::set_path_override(path.clone());
+
+    let mut win = window_with(analysis());
+    for (id, key) in [
+        (win.layer_table, "layers.layers"),
+        (win.tree_table, "layers.tree"),
+        (win.inefficient_table, "layers.inefficient"),
+    ] {
+        testutil::send_event(
+            &mut win,
+            tv::event::Event::Broadcast {
+                command: tv::Command::TABLE_COLUMNS_CHANGED,
+                source: Some(id),
+            },
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            text.contains(&format!("[column_layouts.\"{key}\"]")),
+            "{key} lands in the config: {text:?}"
+        );
+    }
 }
