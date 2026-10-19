@@ -1184,3 +1184,18 @@ fn the_scroll_bars_render_in_the_panels_right_most_columns() {
         assert_eq!(cell(lines[20], x), Some('▼'), "{name} bar's down arrow");
     }
 }
+
+/// 0.18: both panels' tables rule their column separators — a `│` between
+/// the header cells and between every row's cells.
+#[test]
+fn both_panels_tables_draw_column_separators() {
+    let (mut w, _core, _rx) = window();
+    for remote in [false, true] {
+        let id = w.panel_table(remote);
+        assert_eq!(
+            w.table_mut(id).expect("table child").separators(),
+            tv::widgets::Separators::All,
+            "panel {remote} draws its column separators"
+        );
+    }
+}

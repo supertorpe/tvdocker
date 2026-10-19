@@ -16,7 +16,7 @@ use std::rc::Rc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
 use tv::widgets::table::TableModel;
-use tv::widgets::{RowKey, SelectionMode, SortDir, SortKey, Table};
+use tv::widgets::{RowKey, SelectionMode, Separators, SortDir, SortKey, Table};
 use tv::{Command, Context, DrawCtx, HelpCtx, Rect, Role, View, ViewState, delegate};
 
 /// A resource's context-menu builder: the window's core and the clicked
@@ -259,6 +259,7 @@ pub fn build(
         |rect, bar| {
             let columns = (spec.columns)().iter().map(to_spec).collect();
             let mut table = Table::new(rect, columns, bar)
+                .with_separators(Separators::All)
                 .with_selection_mode(if selectable {
                     SelectionMode::Multi
                 } else {
@@ -931,6 +932,43 @@ mod tests {
         );
         assert!(out.contains("[ ]"), "check column drawn: {out:?}");
         assert!(out.contains("selected"), "selected counter: {out:?}");
+    }
+
+    /// 0.18: the window's table rules its column separators — the header
+    /// and every row split their cells with the theme's `│`.
+    #[test]
+    fn tables_render_column_separators() {
+        let core = core_with(&["alpha", "beta"]);
+        let spec = ResourceSpec {
+            columns: || {
+                vec![
+                    Column::new("NAME", 12, crate::widgets::Align::Left),
+                    Column::new("SIZE", 8, crate::widgets::Align::Right),
+                ]
+            },
+            rows: |core| {
+                core.volumes
+                    .iter()
+                    .map(|v| TableRow::new(v.name.clone(), vec![v.name.clone(), "1MB".into()]))
+                    .collect()
+            },
+            ..demo_spec()
+        };
+        let mut w = window(spec, core);
+        assert_eq!(
+            w.table_mut().expect("table child").separators(),
+            tv::widgets::Separators::All,
+            "the resource table draws its column separators"
+        );
+        let out = text(&render_view(76, 23, &mut w));
+        assert!(
+            out.contains("NAME        │"),
+            "the header rules between the columns: {out:?}"
+        );
+        assert!(
+            out.contains("alpha       │"),
+            "row cells are ruled apart: {out:?}"
+        );
     }
 
     /// Ctrl+A on a read-only window must not silently populate invisible

@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/supertorpe/tvdocker"
 
 [dependencies]
-tv = { package = "tvision-rs", version = "0.17" }
+tv = { package = "tvision-rs", version = "0.18" }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-util", "time"] }
 bollard = "0.18"

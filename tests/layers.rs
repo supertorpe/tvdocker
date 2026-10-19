@@ -197,9 +197,10 @@ fn invoking_the_opener_twice_never_duplicates_the_window() {
 /// The whole whiteout chain — tombstone (`Layer::removed`) → `stack` →
 /// `compare` → the rendered row — proven on screen. `tree_rows_for` renders
 /// the change letter in the CHANGE cell (`Removed='-'`, `Unmodified=' '`),
-/// and the CHANGE cell is delimited by spaces, so `contains(" - ")` is
-/// exactly "this row's letter is `-`" (the PERM column has its own
-/// dashes, but never surrounded by spaces).
+/// a 2-cell left-aligned column between the table's `│` separators, so
+/// `contains("│- │")` is exactly "this row's letter is `-`" (the PERM
+/// column's dashes are followed by `r`, never by ` ` before the separator,
+/// and the tree's connectors are box-drawing, not `-`).
 #[test]
 fn a_whiteout_renders_as_a_deletion_on_the_removed_paths_row() {
     let mut h = app_start(|core| seed(core, whiteout_analysis()));
@@ -207,7 +208,7 @@ fn a_whiteout_renders_as_a_deletion_on_the_removed_paths_row() {
     // Layer 0 against itself marks nothing: the tombstone must not show yet.
     let text = screen_text(&h.screen);
     assert!(
-        !line_with(&text, "hosts").contains(" - "),
+        !line_with(&text, "hosts").contains("│- │"),
         "layer 0 wrote hosts and nothing removed it yet: {text}"
     );
     // One Down: the cursor reaches layer 1 and the tree rebuilds for it.
@@ -215,11 +216,11 @@ fn a_whiteout_renders_as_a_deletion_on_the_removed_paths_row() {
     pump(&mut h.program, 2);
     let text = screen_text(&h.screen);
     assert!(
-        line_with(&text, "hosts").contains(" - "),
+        line_with(&text, "hosts").contains("│- │"),
         "the whiteout renders as a deletion: {text}"
     );
     assert!(
-        !line_with(&text, "passwd").contains(" - "),
+        !line_with(&text, "passwd").contains("│- │"),
         "the untouched survivor is not marked deleted: {text}"
     );
 }

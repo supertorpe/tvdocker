@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
-use tv::widgets::{SelectionMode, SortDir, Table};
+use tv::widgets::{SelectionMode, Separators, SortDir, Table};
 use tv::{
     Constraints, Context, HelpCtx, Rect, Role, ScrollBar, Splitter, View, ViewState, Window,
     delegate,
@@ -231,6 +231,7 @@ fn make_table(
 ) -> Table {
     let specs = columns.iter().map(to_spec).collect();
     let mut table = Table::new(rect, specs, bar)
+        .with_separators(Separators::All)
         .with_selection_mode(SelectionMode::Single)
         .with_model(Box::new(RowModel::new(rows)));
     table.state_mut().options.selectable = true;

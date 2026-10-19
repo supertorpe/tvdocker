@@ -123,6 +123,18 @@ fn window_with(a: Analysis) -> LayersWindow {
     win
 }
 
+/// 0.18: every table in the layers window rules its column separators.
+#[test]
+fn all_three_tables_draw_column_separators() {
+    let mut win = window_with(analysis());
+    for id in [win.layer_table, win.tree_table, win.inefficient_table] {
+        assert_eq!(
+            win.table_mut(id).expect("table child").separators(),
+            tv::widgets::Separators::All
+        );
+    }
+}
+
 #[test]
 fn the_change_tree_carries_a_role_per_change_type() {
     assert_eq!(role_for(DiffType::Added), Some(Role::Success));

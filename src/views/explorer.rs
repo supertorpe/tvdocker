@@ -22,7 +22,7 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
-use tv::widgets::{ScrollBar, SelectionMode, SortDir, Table};
+use tv::widgets::{ScrollBar, SelectionMode, Separators, SortDir, Table};
 use tv::{Command, Context, DrawCtx, FieldValue, Rect, Role, View, ViewState, Window, delegate};
 
 /// Help context while an Explorer window is focused .
@@ -192,6 +192,7 @@ fn rows_for(entries: &[ExplorerEntry], show_parent: bool) -> Vec<TableRow> {
 fn make_table(rect: Rect, table_key: &str, rows: Vec<TableRow>, bar: tv::ViewId) -> Table {
     let specs = columns().iter().map(to_spec).collect();
     let mut table = Table::new(rect, specs, Some(bar))
+        .with_separators(Separators::All)
         .with_selection_mode(SelectionMode::Multi)
         .with_model(Box::new(RowModel::new(rows)));
     // The upstream `Table` is a `Group`: mark it selectable so focus can
