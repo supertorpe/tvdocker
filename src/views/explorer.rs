@@ -22,7 +22,7 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
-use tv::widgets::{SelectionMode, SortDir, Table};
+use tv::widgets::{ScrollBar, SelectionMode, SortDir, Table};
 use tv::{Command, Context, DrawCtx, FieldValue, Rect, Role, View, ViewState, Window, delegate};
 
 /// Help context while an Explorer window is focused .
@@ -102,13 +102,24 @@ fn explorer_rects(size: tv::Point) -> ExplorerRects {
     let first_table = 3.min(bottom);
     let hint_y = (bottom - 1).max(first_table);
     let last_table = hint_y.min(bottom);
+    // One column per panel, taken from that panel's own table: the host bar
+    // is the LAST column of the host table, the remote bar the last of the
+    // remote one. The `.max(…)`/`.min(…)` pairs keep every rect ordered even
+    // at degenerate widths (a 1- or 2-column window), where the table may
+    // collapse to zero width but must never invert.
+    let host_body_right = (mid - 2).max(1);
+    let host_bar_right = (mid - 1).max(host_body_right);
+    let remote_body_right = (right - 1).max(mid + 1).min(right);
+    let remote_bar_right = right.max(remote_body_right);
     ExplorerRects {
         breadcrumb_host: Rect::new(1, 1, mid - 1, 2.min(bottom)),
         breadcrumb_remote: Rect::new(mid + 1, 1, right, 2.min(bottom)),
         host_filter: Rect::new(1, 2.min(bottom), mid - 1, 3.min(bottom)),
         remote_filter: Rect::new(mid + 1, 2.min(bottom), right, 3.min(bottom)),
-        host_table: Rect::new(1, first_table, mid - 1, last_table),
-        remote_table: Rect::new(mid + 1, first_table, right, last_table),
+        host_table: Rect::new(1, first_table, host_body_right, last_table),
+        host_bar: Rect::new(host_body_right, first_table, host_bar_right, last_table),
+        remote_table: Rect::new(mid + 1, first_table, remote_body_right, last_table),
+        remote_bar: Rect::new(remote_body_right, first_table, remote_bar_right, last_table),
         hint: Rect::new(1, hint_y, right, bottom.max(hint_y)),
     }
 }
@@ -121,17 +132,26 @@ struct ExplorerRects {
     host_filter: Rect,
     remote_filter: Rect,
     host_table: Rect,
+    /// The host table's vertical scroll bar (its right-most column).
+    host_bar: Rect,
     remote_table: Rect,
+    /// The remote table's vertical scroll bar (its right-most column).
+    remote_bar: Rect,
     hint: Rect,
 }
 
-/// One panel's view half: table + its filter bar's id.
+/// One panel's view half: table + its scroll bar's and filter bar's ids.
 struct Panel {
     table: tv::ViewId,
+    /// The table's vertical scroll bar, in its right-most column.
+    bar: tv::ViewId,
     filter: tv::ViewId,
     path: String,
     entries: Vec<ExplorerEntry>,
     last_rev: u64,
+    /// The rows last pushed to the table — the gate for
+    /// [`ExplorerWindow::push_rows`]. `TableRow: PartialEq`.
+    last_rows: Vec<TableRow>,
     /// The `..` parent row exists for every path but "/".
     show_parent: bool,
 }
@@ -165,12 +185,13 @@ fn rows_for(entries: &[ExplorerEntry], show_parent: bool) -> Vec<TableRow> {
     rows
 }
 
-/// Build one panel's upstream `Table`: a multi-select table over `rows`, its
-/// group marked selectable (so the window's focus pass treats it as a stop),
-/// with the persisted per-panel column layout restored when configured.
-fn make_table(rect: Rect, table_key: &str, rows: Vec<TableRow>) -> Table {
+/// Build one panel's table: a multi-select table over `rows`, its group
+/// marked selectable (so the window's focus pass treats it as a stop), wired
+/// to `bar` (the vertical scroll bar in its right-most column), with the
+/// persisted per-panel column layout restored when configured.
+fn make_table(rect: Rect, table_key: &str, rows: Vec<TableRow>, bar: tv::ViewId) -> Table {
     let specs = columns().iter().map(to_spec).collect();
-    let mut table = Table::new(rect, specs, None)
+    let mut table = Table::new(rect, specs, Some(bar))
         .with_selection_mode(SelectionMode::Multi)
         .with_model(Box::new(RowModel::new(rows)));
     // The upstream `Table` is a `Group`: mark it selectable so focus can
@@ -328,13 +349,41 @@ impl ExplorerWindow {
         );
         let host_rows = rows_for(&self.host.entries, self.host.show_parent);
         let remote_rows = rows_for(&self.remote.entries, self.remote.show_parent);
-        let host_id = self.host.table;
-        if let Some(t) = self.table_mut(host_id) {
-            t.set_model(Box::new(RowModel::new(host_rows)), ctx);
+        self.push_rows(false, host_rows, ctx);
+        self.push_rows(true, remote_rows, ctx);
+    }
+
+    /// Push `rows` into panel `remote`'s table — but ONLY when they differ
+    /// from what that table already holds.
+    ///
+    /// This gate is load-bearing, not an optimisation. [`Table::set_model`]
+    /// publishes the model, and publishing calls
+    /// `list_viewer::focus_item_num(focused)`, which re-anchors `top_item`
+    /// on the CURSOR row and re-publishes that row index to the scroll bar.
+    /// `redraw_texts` runs on EVERY event, so without the gate each one
+    /// snapped the viewport back to the cursor — silently undoing any
+    /// scroll the bar had just applied. That is why the scroll bars and the
+    /// mouse wheel looked dead: only key scrolling survived, because it
+    /// moves the cursor itself.
+    fn push_rows(&mut self, remote: bool, rows: Vec<TableRow>, ctx: &mut Context) {
+        {
+            let panel = if remote {
+                &mut self.remote
+            } else {
+                &mut self.host
+            };
+            if panel.last_rows == rows {
+                return;
+            }
+            panel.last_rows = rows.clone();
         }
-        let remote_id = self.remote.table;
-        if let Some(t) = self.table_mut(remote_id) {
-            t.set_model(Box::new(RowModel::new(remote_rows)), ctx);
+        let table_id = if remote {
+            self.remote.table
+        } else {
+            self.host.table
+        };
+        if let Some(t) = self.table_mut(table_id) {
+            t.set_model(Box::new(RowModel::new(rows)), ctx);
         }
     }
 
@@ -355,6 +404,8 @@ impl ExplorerWindow {
             (self.breadcrumb_remote_id, r.breadcrumb_remote),
             (self.host.filter, r.host_filter),
             (self.remote.filter, r.remote_filter),
+            (self.host.bar, r.host_bar),
+            (self.remote.bar, r.remote_bar),
             (self.host.table, r.host_table),
             (self.remote.table, r.remote_table),
             (self.hint_id, r.hint),
@@ -514,15 +565,22 @@ pub fn build(
     // remote rows. A listing replaces them on the first event.
     let host_rows = rows_for(&[], host_path != "/");
     let remote_rows = rows_for(&[], false);
+    // Bars FIRST (the `build_scroll_window` / layers pattern): the table
+    // wires itself to the bar's id at construction and publishes its row
+    // range to it on every model push.
+    let host_bar = win.insert_child(Box::new(ScrollBar::new(r.host_bar)));
     let host_table = win.insert_child(Box::new(make_table(
         r.host_table,
         HOST_TABLE_KEY,
         host_rows,
+        host_bar,
     )));
+    let remote_bar = win.insert_child(Box::new(ScrollBar::new(r.remote_bar)));
     let remote_table = win.insert_child(Box::new(make_table(
         r.remote_table,
         REMOTE_TABLE_KEY,
         remote_rows,
+        remote_bar,
     )));
     let hint_id = win.insert_child(Box::new(SharedLine::new(
         r.hint,
@@ -539,19 +597,23 @@ pub fn build(
         open,
         host: Panel {
             table: host_table,
+            bar: host_bar,
             filter: host_filter,
             path: host_path.clone(),
             entries: Vec::new(),
             last_rev: 0,
             show_parent: host_path != "/",
+            last_rows: Vec::new(),
         },
         remote: Panel {
             table: remote_table,
+            bar: remote_bar,
             filter: remote_filter,
             path: "/".to_string(),
             entries: Vec::new(),
             last_rev: 0,
             show_parent: false,
+            last_rows: Vec::new(),
         },
         breadcrumb_host,
         breadcrumb_remote,
@@ -896,6 +958,55 @@ impl View for ExplorerWindow {
                 ev.clear();
                 return;
             }
+        }
+        // --- Mouse wheel: the group fans this out to EVERY child in reverse
+        // insertion order and stops at the first one that consumes it, and
+        // only the `ScrollBar`s handle the wheel. Since this window inserts
+        // `host_bar` BEFORE `remote_bar`, the remote bar was reached first and
+        // consumed every scroll — so the wheel always drove the right panel
+        // and could never reach the host at all. Deliver it to the ACTIVE
+        // panel's bar instead (the same focus-follows routing the keys use),
+        // localized into the bar's frame exactly as the group's `deliver`
+        // would have done, and always consume it so no sibling steals it.
+        if let Event::MouseWheel(m) = ev {
+            let m = *m;
+            let bar = if self.active_remote() {
+                self.remote.bar
+            } else {
+                self.host.bar
+            };
+            let mut local = Event::MouseWheel(m);
+            let stepped = {
+                let Some(v) = self.win.child_mut(bar) else {
+                    ev.clear();
+                    return;
+                };
+                if let Event::MouseWheel(lm) = &mut local {
+                    lm.position -= v.state().get_bounds().a;
+                }
+                v.handle_event(&mut local, ctx);
+                v.as_any_mut()
+                    .and_then(|a| a.downcast_mut::<tv::widgets::ScrollBar>())
+                    .map(|sb| sb.value)
+            };
+            if let Some(value) = stepped {
+                // Re-assert the value the bar just chose, as a DEFERRED.
+                //
+                // The wheel made the BAR the source of truth, but the table's
+                // cursor disagrees, and `list_viewer::focus_item` reconciles
+                // by pushing the cursor row back into the bar — also deferred.
+                // That write-back was queued a pass EARLIER, so in the deferred
+                // drain it lands after ours and wins: the bar snapped back to
+                // the cursor row, the sync then read the stale cursor, and the
+                // panel never scrolled past it (a stable stall, which is why
+                // only the first tick ever appeared to move anything). Queueing
+                // our own write behind it makes ours the LAST write in the
+                // drain, so the sync that follows reads OUR value and the
+                // cursor catches up instead of fighting back.
+                ctx.request_scroll_bar_params(bar, Some(value), None, None, None, None);
+            }
+            ev.clear();
+            return;
         }
         self.redraw_texts(ctx);
         // Windows ▸ Full screen: this window owns the inner `win` directly,

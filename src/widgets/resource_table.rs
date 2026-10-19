@@ -78,7 +78,7 @@ pub fn to_spec(col: &Column) -> ColumnSpec {
 
 /// One display row: a stable id (cursor/selection identity) plus cell text,
 /// with an optional per-row tint.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableRow {
     pub id: String,
     pub cells: Vec<String>,

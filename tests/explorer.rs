@@ -439,3 +439,113 @@ fn ctrl_e_opens_the_image_explorer() {
         "the remote listing names the image"
     );
 }
+
+/// Build `n` rows named `H00..`/`R00..` — the tag keeps each panel's rows
+/// distinguishable on screen, so a test can tell WHICH panel scrolled.
+fn wheel_rows(tag: u8, n: usize) -> Vec<tvdocker::domain::docker::explorer::ExplorerEntry> {
+    (0..n)
+        .map(|i| tvdocker::domain::docker::explorer::ExplorerEntry {
+            name: format!("{}{:02}", tag as char, i),
+            is_dir: false,
+            size: 10,
+            modified: "Oct 11 09:00".into(),
+            permissions: "-rw-r--r--".into(),
+        })
+        .collect()
+}
+
+/// The lowest-numbered `H##`/`R##` row still on screen — that panel's
+/// top-of-viewport row, or `None` if none of its rows are visible.
+fn top_visible(text: &str, tag: u8) -> Option<usize> {
+    (0..60).find(|i| text.contains(&format!("{}{:02}", tag as char, i)))
+}
+
+/// Wheel down `times` times. The group fans the wheel to every child without
+/// hit-testing, so the position is irrelevant — it only has to be plausible.
+fn wheel_down(screen: &HeadlessHandle, program: &mut Program, times: usize) {
+    for _ in 0..times {
+        screen.push_event(Event::MouseWheel(tv::event::MouseEvent {
+            position: Point::new(10, 10),
+            wheel: tv::event::MouseWheel::Down,
+            ..tv::event::MouseEvent::default()
+        }));
+        // Generous pump: the wheel steps the bar, which queues a SCROLL_BAR_
+        // CHANGED broadcast, which queues a ScrollSync deferred — three pumps'
+        // worth of work per click. A real user's wheel ticks are far apart;
+        // starving the drain here would test the harness, not the app.
+        pump(program, 8);
+    }
+}
+
+/// The wheel must scroll the panel that holds the focus.
+///
+/// Upstream fans `MouseWheel` out to every child in REVERSE insertion order
+/// (`Group::handle_event`) and stops at the first consumer. Only `ScrollBar`
+/// handles the wheel, and the explorer inserts `host_bar` BEFORE
+/// `remote_bar` — so the remote bar always won every scroll, and the host
+/// panel could not be wheeled at all. The window now routes the wheel to the
+/// active panel's bar itself, the same way its key handlers route by focus.
+#[test]
+fn the_mouse_wheel_scrolls_the_active_panel() {
+    let (mut program, screen, core, mut task_rx) = start();
+    right_click(&screen, 12, 6);
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('e'), KeyModifiers::default());
+    pump(&mut program, 6);
+    while task_rx.try_recv().is_ok() {} // drain the two build requests
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    core.borrow_mut().apply(AppMsg::ExplorerDir {
+        key: "id-a".into(),
+        target: ExplorerTarget::Host,
+        path: home,
+        entries: wheel_rows(b'H', 60),
+    });
+    core.borrow_mut().apply(AppMsg::ExplorerDir {
+        key: "id-a".into(),
+        target: ExplorerTarget::Container("id-a".into()),
+        path: "/".into(),
+        entries: wheel_rows(b'R', 60),
+    });
+    pump(&mut program, 6);
+    let seeded = screen_text(&screen);
+    assert!(seeded.contains("H00"), "host rows seeded: {seeded:?}");
+    assert!(seeded.contains("R00"), "remote rows seeded: {seeded:?}");
+    assert_eq!(top_visible(&seeded, b'H'), Some(0));
+    assert_eq!(top_visible(&seeded, b'R'), Some(0));
+
+    // The host table holds the focus on open, so the wheel belongs to it.
+    // 8 steps x 3 rows > the 16-row viewport, so the view must move.
+    wheel_down(&screen, &mut program, 8);
+    let after_host = screen_text(&screen);
+    let host_top = top_visible(&after_host, b'H');
+    assert!(
+        host_top.is_some_and(|t| t > 0),
+        "the wheel scrolled the FOCUSED host panel (top={host_top:?}): {after_host:?}"
+    );
+    assert_eq!(
+        top_visible(&after_host, b'R'),
+        Some(0),
+        "…and left the unfocused remote panel alone"
+    );
+
+    // Tab to the remote panel: now the wheel must scroll IT, and the host
+    // must stay exactly where it was.
+    screen.push_key(Key::Tab, KeyModifiers::default());
+    pump(&mut program, 4);
+    wheel_down(&screen, &mut program, 8);
+    let after_remote = screen_text(&screen);
+    let remote_top = top_visible(&after_remote, b'R');
+    assert!(
+        remote_top.is_some_and(|t| t > 0),
+        "the wheel scrolled the FOCUSED remote panel (top={remote_top:?}): {after_remote:?}"
+    );
+    assert_eq!(
+        top_visible(&after_remote, b'H'),
+        host_top,
+        "…and left the host panel where it was"
+    );
+
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+}

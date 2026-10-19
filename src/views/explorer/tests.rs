@@ -89,6 +89,45 @@ fn focused_key(w: &mut ExplorerWindow, remote: bool) -> Option<String> {
     w.table_mut(id).and_then(|t| t.focused_key()).map(|k| k.0)
 }
 
+/// A direct child's bounds in WINDOW coordinates.
+fn child_bounds(w: &mut ExplorerWindow, id: tv::ViewId) -> Rect {
+    w.win
+        .child_mut(id)
+        .expect("child exists")
+        .state()
+        .get_bounds()
+}
+
+/// `redraw_texts` with a Context that KEEPS its deferred queue, so a test
+/// can read the scroll-bar parameters the tables publish to their bars (the
+/// pump applies them to the `ScrollBar` views; the throwaway `with_ctx`
+/// queue would drop them).
+/// Clear the per-panel "rows last pushed" gate, so the next event does a
+/// genuine re-push (and therefore publishes the bar range). The gate is what
+/// stops `redraw_texts` from re-publishing on every event — see
+/// [`ExplorerWindow::push_rows`].
+fn clear_push_gate(w: &mut ExplorerWindow) {
+    w.host.last_rows.clear();
+    w.remote.last_rows.clear();
+}
+
+/// Drive one real event with a Context that KEEPS its deferred queue, so a
+/// test can read the scroll-bar parameter requests the tables publish.
+fn event_capturing_deferred(w: &mut ExplorerWindow) -> Vec<tv::Deferred> {
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = Event::KeyDown(tv::event::KeyEvent::new(
+            Key::Down,
+            tv::event::KeyModifiers::default(),
+        ));
+        w.handle_event(&mut ev, &mut ctx);
+    }
+    deferred
+}
+
 #[test]
 fn build_requests_both_initial_listings() {
     let (_w, _core, mut rx) = window();
@@ -523,6 +562,10 @@ fn resize_refills_every_child_with_the_new_window_size() {
     let size = w.state().size;
     let half = size.x / 2;
     let bottom = size.y - 1; // last CLIENT row index (the frame owns the rest)
+    // Each panel gives its right-most column to its scroll bar, so the
+    // table bodies stop one column earlier than they used to.
+    let host_body_right = (half - 2).max(1);
+    let remote_body_right = (size.x - 2).max(half + 1);
     let cases = [
         (
             "breadcrumb (host)",
@@ -543,12 +586,22 @@ fn resize_refills_every_child_with_the_new_window_size() {
         (
             "host table",
             w.host.table,
-            Rect::new(1, 3, half - 1, bottom - 1),
+            Rect::new(1, 3, host_body_right, bottom - 1),
+        ),
+        (
+            "host scroll bar",
+            w.host.bar,
+            Rect::new(host_body_right, 3, host_body_right + 1, bottom - 1),
         ),
         (
             "remote table",
             w.remote.table,
-            Rect::new(half + 1, 3, size.x - 1, bottom - 1),
+            Rect::new(half + 1, 3, remote_body_right, bottom - 1),
+        ),
+        (
+            "remote scroll bar",
+            w.remote.bar,
+            Rect::new(remote_body_right, 3, size.x - 1, bottom - 1),
         ),
         (
             "hint",
@@ -924,4 +977,210 @@ fn full_screen_toggles_the_explorer_window() {
     assert_eq!(w.win.fullscreen(), Fullscreen::Off, "one press reverts");
     assert!(w.win.bordered(), "frame back");
     assert_eq!(w.win.state().get_bounds(), orig, "bounds restored");
+}
+
+/// Each panel gives its right-most client column to a vertical scroll bar
+/// (the `widgets::scroll_rects` body+bar convention, panel-local): the bar
+/// is one column wide and starts exactly where its table's body ends. At
+/// 76×23 the host side stops at x=36 (the two-column gutter owns x=37/38)
+/// and the remote bar hugs the window's right edge at x=74.
+#[test]
+fn both_panels_reserve_a_scroll_bar_column_at_their_tables_right_edge() {
+    let (mut w, _core, _rx) = window();
+    let (host_table_id, host_bar_id) = (w.host.table, w.host.bar);
+    let (remote_table_id, remote_bar_id) = (w.remote.table, w.remote.bar);
+    let host_table = child_bounds(&mut w, host_table_id);
+    let host_bar = child_bounds(&mut w, host_bar_id);
+    let remote_table = child_bounds(&mut w, remote_table_id);
+    let remote_bar = child_bounds(&mut w, remote_bar_id);
+    assert_eq!(host_table.b.x, host_bar.a.x, "the host bar abuts its table");
+    assert_eq!(
+        remote_table.b.x, remote_bar.a.x,
+        "the remote bar abuts its table"
+    );
+    assert_eq!(host_bar.b.x - host_bar.a.x, 1, "one column per bar");
+    assert_eq!(remote_bar.b.x - remote_bar.a.x, 1, "one column per bar");
+    assert_eq!(host_table, Rect::new(1, 3, 36, 21));
+    assert_eq!(host_bar, Rect::new(36, 3, 37, 21));
+    assert_eq!(remote_table, Rect::new(39, 3, 74, 21));
+    assert_eq!(remote_bar, Rect::new(74, 3, 75, 21));
+}
+
+/// Degenerate widths must never produce an inverted BAR rect — through the
+/// whole chain: window → `explorer_rects` → bar.
+#[test]
+fn the_scroll_bar_rects_stay_ordered_at_degenerate_sizes() {
+    for w in 1..8 {
+        let (mut win, _core, _rx) = window();
+        win.change_bounds(Rect::new(0, 0, w, 4));
+        for id in [win.host.bar, win.remote.bar] {
+            let bar = child_bounds(&mut win, id);
+            assert!(bar.a.x <= bar.b.x && bar.a.y <= bar.b.y, "w={w}: {bar:?}");
+        }
+    }
+}
+
+/// The window inserts one `ScrollBar` per panel at that panel's table right
+/// edge, and the bars stay out of the Tab order (Ruling 3 keeps Tab at
+/// exactly two stops — the two tables).
+#[test]
+fn both_panels_get_a_vertical_scroll_bar_that_tab_skips() {
+    let (mut w, _core, _rx) = window();
+    let (host_bar_id, remote_bar_id) = (w.host.bar, w.remote.bar);
+    assert_eq!(child_bounds(&mut w, host_bar_id), Rect::new(36, 3, 37, 21));
+    assert_eq!(
+        child_bounds(&mut w, remote_bar_id),
+        Rect::new(74, 3, 75, 21)
+    );
+    for id in [host_bar_id, remote_bar_id] {
+        assert!(
+            !w.win.find_mut(id).unwrap().state().options.selectable,
+            "the bar participates in neither Tab order nor focus"
+        );
+    }
+}
+
+/// The id plumbing, end to end: on every push each table publishes its row
+/// range to ITS bar (the pump applies these deferred params to the
+/// `ScrollBar` views), so a scrollbar click can drive that table.
+#[test]
+fn each_table_publishes_its_row_range_to_its_bar() {
+    let (mut w, _core, _rx) = window();
+    // The host panel starts at $HOME (its `..` row makes 4 rows); the
+    // remote starts at "/" (3 rows). The two different maxima prove each
+    // table publishes to ITS OWN bar.
+    seed(
+        &mut w,
+        ExplorerTarget::Host,
+        &ExplorerWindow::host_home(),
+        vec![entry("a", false), entry("b", false), entry("c", false)],
+    );
+    seed(
+        &mut w,
+        ExplorerTarget::Container("c1".into()),
+        "/",
+        vec![entry("d", false), entry("e", false), entry("f", false)],
+    );
+    // Capture from a REAL event, the way the app does it: `seed` drove the
+    // pushes through a throwaway Context, whose deferreds are discarded.
+    clear_push_gate(&mut w);
+    let deferred = event_capturing_deferred(&mut w);
+    let bar_max = |id: tv::ViewId| {
+        deferred.iter().find_map(|d| match d {
+            tv::Deferred::ScrollBarSetParams { id: got, max, .. } if *got == id => *max,
+            _ => None,
+        })
+    };
+    assert_eq!(
+        bar_max(w.host.bar),
+        Some(3),
+        "4 host rows (incl. `..`) ⇒ the host bar's max is len-1"
+    );
+    assert_eq!(bar_max(w.remote.bar), Some(2), "…and 3 remote rows ⇒ 2");
+}
+
+/// Zoom / resize re-derives the panel rects with the window's, and the bars
+/// follow their tables through the whole chain.
+#[test]
+fn the_bars_follow_the_tables_through_a_resize() {
+    let (mut w, _core, _rx) = window();
+    let (host_bar_id, remote_bar_id, host_table_id) = (w.host.bar, w.remote.bar, w.host.table);
+    let before = child_bounds(&mut w, host_bar_id);
+    w.change_bounds(Rect::new(0, 0, 60, 20));
+    let bar = child_bounds(&mut w, host_bar_id);
+    let remote = child_bounds(&mut w, remote_bar_id);
+    let table = child_bounds(&mut w, host_table_id);
+    assert_ne!(bar, before, "the bar moved with the resize");
+    assert_eq!(table.b.x, bar.a.x, "…and still abuts its table");
+    assert_eq!(bar.b.x - bar.a.x, 1, "…one column wide");
+    // The remote side ends where the client does (right = 60-1).
+    assert_eq!(
+        remote.b.x, 59,
+        "the remote bar hugs the window's right edge"
+    );
+}
+
+/// …and the window's routing HANDS that column to the bar: a press there
+/// makes the `ScrollBar` broadcast `SCROLL_BAR_CLICKED` (the command the
+/// table turns into a scroll), while the same press on the table's body
+/// stays a body click and broadcasts nothing.
+#[test]
+fn a_click_in_the_bar_column_reaches_the_scroll_bar() {
+    let bar_clicks = |w: &mut ExplorerWindow, x: i32, y: i32| {
+        let mut out = std::collections::VecDeque::new();
+        let mut timers = tv::TimerQueue::new();
+        let mut deferred: Vec<tv::Deferred> = Vec::new();
+        {
+            let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+            let mut ev = Event::MouseDown(tv::MouseEvent {
+                position: tv::Point::new(x, y),
+                buttons: tv::event::MouseButtons {
+                    left: true,
+                    ..tv::event::MouseButtons::default()
+                },
+                ..tv::MouseEvent::default()
+            });
+            w.handle_event(&mut ev, &mut ctx);
+        }
+        out.iter()
+            .filter(|e| matches!(e, Event::Broadcast { command, .. } if *command == Command::SCROLL_BAR_CLICKED))
+            .count()
+    };
+    let (mut w, _core, _rx) = window();
+    assert_eq!(bar_clicks(&mut w, 74, 6), 1, "the remote bar got the click");
+    assert_eq!(bar_clicks(&mut w, 40, 6), 0, "its table's body did not");
+}
+
+/// A left click in a panel's scroll-bar column is NOT a body click: it must
+/// not focus that panel or move its cursor (the bar column now belongs to
+/// the `ScrollBar` child, which the window's own routing serves).
+#[test]
+fn a_click_in_the_bar_column_does_not_focus_the_panel() {
+    let (mut w, _core, _rx) = window();
+    seed(
+        &mut w,
+        ExplorerTarget::Host,
+        "/",
+        vec![entry("h1", false), entry("h2", false), entry("h3", false)],
+    );
+    seed(
+        &mut w,
+        ExplorerTarget::Container("c1".into()),
+        "/",
+        vec![entry("r1", false), entry("r2", false), entry("r3", false)],
+    );
+    focus_panel(&mut w, false);
+    assert!(!w.active_remote(), "the host panel starts focused");
+    // x=74 is the REMOTE panel's bar column; y=6 is its third body row —
+    // a click on the TABLE there would move the cursor to "r3".
+    mouse(&mut w, 74, 6, false);
+    assert!(
+        !w.active_remote(),
+        "the remote bar column must not steal the focus"
+    );
+    assert_eq!(
+        focused_key(&mut w, true),
+        Some("r1".into()),
+        "…nor move the remote cursor"
+    );
+}
+
+/// The bars are VISIBLE: each panel's right-most column renders the
+/// scroll-bar glyphs (up arrow on the header row, the trough through the
+/// body, down arrow at the foot).
+#[test]
+fn the_scroll_bars_render_in_the_panels_right_most_columns() {
+    let (mut w, _core, _rx) = window();
+    crate::testutil::with_ctx(|ctx| w.redraw_texts(ctx));
+    let screen = crate::testutil::render_view(76, 23, &mut w);
+    let text = crate::testutil::text(&screen);
+    let lines: Vec<&str> = text.lines().collect();
+    let cell = |line: &str, x: usize| line.chars().nth(x);
+    // The bar columns (window coords == screen coords at the origin).
+    // The header row is 3 and the bars' last row is 20 (the hint takes 21).
+    for (x, name) in [(36, "host"), (74, "remote")] {
+        assert_eq!(cell(lines[3], x), Some('▲'), "{name} bar's up arrow");
+        assert_eq!(cell(lines[12], x), Some('▓'), "{name} bar's trough");
+        assert_eq!(cell(lines[20], x), Some('▼'), "{name} bar's down arrow");
+    }
 }
