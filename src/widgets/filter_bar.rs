@@ -141,10 +141,8 @@ impl View for FilterBar {
                     }
                 }
             }
-            Event::MouseDown(m) => {
-                if m.buttons.left {
-                    ev.clear();
-                }
+            Event::MouseDown(m) if m.buttons.left => {
+                ev.clear();
             }
             Event::MouseWheel(_) => {
                 ev.clear();

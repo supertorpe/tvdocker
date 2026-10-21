@@ -159,11 +159,11 @@ pub fn resolve_volume_bind(spec: &str) -> String {
     let Some((host, rest)) = spec.split_once(':') else {
         return spec.to_string();
     };
-    let is_named_volume = !host.starts_with('/')
-        && !host.starts_with('.')
-        && !host.starts_with('~')
-        && !host.contains('\\')
-        && !(host.len() >= 2 && host.as_bytes()[1] == b':');
+    let is_named_volume = !(host.starts_with('/')
+        || host.starts_with('.')
+        || host.starts_with('~')
+        || host.contains('\\')
+        || host.len() >= 2 && host.as_bytes()[1] == b':');
     if is_named_volume {
         return spec.to_string();
     }
