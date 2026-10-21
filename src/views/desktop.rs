@@ -41,6 +41,70 @@ impl Slot {
             id: Rc::new(RefCell::new(None)),
         }
     }
+
+    /// The id to focus when this slot already has a window ("opening an
+    /// item already on screen focuses it instead of duplicating it"), or
+    /// `None` once the window is gone (its `Drop` cleared the flag).
+    fn open_id(&self) -> Option<ViewId> {
+        if *self.open.borrow() {
+            *self.id.borrow()
+        } else {
+            None
+        }
+    }
+
+    /// The bookkeeping every opener does after `insert_and_focus`: the slot
+    /// remembers the new id and flips the open flag (cleared by `Drop`).
+    fn record(&self, vid: ViewId) {
+        *self.id.borrow_mut() = Some(vid);
+        *self.open.borrow_mut() = true;
+    }
+}
+
+/// Every shell window opened for ONE container: one [`Slot`] per window
+/// (each window's `Drop` clears its own flag), so "how many shells are
+/// open" is a count, not a boolean. Closed slots are pruned on every
+/// read; `opened` never shrinks — it numbers the labels so two live
+/// windows can never share one (`webalpha (2)` stays unique).
+struct ShellSet {
+    slots: Vec<Slot>,
+    /// Total windows ever opened for this container (label numbering).
+    opened: usize,
+}
+
+impl ShellSet {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            opened: 0,
+        }
+    }
+
+    /// Drop the closed windows, then how many are still open.
+    fn live(&mut self) -> usize {
+        self.slots.retain(|s| *s.open.borrow());
+        self.slots.len()
+    }
+
+    /// The focus target for "show the current one": the first live slot.
+    fn open_id(&mut self) -> Option<ViewId> {
+        self.live();
+        self.slots.first().and_then(|s| *s.id.borrow())
+    }
+
+    fn push(&mut self, slot: Slot) {
+        self.live();
+        self.slots.push(slot);
+        self.opened += 1;
+    }
+}
+
+/// Everything `finish_shell_prompt` needs after the yes/no box answers
+/// (the `ShellSession` pattern).
+struct ShellPrompt {
+    id: String,
+    name: String,
+    image: String,
 }
 
 /// Everything `finish_shell_config` needs after the modal answers.
@@ -84,6 +148,8 @@ pub struct TvdockerDesktop {
     modal_answer: Option<tv::Command>,
     /// In-flight shell dialog state.
     shell_session: Option<ShellSession>,
+    /// In-flight yes/no prompt ("a shell is already open").
+    shell_prompt: Option<ShellPrompt>,
     /// In-flight run-form state (the shell-session pattern).
     run_session: Option<RunSession>,
     /// ×N slots keyed by container id.
@@ -91,7 +157,8 @@ pub struct TvdockerDesktop {
     log_slots: HashMap<String, Slot>,
     /// Diagnostics windows keyed by container id.
     diagnostics_slots: HashMap<String, Slot>,
-    shell_slots: HashMap<String, Slot>,
+    /// Every shell window per container id (one [`Slot`] each).
+    shell_slots: HashMap<String, ShellSet>,
     /// The single Settings window (settings window number 0, so
     /// there is exactly one of it).
     settings_slot: Option<Slot>,
@@ -158,7 +225,7 @@ impl TvdockerDesktop {
         // interval ticks cover it.
         let _ = self.actions.send(ActionReq::PollNow);
         let slot = &self.slots[kind as usize];
-        if let Some(id) = Self::open_id(slot) {
+        if let Some(id) = slot.open_id() {
             ctx.request_focus(id); // already open → focus
             return;
         }
@@ -177,7 +244,7 @@ impl TvdockerDesktop {
             Win::Statistics => statistics::build(Rc::clone(&self.core), bounds, open),
         };
         let id = self.desktop.insert_and_focus(Box::new(win), ctx);
-        Self::record(slot, id);
+        slot.record(id);
     }
 
     /// `(name, image)` of a container id (empty when unknown — the
@@ -207,11 +274,11 @@ impl TvdockerDesktop {
             return;
         };
         let (name, _) = self.container_meta(&target);
-        let focused = Self::open_id(
-            self.details_slots
-                .entry(target.clone())
-                .or_insert_with(Slot::new),
-        );
+        let focused = self
+            .details_slots
+            .entry(target.clone())
+            .or_insert_with(Slot::new)
+            .open_id();
         self.core.borrow_mut().details.remove(&target); // loading state
         let _ = self.task_tx.send(TaskReq::Inspect { id: target.clone() });
         if let Some(vid) = focused {
@@ -234,26 +301,7 @@ impl TvdockerDesktop {
         let win = details::build(Rc::clone(&self.core), bounds, &target, &display, open);
         let vid = self.desktop.insert_and_focus(Box::new(win), ctx);
         let slot = self.details_slots.entry(target).or_insert_with(Slot::new);
-        Self::record(slot, vid);
-    }
-
-    /// The id to focus when `slot` already has a window ("opening
-    /// an item already on screen focuses it instead of duplicating it"), or
-    /// `None` when there is nothing open. Taking `&Slot` ends the slot-map
-    /// borrow at the call, which is what the openers used a scope for.
-    fn open_id(slot: &Slot) -> Option<ViewId> {
-        if *slot.open.borrow() {
-            *slot.id.borrow()
-        } else {
-            None
-        }
-    }
-
-    /// The bookkeeping every opener does after `insert_and_focus`: the slot
-    /// remembers the new id and flips the open flag (cleared by `Drop`).
-    fn record(slot: &Slot, vid: ViewId) {
-        *slot.id.borrow_mut() = Some(vid);
-        *slot.open.borrow_mut() = true;
+        slot.record(vid);
     }
 
     /// Logs: fresh session + worker + ×N window.
@@ -262,11 +310,11 @@ impl TvdockerDesktop {
             return;
         };
         let (name, _) = self.container_meta(&target);
-        let focused = Self::open_id(
-            self.log_slots
-                .entry(target.clone())
-                .or_insert_with(Slot::new),
-        );
+        let focused = self
+            .log_slots
+            .entry(target.clone())
+            .or_insert_with(Slot::new)
+            .open_id();
         if let Some(vid) = focused {
             ctx.request_focus(vid);
             return;
@@ -299,7 +347,7 @@ impl TvdockerDesktop {
         let win = logs::build(Rc::clone(&self.core), bounds, &target, &display, open);
         let vid = self.desktop.insert_and_focus(Box::new(win), ctx);
         let slot = self.log_slots.entry(target).or_insert_with(Slot::new);
-        Self::record(slot, vid);
+        slot.record(vid);
     }
 
     /// Diagnostics: one window per container; the
@@ -324,11 +372,11 @@ impl TvdockerDesktop {
             config,
         });
         // Focus an already-open window (its rev-diff picks up the new run).
-        let focused = Self::open_id(
-            self.diagnostics_slots
-                .entry(target.clone())
-                .or_insert_with(Slot::new),
-        );
+        let focused = self
+            .diagnostics_slots
+            .entry(target.clone())
+            .or_insert_with(Slot::new)
+            .open_id();
         if let Some(vid) = focused {
             ctx.request_focus(vid);
             return;
@@ -359,7 +407,7 @@ impl TvdockerDesktop {
             .diagnostics_slots
             .entry(target)
             .or_insert_with(Slot::new);
-        Self::record(slot, vid);
+        slot.record(vid);
     }
 
     /// Image jump: open/focus the Images window, then queue the row-focus
@@ -391,11 +439,11 @@ impl TvdockerDesktop {
             return;
         };
         let slot_key = format!("{}{target_id}", kind.slot_prefix());
-        let focused = Self::open_id(
-            self.explorer_slots
-                .entry(slot_key.clone())
-                .or_insert_with(Slot::new),
-        );
+        let focused = self
+            .explorer_slots
+            .entry(slot_key.clone())
+            .or_insert_with(Slot::new)
+            .open_id();
         if let Some(vid) = focused {
             ctx.request_focus(vid);
             return;
@@ -424,7 +472,7 @@ impl TvdockerDesktop {
             .explorer_slots
             .entry(slot_key)
             .or_insert_with(Slot::new);
-        Self::record(slot, vid);
+        slot.record(vid);
     }
 
     /// The image-layer window: keyed `lay:<image id>`, so a second invoke
@@ -434,11 +482,12 @@ impl TvdockerDesktop {
             return;
         };
         let slot_key = format!("lay:{image_id}");
-        if let Some(vid) = Self::open_id(
-            self.layers_slots
-                .entry(slot_key.clone())
-                .or_insert_with(Slot::new),
-        ) {
+        if let Some(vid) = self
+            .layers_slots
+            .entry(slot_key.clone())
+            .or_insert_with(Slot::new)
+            .open_id()
+        {
             ctx.request_focus(vid);
             return;
         }
@@ -475,13 +524,13 @@ impl TvdockerDesktop {
         win.request_initial_focus(ctx);
         let vid = self.desktop.insert_and_focus(Box::new(win), ctx);
         let slot = self.layers_slots.entry(slot_key).or_insert_with(Slot::new);
-        Self::record(slot, vid);
+        slot.record(vid);
     }
 
     /// Settings (settings): open the one window, or focus it when it
     /// is already open (no second buffer).
     fn open_settings(&mut self, ctx: &mut Context) {
-        let focused = self.settings_slot.as_ref().and_then(Self::open_id);
+        let focused = self.settings_slot.as_ref().and_then(Slot::open_id);
         if let Some(vid) = focused {
             ctx.request_focus(vid);
             return;
@@ -491,28 +540,73 @@ impl TvdockerDesktop {
         let win = crate::views::settings::build(bounds, Rc::clone(&self.core), open);
         let vid = self.desktop.insert_and_focus(Box::new(win), ctx);
         let slot = self.settings_slot.get_or_insert_with(Slot::new);
-        Self::record(slot, vid);
+        slot.record(vid);
     }
 
-    /// F4: dialog unless a shell for this container is
-    /// already open (then just focus it).
+    /// F4: dialog; but with EXACTLY one shell already open for the
+    /// container, a yes/no prompt first (No ⇒ show the current one, no
+    /// new exec). Zero or several open ⇒ straight to the dialog.
     fn open_shell_config(&mut self, ctx: &mut Context) {
         let Some(target) = self.core.borrow_mut().take_pending().into_iter().next() else {
             return;
         };
         let (name, image) = self.container_meta(&target);
-        let slot = self
+        let live = self
             .shell_slots
             .entry(target.clone())
-            .or_insert_with(Slot::new);
-        if let Some(vid) = Self::open_id(slot) {
-            ctx.request_focus(vid);
+            .or_insert_with(ShellSet::new)
+            .live();
+        if live == 1 {
+            let Some(requester) = self.state().id() else {
+                return;
+            };
+            self.shell_prompt = Some(ShellPrompt {
+                id: target,
+                name: name.clone(),
+                image,
+            });
+            ctx.request_message_box(
+                format!(
+                    "A shell is already open for '{name}'. Open a new one? \
+                     (No = show the current one)"
+                ),
+                tv::MessageBoxKind::Confirmation,
+                tv::MessageBoxButtons::yes_no(),
+                Some(requester),
+                Some(crate::app::CMD_SHELL_PROMPT),
+            );
             return;
         }
+        self.open_shell_dialog(target, name, image, ctx);
+    }
+
+    /// The yes/no answer: Yes ⇒ the normal config dialog; anything else
+    /// (No/Esc/CANCEL) ⇒ focus the shell that is already open — no exec.
+    fn finish_shell_prompt(&mut self, ctx: &mut Context) {
+        let answer = self.modal_answer.take();
+        let Some(prompt) = self.shell_prompt.take() else {
+            return;
+        };
+        if answer == Some(tv::Command::YES) {
+            self.open_shell_dialog(prompt.id, prompt.name, prompt.image, ctx);
+            return;
+        }
+        let set = self
+            .shell_slots
+            .entry(prompt.id)
+            .or_insert_with(ShellSet::new);
+        if let Some(vid) = set.open_id() {
+            ctx.request_focus(vid);
+        }
+    }
+
+    /// The config dialog for `(id, name, image)` — every F4 path ends
+    /// here (directly, or through the prompt's Yes).
+    fn open_shell_dialog(&mut self, id: String, name: String, image: String, ctx: &mut Context) {
         let form = crate::views::dialogs::ShellForm::prefill(&name, &image);
         self.shell_session = Some(ShellSession {
             form: form.clone(),
-            id: target.clone(),
+            id: id.clone(),
             name,
             image,
         });
@@ -526,7 +620,7 @@ impl TvdockerDesktop {
             (size.x - 60) / 2 + 60,
             (size.y - 10) / 2 + 10,
         );
-        let dialog = crate::views::dialogs::ShellConfigDialog::new(bounds, &form, &target);
+        let dialog = crate::views::dialogs::ShellConfigDialog::new(bounds, &form, &id);
         ctx.request_exec_view(
             Box::new(dialog),
             requester,
@@ -549,24 +643,12 @@ impl TvdockerDesktop {
             // Never a modal (§10) — the status line carries it.
             self.core.borrow_mut().last_error = Some(format!("config save: {e}"));
         }
-        let container_id = sess.id.clone();
-        // Scoped so the slot-map borrow ends before anything below borrows
-        // `self` again; the check itself is the F4 race just underneath.
-        let already_open = {
-            let slot = self
-                .shell_slots
-                .entry(sess.id.clone())
-                .or_insert_with(Slot::new);
-            *slot.open.borrow()
-        };
-        if already_open {
-            return; // raced with a second F4 — keep the first window
-        }
+        let container_id = sess.id;
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = tokio::sync::watch::channel((80u16, 24u16));
         let _ = self.task_tx.send(TaskReq::StartShell {
-            id: sess.id,
+            id: container_id.clone(),
             shell: form.shell,
             user: form.user,
             workdir: form.workdir,
@@ -574,14 +656,31 @@ impl TvdockerDesktop {
             input_rx,
             resize_rx,
         });
+        // Every window gets ITS OWN slot (the Drop flag it clears when it
+        // closes). The label counts this container's windows ever opened:
+        // the first keeps the plain name, then `name (2)`, `name (3)`, …
+        // and the counter never rewinds, so two live windows stay unique.
+        let label = {
+            let set = self
+                .shell_slots
+                .entry(container_id.clone())
+                .or_insert_with(ShellSet::new);
+            if set.opened == 0 {
+                sess.name.clone()
+            } else {
+                format!("{} ({})", sess.name, set.opened + 1)
+            }
+        };
+        let slot = Slot::new();
+        let open = Rc::clone(&slot.open);
         let bounds = self.next_bounds();
-        let (win, _state) = shell::build(bounds, &sess.name, input_tx, resize_tx, out_rx);
+        let (win, _state) = shell::build(bounds, &label, input_tx, resize_tx, out_rx, open);
         let vid = self.desktop.insert_and_focus(Box::new(win), ctx);
-        let slot = self
-            .shell_slots
+        slot.record(vid);
+        self.shell_slots
             .entry(container_id)
-            .or_insert_with(Slot::new);
-        Self::record(slot, vid);
+            .or_insert_with(ShellSet::new)
+            .push(slot);
     }
 
     /// Run…: the form for the cursor image (upstream parity:
@@ -880,6 +979,11 @@ impl View for TvdockerDesktop {
                 ev.clear();
                 return;
             }
+            if *cmd == crate::app::CMD_SHELL_PROMPT {
+                self.finish_shell_prompt(ctx);
+                ev.clear();
+                return;
+            }
             if *cmd == crate::app::CMD_RUN {
                 self.open_run_form(ctx);
                 ev.clear();
@@ -986,6 +1090,7 @@ pub fn containers_desktop(
         task_tx,
         modal_answer: None,
         shell_session: None,
+        shell_prompt: None,
         run_session: None,
         details_slots: HashMap::new(),
         log_slots: HashMap::new(),

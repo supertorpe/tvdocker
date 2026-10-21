@@ -488,6 +488,123 @@ fn shell_cancel_sends_nothing() {
     assert!(!screen_text(&screen).contains("shell @"), "no window");
 }
 
+/// F4 → shell → close the shell window → F4 again: the config dialog
+/// must open again.
+///
+/// The shell window has to clear its slot's open flag when it is closed
+/// (the Drop pattern every other window follows). If it does not, the
+/// desktop still believes a shell is open and "focuses" the DEAD
+/// window id — `request_focus` on a removed view is a silent no-op — so
+/// F4 does nothing at all: no config dialog, no window.
+#[test]
+fn f4_reopens_the_shell_config_after_the_shell_window_was_closed() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // F4 → the config dialog → OK ⇒ the shell window opens.
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    // F3 closes the focused window (the shell window).
+    screen.push_key(Key::F(3), KeyModifiers::default());
+    // F4 again ⇒ the config dialog must open again (and submit ⇒ a
+    // SECOND exec).
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    let mut shells = 0;
+    while let Ok(TaskReq::StartShell { .. }) = task_rx.try_recv() {
+        shells += 1;
+    }
+    assert_eq!(
+        shells, 2,
+        "F4 after closing the shell window must open the config dialog again"
+    );
+}
+
+/// Exactly one shell open for the container ⇒ F4 must ASK before opening
+/// another: Yes ⇒ the config dialog ⇒ a second exec. The prompt's own
+/// text cannot be asserted (a modal only exists mid-`run_program`, which
+/// drives to quit), so the proof is the `StartShell` count.
+#[test]
+fn f4_with_one_shell_open_asks_before_opening_another() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // Shell #1: F4 → config dialog → OK.
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    // The shell window swallowed focus — back to the table, F4 again
+    // with exactly one shell open ⇒ the yes/no prompt ⇒ Yes ⇒ the
+    // config dialog ⇒ OK ⇒ a second exec.
+    screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    screen.push_event(Event::Command(Command::OK));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    let mut shells = 0;
+    while let Ok(TaskReq::StartShell { .. }) = task_rx.try_recv() {
+        shells += 1;
+    }
+    assert_eq!(shells, 2, "Yes ⇒ a second PTY opens");
+}
+
+/// The prompt's No must queue NOTHING (it shows the current shell), and
+/// the next F4 must ask again — still exactly one open — where Yes then
+/// opens the second shell. No alone cannot fail before the prompt exists
+/// (focus-not-open also yields one exec), so No and the re-ask share one
+/// stream whose second answer makes it red.
+#[test]
+fn f4_prompt_no_shows_the_current_shell_and_the_next_asks_again() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // Shell #1.
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    // F4 ⇒ prompt ⇒ No ⇒ no new exec.
+    screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::NO));
+    // F4 ⇒ prompt AGAIN (one shell still open) ⇒ Yes ⇒ dialog ⇒ OK.
+    screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    screen.push_event(Event::Command(Command::OK));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    let mut shells = 0;
+    while let Ok(TaskReq::StartShell { .. }) = task_rx.try_recv() {
+        shells += 1;
+    }
+    assert_eq!(
+        shells, 2,
+        "No opened nothing; the next F4 asked again and Yes opened the second"
+    );
+}
+
+/// Two shells open ⇒ F4 asks NO MORE: the dialog opens directly. The
+/// third exec rides the queued OK — if a prompt were up instead, it would
+/// swallow the OK as a non-Yes answer and no third exec would happen.
+#[test]
+fn f4_with_several_shells_open_opens_another_without_asking() {
+    let (program, screen, _core, mut task_rx) = start(two_rows());
+    // Shell #1.
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    // Shell #2 through the prompt (the only way past "exactly one").
+    screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    screen.push_event(Event::Command(Command::OK));
+    // Third F4 with two open: straight to the config dialog.
+    screen.push_event(Event::Command(app::CMD_OPEN_CONTAINERS));
+    screen.push_key(Key::F(4), KeyModifiers::default());
+    screen.push_event(Event::Command(Command::OK));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    let mut shells = 0;
+    while let Ok(TaskReq::StartShell { .. }) = task_rx.try_recv() {
+        shells += 1;
+    }
+    assert_eq!(shells, 3, "no prompt at two open — a third PTY opens");
+}
+
 #[test]
 fn images_del_batch_removes_exactly_the_selection() {
     let (mut program, screen, core, mut task_rx) = start(two_rows());
