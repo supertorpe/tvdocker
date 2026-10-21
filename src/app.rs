@@ -2,7 +2,7 @@
 //! Containers desktop, dynamic status line, menu bar, the `run_app`
 //! command loop, plus `build`/`run` — shared core, bounded channels, and
 //! the poller spawn.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tokio::sync::{broadcast, mpsc};
 use tv::status::StatusItemsBuilder;
@@ -137,6 +137,9 @@ pub const CMD_OPEN_DETAILS: Command = Command::custom("tvdocker.open_details");
 pub const CMD_OPEN_LOGS: Command = Command::custom("tvdocker.open_logs");
 pub const CMD_SHELL_CONFIG: Command = Command::custom("tvdocker.shell_config");
 pub const CMD_SHELL_SUBMIT: Command = Command::custom("tvdocker.shell_submit");
+/// The yes/no prompt's answer ("one shell already open"): Yes opens the
+/// config dialog, anything else shows the current shell.
+pub const CMD_SHELL_PROMPT: Command = Command::custom("tvdocker.shell_prompt");
 pub const CMD_DELETE: Command = Command::custom("tvdocker.delete");
 pub const CMD_DELETE_CONFIRMED: Command = Command::custom("tvdocker.delete_confirmed");
 pub const CMD_START: Command = Command::custom("tvdocker.start");
@@ -672,7 +675,28 @@ pub fn program_with_status(
     let (cfg, _) = crate::domain::config::TvdockerConfig::load();
     let selection = cfg.theme.as_deref().unwrap_or("classic");
     let theme = crate::domain::theme::resolve(&cfg.themes, selection);
-    Program::new(backend, clock, theme, desktop_fn, status_fn, init_menu_bar)
+    // rustc miscompile workaround (tvision-rs issue #43,
+    // https://github.com/oetiker/tvision-rs/issues/43): in optimized builds
+    // `Program::new` hands the status/menu factories the DESKTOP factory's
+    // mutated rect instead of the screen extent (the desktop does
+    // `r.a.y += 1; r.b.y -= 1` on its by-value copy) — the menu bar then
+    // lands at the wrong row and the status line off-screen; release only,
+    // `-O0` is fine. The desktop factory is called FIRST and always receives
+    // the true extent, so it records it here and the other two factories
+    // restore it, ignoring their own (possibly corrupted) argument.
+    // Identical values flow through once tvision-rs ships its own
+    // `black_box` fix — delete this block after the bump.
+    let extent_seen: Rc<Cell<Option<Rect>>> = Rc::new(Cell::new(None));
+    let note = Rc::clone(&extent_seen);
+    let desktop_fn = move |r: Rect| {
+        note.set(Some(r));
+        desktop_fn(r)
+    };
+    let restore = Rc::clone(&extent_seen);
+    let status_fn = move |r: Rect| status_fn(restore.get().unwrap_or(r));
+    let restore = Rc::clone(&extent_seen);
+    let menu_fn = move |r: Rect| init_menu_bar(restore.get().unwrap_or(r));
+    Program::new(backend, clock, theme, desktop_fn, status_fn, menu_fn)
 }
 
 /// Build the running program: dynamic status + Containers desktop +
