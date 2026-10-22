@@ -66,6 +66,13 @@ pub fn context_menu(core: &AppCore, id: &str) -> Vec<(String, tv::Command)> {
         .iter()
         .find(|c| c.id == id)
         .is_some_and(|c| c.state == "running");
+    context_menu_for(running)
+}
+
+/// The same menu for a container whose state is already known — the
+/// Statistics window reuses it (a stats row is a RUNNING container by
+/// construction: `docker stats` only samples running ones).
+pub fn context_menu_for(running: bool) -> Vec<(String, tv::Command)> {
     vec![
         ("~E~xplorer".to_string(), crate::app::CMD_REQ_EXPLORER),
         ("~I~mage".to_string(), crate::app::CMD_REQ_IMAGE),

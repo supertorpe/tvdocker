@@ -1117,6 +1117,7 @@ mod tests {
 
     fn stat(name: &str) -> crate::domain::docker::statistics::StatEntry {
         crate::domain::docker::statistics::StatEntry {
+            id: format!("id-{name}"),
             name: name.into(),
             cpu_percent: 1.5,
             memory_usage: 1,

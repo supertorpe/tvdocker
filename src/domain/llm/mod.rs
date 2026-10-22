@@ -320,6 +320,7 @@ mod tests {
                 message: "panic: boom".into(),
             }],
             stats: Some(StatEntry {
+                id: "abc123".into(),
                 name: "web".into(),
                 cpu_percent: 12.5,
                 memory_usage: 1024 * 1024,

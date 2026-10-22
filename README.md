@@ -36,7 +36,7 @@ Everything runs in the pinned container — no host toolchain required:
 - **Image layers** — `Ctrl+L` on an image (or **Layers…** in its context menu) opens the layer explorer: the layer list beside a colour-coded change tree (Added / Removed / Modified), with an efficiency score, the potential wasted space and the inefficient paths; it streams `docker save` under the hood and never starts a container
 - **Image management** — `REPOSITORY:TAG` and `SIZE`, remove, prune/dangling cleanup, and Run… (`F2`) through a validated run form
 - **Networks & volumes** — names, drivers, sizes and container counts; delete with confirmation; open a volume directly in the Explorer
-- **Live statistics** — `docker stats` (CPU %, memory, net, block I/O, PIDs) per container, sortable by column
+- **Live statistics** — `docker stats` (CPU %, memory, net, block I/O, PIDs) per container, sortable by column; each row carries the container menu (Details, Logs, Shell, Explorer, Image, Diagnose…, Stop, Delete)
 - **Docker events** — a real-time, filtered event stream, newest first
 - **AI diagnostics** — right-click a container → **Diagnose…** compiles recent logs, exit code, stats and config into a local or cloud LLM for root-cause analysis and a repair playbook
 - **Context menus** — right-click a row (or press `Shift+F10`) for its actions (Details, Logs, Shell, Explorer, Diagnose…, Start/Stop, Delete)
@@ -68,10 +68,10 @@ Everything runs in the pinned container — no host toolchain required:
 | on an image | `Ctrl+E` | **Image Explorer** — the image's filesystem, read-only |
 | on an image | `Ctrl+L` | **Layers ×N** — the layer list with the colour-coded change tree, efficiency score and potential wasted space; also **Layers…** in the context menu |
 | on an image | `F2` | **Run…** — the validated run form |
-| on a row | `Shift+F10` | context menu (mouse-free right-click): Explorer, Details, Logs, Shell, **Diagnose…**, Start/Stop, Delete (containers add **Image** — jumps to the Images window with the container's image under the cursor) |
+| on a row | `Shift+F10` | context menu (mouse-free right-click): Explorer, Details, Logs, Shell, **Diagnose…**, Start/Stop, Delete (container rows add **Image** — jumps to the Images window with the container's image under the cursor) |
 | Options menu | `Alt+O` | **Settings** — the TOML editor (`F2` saves + live-reloads) |  
 
-Right-click a row — or press `Shift+F10` on it — for the **context menu** (Details/Logs/Shell, Start/Stop, Delete, Diagnose…, Explorer; containers also **Image**, which opens the Images window with that container's image selected); `Del` deletes with confirmation; `Ctrl+O` opens the **column picker** (runtime-only — reopening resets it).
+Right-click a row — or press `Shift+F10` on it — for the **context menu** (Details/Logs/Shell, Start/Stop, Delete, Diagnose…, Explorer; container rows also **Image**, which opens the Images window with that container's image selected). The **Containers** and **Statistics** tables carry that menu — a stats row acts on the container it measures; `Del` deletes with confirmation; `Ctrl+O` opens the **column picker** (runtime-only — reopening resets it).
 
 Opening an item already on screen focuses it instead of duplicating it, windows cascade (+2/+1) and shrink to fit, and each keeps its own filter (`Esc` clears selection → filter → close). `Ctrl+A` selects the filtered rows; the status line shows the focused window's contextual shortcuts and hides them under `F10`.
 

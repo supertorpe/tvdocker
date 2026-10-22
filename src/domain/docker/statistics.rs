@@ -7,11 +7,15 @@ use bollard::Docker;
 use bollard::container::{ListContainersOptions, Stats, StatsOptions};
 use futures_util::StreamExt;
 
-/// One row of the Statistics window (field-for-field oh-my-docker's
-/// `StatEntry`). The two `f64`s are why `AppMsg` keeps only `PartialEq`
-///.
+/// One row of the Statistics window: field-for-field oh-my-docker's
+/// `StatEntry`, plus the container id (the row's key, so the
+/// container-scoped actions can target it). The two `f64`s are why
+/// `AppMsg` keeps only `PartialEq`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatEntry {
+    /// The container's id — the same short id the Containers window keys
+    /// its rows with; the Statistics row's stable key.
+    pub id: String,
     pub name: String,
     pub cpu_percent: f64,
     pub memory_usage: u64,
@@ -27,7 +31,7 @@ pub struct StatEntry {
 /// Pure extraction of one stats snapshot — the vendored math verbatim:
 /// cpu_delta over system_delta with the `online_cpus` multiplier, mem %
 /// of limit, per-interface rx/tx sums, blkio read/write ops only.
-pub fn stat_entry(name: String, stats: Stats) -> StatEntry {
+pub fn stat_entry(id: String, name: String, stats: Stats) -> StatEntry {
     let cpu_delta = stats
         .cpu_stats
         .cpu_usage
@@ -73,6 +77,7 @@ pub fn stat_entry(name: String, stats: Stats) -> StatEntry {
     }
 
     StatEntry {
+        id,
         name,
         cpu_percent,
         memory_usage,
@@ -96,7 +101,7 @@ pub async fn one_shot(docker: &Docker, id: &str, name: &str) -> Result<Option<St
     };
     let mut stream = docker.stats(id, Some(options));
     match stream.next().await {
-        Some(Ok(stats)) => Ok(Some(stat_entry(name.to_string(), stats))),
+        Some(Ok(stats)) => Ok(Some(stat_entry(id.to_string(), name.to_string(), stats))),
         _ => Ok(None),
     }
 }
@@ -249,7 +254,7 @@ mod tests {
 
     #[test]
     fn stat_entry_computes_the_vendored_percentages() {
-        let e = stat_entry("web".into(), stats());
+        let e = stat_entry("id-web".into(), "web".into(), stats());
         assert_eq!(e.cpu_percent, 40.0, "(1000/5000) × 2 cpus × 100");
         assert_eq!(e.memory_usage, 100);
         assert_eq!(e.memory_limit, 400);
@@ -261,6 +266,7 @@ mod tests {
         );
         assert_eq!(e.pids, 3);
         assert_eq!(e.name, "web");
+        assert_eq!(e.id, "id-web", "the row carries the container id");
     }
 
     #[test]
@@ -270,7 +276,7 @@ mod tests {
         s.precpu_stats.cpu_usage.total_usage = 1_500; // cpu_delta = 0
         s.memory_stats.limit = None;
         s.pids_stats.current = None;
-        let e = stat_entry("x".into(), s);
+        let e = stat_entry("id-x".into(), "x".into(), s);
         assert_eq!(e.cpu_percent, 0.0, "no delta ⇒ 0 (vendored guard)");
         assert_eq!(e.memory_percent, 0.0, "no limit ⇒ 0");
         assert_eq!(e.pids, 0);
@@ -292,7 +298,7 @@ mod tests {
                 tx_bytes: 20,
             },
         )]));
-        let e = stat_entry("n".into(), s);
+        let e = stat_entry("id-n".into(), "n".into(), s);
         assert_eq!((e.net_rx, e.net_tx), (10, 20));
     }
 
@@ -303,7 +309,7 @@ mod tests {
         // `one_shot`'s pure core is `stat_entry`; this pins that the
         // refactor did not fork the math (the fixture is the existing
         // `stats()` builder).
-        let e = stat_entry("web".into(), stats());
+        let e = stat_entry("id-web".into(), "web".into(), stats());
         assert_eq!(e.cpu_percent, 40.0);
         assert_eq!(e.memory_usage, 100);
         assert_eq!(e.net_rx, 70);

@@ -86,6 +86,36 @@ fn two_rows() -> Vec<ContainerSummary> {
     ]
 }
 
+/// One live stats sample for `id-web` (the stats poller keys its rows by
+/// container, so the row carries the container id).
+fn stats_row(id: &str, name: &str) -> tvdocker::domain::docker::statistics::StatEntry {
+    tvdocker::domain::docker::statistics::StatEntry {
+        id: id.into(),
+        name: name.into(),
+        cpu_percent: 9.9,
+        memory_usage: 104_857_600,
+        memory_limit: 524_288_000,
+        memory_percent: 20.0,
+        net_rx: 1_000_000,
+        net_tx: 2_000_000,
+        block_read: 0,
+        block_write: 0,
+        pids: 4,
+    }
+}
+
+/// The Statistics window, opened on a live stats row: the same startup
+/// as [`start`], plus the stats the window renders.
+fn start_with_stats() -> (Program, HeadlessHandle, Rc<RefCell<AppCore>>, TaskRx) {
+    let (mut program, screen, core, task_rx) =
+        start(vec![container_state("id-web", "web", "running")]);
+    core.borrow_mut()
+        .apply(AppMsg::Statistics(vec![stats_row("id-web", "web")]));
+    screen.push_event(Event::Command(app::CMD_OPEN_STATISTICS));
+    pump(&mut program, 10);
+    (program, screen, core, task_rx)
+}
+
 /// Right-click a point in **absolute** screen coordinates.
 ///
 /// The window sits at `Rect(2,1,78,23)` *inside* the desktop, which the
@@ -204,6 +234,98 @@ fn shift_f10_opens_the_row_menu_not_the_menu_bar() {
     assert!(
         matches!(task_rx.try_recv(), Ok(TaskReq::Inspect { id }) if id == "id-alpha"),
         "Enter still opens Details — the menu bar was never armed"
+    );
+}
+
+/// The Statistics window carries the Containers row menu: Shift+F10 on a
+/// stats row opens the same items, and they act on that row's CONTAINER
+/// (the desktop's openers queue container ids, not names).
+#[test]
+fn the_stats_row_menu_is_the_containers_menu() {
+    let (mut program, screen, _core, mut task_rx) = start_with_stats();
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("Explorer")
+            && text.contains("Image")
+            && text.contains("Details")
+            && text.contains("Delete"),
+        "the Containers menu on the stats row: {text:?}"
+    );
+    // 'd' → Details → an inspect of the ROW's container.
+    screen.push_key(Key::Char('d'), KeyModifiers::default());
+    pump(&mut program, 5);
+    match task_rx.try_recv() {
+        Ok(TaskReq::Inspect { id }) => assert_eq!(id, "id-web", "the row's container"),
+        _ => panic!("Inspect task for the stats row"),
+    }
+}
+
+/// A stats row is a RUNNING container by construction (docker stats only
+/// samples running ones), so its menu offers Stop — even when the
+/// containers list has not caught up (it polls separately).
+#[test]
+fn the_stats_menu_offers_stop_for_its_running_container() {
+    let (mut program, screen, core, _task_rx) = start_with_stats();
+    // The containers list lags behind (or lost the row meanwhile): the
+    // stats row itself still knows its container is running.
+    core.borrow_mut().apply(AppMsg::Containers(vec![]));
+    pump(&mut program, 3);
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    let text = screen_text(&screen);
+    let lower = text.to_lowercase();
+    assert!(
+        lower.contains("stop") && !lower.contains("start"),
+        "a stats row is running ⇒ Stop, never start: {text:?}"
+    );
+}
+
+/// The Image jump works from a stats row too: the menu's **Image** opens
+/// the Images window on THAT row's container image (proved by the cursor:
+/// Del in the Images window must remove the container's image, not the
+/// first row's).
+#[test]
+fn the_stats_menu_image_jump_opens_the_container_image() {
+    let (mut program, screen, core, mut task_rx) = start_with_stats();
+    core.borrow_mut().apply(AppMsg::Images(vec![
+        image_row("sha256:other", "zzz", "1"),
+        image_row("sha256:img", "nginx", "1.27"),
+    ]));
+    pump(&mut program, 3);
+    screen.push_key(
+        Key::F(10),
+        KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        },
+    );
+    pump(&mut program, 3);
+    screen.push_key(Key::Char('i'), KeyModifiers::default()); // ~I~mage
+    pump(&mut program, 16); // the Images status def lands ~9 pumps after open
+    screen.push_key(Key::Delete, KeyModifiers::default());
+    screen.push_event(Event::Command(Command::YES));
+    close_modal_and_quit(&screen);
+    app::run_program(program, None);
+    assert!(
+        matches!(
+            task_rx.try_recv(),
+            Ok(TaskReq::RemoveImage { id }) if id == "sha256:img"
+        ),
+        "the jump moved the Images cursor to the stats row's container image"
     );
 }
 

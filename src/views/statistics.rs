@@ -26,10 +26,10 @@ pub fn columns() -> Vec<Column> {
     ]
 }
 
-/// One row; id = the container NAME (— the stats poller
-/// keys by name). Cell formats copied verbatim from oh-my-docker's
-/// statistics UI; every numeric column sorts on its raw
-/// value.
+/// One row; id = the CONTAINER id (the stats poller keys its rows by
+/// container, so the container-scoped actions can target it); cell formats
+/// copied verbatim from oh-my-docker's statistics UI; every numeric column
+/// sorts on its raw value.
 pub fn to_row(s: &crate::domain::docker::statistics::StatEntry) -> TableRow {
     let mem = format!(
         "{:.1}MiB / {:.1}MiB",
@@ -51,7 +51,13 @@ pub fn to_row(s: &crate::domain::docker::statistics::StatEntry) -> TableRow {
         "0B / 0B".to_string()
     };
     TableRow::new(
-        s.name.clone(),
+        // An id-less sample (never seen from the poller) falls back to
+        // the name, so the row keeps a usable key.
+        if s.id.is_empty() {
+            s.name.clone()
+        } else {
+            s.id.clone()
+        },
         vec![
             s.name.clone(),
             format!("{:.1}%", s.cpu_percent),
@@ -111,6 +117,15 @@ pub fn sort_keys(core: &AppCore) -> Vec<(usize, Vec<SortKey>)> {
     ]
 }
 
+/// The Statistics row menu — the Containers menu, applied to the row's
+/// container (the row's id IS the container id). A stats row is a RUNNING
+/// container by construction (`docker stats` only samples running ones),
+/// so the Start/Stop flip does not depend on the containers list, which
+/// polls separately.
+pub fn context_menu(_core: &AppCore, _id: &str) -> Vec<(String, tv::Command)> {
+    crate::views::containers::context_menu_for(true)
+}
+
 const SPEC: ResourceSpec = ResourceSpec {
     title: "Statistics",
     number: 6,
@@ -120,7 +135,7 @@ const SPEC: ResourceSpec = ResourceSpec {
     rows,
     total,
     empty: " No running containers.",
-    context_menu: None,
+    context_menu: Some(context_menu),
     table_key: "statistics",
     sort_keys,
 };
@@ -137,6 +152,7 @@ mod tests {
 
     fn entry() -> StatEntry {
         StatEntry {
+            id: "id-web".into(),
             name: "web".into(),
             cpu_percent: 9.9,
             memory_usage: 104_857_600,
@@ -150,11 +166,43 @@ mod tests {
         }
     }
 
+    /// The row's id must be the CONTAINER id: every menu item acts on a
+    /// container id (the desktop's openers queue ids, not names).
+    #[test]
+    fn the_stats_row_is_keyed_by_container_id() {
+        let r = to_row(&entry());
+        assert_eq!(r.id, "id-web", "id = the container id");
+        assert_eq!(r.cells[0], "web", "the NAME cell is unchanged");
+    }
+
+    /// The Statistics window carries the Containers row menu: the same
+    /// items, on the row's container.
+    #[test]
+    fn the_stats_menu_is_the_containers_menu() {
+        let core = Rc::new(RefCell::new(AppCore::new()));
+        let items = context_menu(&core.borrow(), "id-web");
+        assert_eq!(
+            items,
+            crate::views::containers::context_menu_for(true),
+            "the Containers menu, verbatim"
+        );
+        assert!(
+            items.iter().any(|(l, _)| l.replace('~', "") == "Image"),
+            "the Image jump is there too: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(l, _)| l.replace('~', "").to_lowercase() == "stop"),
+            "a stats row is a RUNNING container ⇒ Stop: {items:?}"
+        );
+    }
+
     #[test]
     fn statistics_rows_carry_numeric_sort_keys_and_tvdocker_formats() {
         // Review Focus #5: the keys make CPU 9.9% sort BELOW 10.2%.
         let r = to_row(&entry());
-        assert_eq!(r.id, "web", "id = container name");
+        assert_eq!(r.id, "id-web", "id = the container id");
         assert_eq!(r.cells[1], "9.9%", "CPU % format");
         assert_eq!(r.cells[2], "100.0MiB / 500.0MiB", "MEM in MiB");
         assert_eq!(r.cells[3], "1.0MB / 2.0MB", "NET rx / tx in MB");
