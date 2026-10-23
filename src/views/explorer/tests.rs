@@ -279,6 +279,41 @@ fn enter_descends_backspace_climbs_and_requests_relist() {
     );
 }
 
+/// Refresh moved off F5 — the app-wide Zoom's key, whose `status_always`
+/// item wins the pre-route first (so the window's F5 arm was unreachable in
+/// practice) — onto Ctrl+R. The window's own arm must relist on the chord
+/// even with no status pre-route in the loop, and F5 must never relist.
+#[test]
+fn ctrl_r_refreshes_the_active_panel_and_f5_no_longer_does() {
+    let (mut w, _core, mut rx) = window();
+    while rx.try_recv().is_ok() {} // drain the build requests
+    crate::testutil::send_key_mods(
+        &mut w,
+        Key::Char('r'),
+        tv::event::KeyModifiers {
+            ctrl: true,
+            ..tv::event::KeyModifiers::default()
+        },
+    );
+    let req = rx.try_recv().expect("Ctrl+R re-lists the active panel");
+    assert!(
+        matches!(
+            req,
+            TaskReq::ExplorerList {
+                target: ExplorerTarget::Host,
+                ..
+            }
+        ),
+        "the focused host panel is the one refreshed"
+    );
+
+    send(&mut w, Key::F(5));
+    assert!(
+        rx.try_recv().is_err(),
+        "F5 is Zoom now — it must not relist"
+    );
+}
+
 fn core_seed_host(_w: &mut ExplorerWindow, rx: &mut mpsc::UnboundedReceiver<TaskReq>) {
     while rx.try_recv().is_ok() {}
 }
@@ -1339,7 +1374,7 @@ fn the_columns_command_opens_the_popup_with_the_filter_focused() {
 }
 
 /// The window reports its help context, so the status line switches to
-/// the Explorer def while it is focused (Ctrl+O's column popup, F5,
+/// the Explorer def while it is focused (Ctrl+O's column popup, ^R,
 /// Del). Without it `Group::get_help_ctx` yields NO_CONTEXT from every
 /// child and the bar stays on the universal def — no window keys bound.
 #[test]

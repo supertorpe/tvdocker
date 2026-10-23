@@ -508,7 +508,7 @@ pub fn build(
     // Set ONCE on the window's state — the status line keys off the
     // focused window's help ctx (the ResourceWindow/logs pattern:
     // `Group::get_help_ctx` falls back to this state when every focused
-    // leaf yields NO_CONTEXT), so the Explorer def (Ctrl+O, F5, Del)
+    // leaf yields NO_CONTEXT), so the Explorer def (Ctrl+O, ^R, Del)
     // applies while this window has the focus.
     win.state_mut().help_ctx = HELP_CTX;
     let size = win.state().size;
@@ -848,8 +848,10 @@ impl View for ExplorerWindow {
                 return;
             }
         }
-        // --- Printables + Del/F5 (NEVER status-bound; a
-        // focused filter swallows them instead — correct UX).
+        // --- Printables + Del/^R: the window's OWN path for these keys
+        // (the status def also binds Del/^R for the pre-route; this arm
+        // covers direct delivery). A focused filter swallows them instead
+        // — correct UX).
         if let Event::KeyDown(ke) = ev
             && !self.filter_focused()
         {
@@ -859,7 +861,10 @@ impl View for ExplorerWindow {
                     ev.clear();
                     return;
                 }
-                (Key::F(5), _) => {
+                // Ctrl+R refreshes (F5 belongs to the app-wide Zoom — its
+                // status item wins the pre-route, so F5 here could never
+                // relist anyway).
+                (Key::Char('r'), true) => {
                     self.relist_active();
                     ev.clear();
                     return;
@@ -1092,7 +1097,7 @@ impl ExplorerWindow {
         self.is_focused(self.host.filter) || self.is_focused(self.remote.filter)
     }
 
-    /// Re-request the active panel's current listing (F5 / `R`).
+    /// Re-request the active panel's current listing (`Ctrl+R` / `R`).
     fn relist_active(&mut self) {
         let remote = self.active_remote();
         let target = if remote {

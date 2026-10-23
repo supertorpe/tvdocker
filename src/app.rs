@@ -405,12 +405,14 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
                 .key_item(k(&kb.delete, KeyEvent::from(Key::Delete)), CMD_REQ_DELETE)
                 .key_item(ctrl_chord(Key::Char('o')), Command::TABLE_COLUMNS)
         })
-        // Explorer: F5 Refresh, Del; Ctrl+O.
+        // Explorer: ^R Refresh, Del; Ctrl+O. (NOT F5 — `status_always`
+        // binds F5 → Zoom first and first match wins, so an F5 Refresh
+        // item here could never fire: F5 maximized instead.)
         .def_one_of([crate::views::explorer::HELP_CTX], |d| {
             status_hidden(status_always(d, kb), kb)
                 .item(
-                    "~F5~ Refresh",
-                    KeyEvent::from(Key::F(5)),
+                    "^~R~ Refresh",
+                    ctrl_chord(Key::Char('r')),
                     crate::views::explorer::CMD_EXP_REFRESH,
                 )
                 .key_item(
@@ -1249,6 +1251,43 @@ mod tests {
         );
     }
 
+    /// The Explorer's Refresh must ride `Ctrl+R`, not F5: F5 is the
+    /// app-wide Zoom and its `status_always` item is added FIRST, so the
+    /// old `~F5~ Refresh` item lost the pre-route to it (first match wins)
+    /// and F5 maximized the window instead of refreshing. The chord is
+    /// Explorer-only — it must not leak into other contexts.
+    #[test]
+    fn explorer_refresh_moves_to_ctrl_r_and_f5_stays_zoom() {
+        use crate::views::explorer;
+        let ctrl_r = Event::KeyDown(KeyEvent::new(
+            Key::Char('r'),
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            },
+        ));
+        assert_eq!(
+            transform(explorer::HELP_CTX, ctrl_r.clone()),
+            Event::Command(explorer::CMD_EXP_REFRESH),
+            "Explorer: Ctrl+R refreshes"
+        );
+        assert_eq!(
+            transform(explorer::HELP_CTX, key(Key::F(5))),
+            Event::Command(Command::ZOOM),
+            "F5 keeps Zoom in the Explorer"
+        );
+        assert_eq!(
+            transform(crate::views::containers::HELP_CTX, ctrl_r.clone()),
+            ctrl_r,
+            "Ctrl+R must NOT leak from the Explorer def"
+        );
+        assert_eq!(
+            transform(HelpCtx::NO_CONTEXT, ctrl_r.clone()),
+            ctrl_r,
+            "…nor from the universal def"
+        );
+    }
+
     /// `Ctrl+L` is the keyboard-only Layers route, bound in Images the way
     /// `Ctrl+E` is bound there for the Explorer.
     #[test]
@@ -1292,6 +1331,7 @@ mod tests {
             "F5 Zoom",
             "F6 Next",
             "F10 Menu",
+            "^R Refresh",
             "Alt-X Exit",
             // …and the menu bar, likewise permanently on screen: its Alt
             // chords are the bar's own hot letters, and the Windows submenu
