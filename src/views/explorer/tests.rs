@@ -445,6 +445,44 @@ fn del_ignores_the_parent_row() {
 }
 
 #[test]
+fn del_on_the_host_panel_queues_a_host_delete_in_a_container_window() {
+    // The window's `target` is the REMOTE side (here Container "c1"), but
+    // Del on the HOST panel must delete on the HOST fs — the side follows
+    // the active panel, exactly as `finish_prompt` computes it. Sending
+    // the window target instead runs `rm` INSIDE the container and the
+    // host file survives.
+    let (mut w, _core, mut rx) = window();
+    while rx.try_recv().is_ok() {}
+    w.host.path = "/home/u".into();
+    seed(
+        &mut w,
+        ExplorerTarget::Host,
+        "/home/u",
+        vec![entry("a.txt", false)],
+    );
+    // `g` parks the cursor on `..`; Down lands on the only real row.
+    send(&mut w, Key::Char('g'));
+    send(&mut w, Key::Down);
+    send(&mut w, Key::Delete);
+    {
+        let mut timers = tv::TimerQueue::new();
+        let mut deferred: Vec<tv::Deferred> = Vec::new();
+        let mut out = std::collections::VecDeque::new();
+        let mut ctx = Context::new(&mut out, &mut timers, 0, &mut deferred);
+        w.set_modal_answer(tv::Command::YES);
+        let mut ev = Event::Command(CMD_EXP_DELETE_CONFIRMED);
+        w.handle_event(&mut ev, &mut ctx);
+    }
+    let req = rx.try_recv().expect("delete queued");
+    assert!(
+        matches!(req, TaskReq::ExplorerDelete { target: ExplorerTarget::Host, ref paths, .. }
+                if paths == &vec!["/home/u/a.txt".to_string()]),
+        "a host-panel delete must target ExplorerTarget::Host, not the window's remote target"
+    );
+    assert!(rx.try_recv().is_err(), "exactly one delete");
+}
+
+#[test]
 fn drop_stops_the_volume_helper_but_never_a_container_explorer() {
     // Review Focus #3: every volume-window close must stop its
     // helper; a container explorer must never send the request.

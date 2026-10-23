@@ -229,7 +229,11 @@ pub struct ExplorerWindow {
     /// The prompt that is open (or about to be): create/rename/goto.
     pending_prompt: Option<PromptKind>,
     /// The pending Del's paths (the confirm round trip).
-    pending_delete: Option<Vec<String>>,
+    /// The Del confirm's snapshot: the ACTIVE panel's side target plus its
+    /// paths, captured together. The window's `target` is the REMOTE side
+    /// only, so a host-panel delete must not inherit it (it would run `rm`
+    /// inside the container and leave the host file in place).
+    pending_delete: Option<(ExplorerTarget, Vec<String>)>,
     /// The answer of the last message box.
     modal_answer: Option<Command>,
     /// The last prompt's answered text (the `InputDialog` record, delivered
@@ -1237,7 +1241,12 @@ impl ExplorerWindow {
         if targets.is_empty() {
             return;
         }
-        self.pending_delete = Some(targets.clone());
+        let target = if self.active_remote() {
+            self.target.clone()
+        } else {
+            ExplorerTarget::Host
+        };
+        self.pending_delete = Some((target, targets.clone()));
         let text = if targets.len() == 1 {
             format!("Delete '{}'?", targets[0])
         } else {
@@ -1256,16 +1265,16 @@ impl ExplorerWindow {
     }
 
     fn finish_delete(&mut self) {
-        let paths = self.pending_delete.take();
+        let pending = self.pending_delete.take();
         if self.modal_answer.take() != Some(tv::Command::YES) {
             return;
         }
-        let Some(paths) = paths else {
+        let Some((target, paths)) = pending else {
             return;
         };
         let _ = self.task_tx.send(TaskReq::ExplorerDelete {
             key: self.key.clone(),
-            target: self.target.clone(),
+            target,
             paths,
         });
     }

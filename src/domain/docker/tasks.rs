@@ -176,7 +176,8 @@ pub fn spawn_task_worker(
                     dst,
                 } => {
                     let outcome = copy_for(&target, to_container, &items, &dst).await;
-                    finish_explorer(&app_tx, &action_tx, outcome, &key, &target, dst, "copy").await;
+                    let relist = copy_relist_target(&target, to_container);
+                    finish_explorer(&app_tx, &action_tx, outcome, &key, &relist, dst, "copy").await;
                 }
                 TaskReq::ExplorerDelete { key, target, paths } => {
                     let outcome = mutate_for(&target, paths.clone(), true).await;
@@ -535,15 +536,32 @@ async fn rename_for(
     Ok(())
 }
 
+/// The side a successful copy must re-list — its DESTINATION. Copying
+/// `to_container` refreshes the remote panel (the window's `target`);
+/// copying to the host refreshes the HOST panel, so the epilogue must
+/// not reuse the remote `target` for a host `dst` (it would list the
+/// host path inside the container and key the result to the wrong side).
+fn copy_relist_target(
+    target: &crate::core::ExplorerTarget,
+    to_container: bool,
+) -> crate::core::ExplorerTarget {
+    if to_container {
+        target.clone()
+    } else {
+        crate::core::ExplorerTarget::Host
+    }
+}
+
 /// Mutation epilogue (ruling 4): success ⇒ Status + PollNow + the
 /// affected dir re-listed (the window never waits for a round trip);
-/// failure ⇒ TaskError.
+/// failure ⇒ TaskError. `relist_target` is the SIDE the operation
+/// touched — not necessarily the window's remote target.
 async fn finish_explorer(
     app_tx: &Sender<AppMsg>,
     action_tx: &ActionSender<ActionReq>,
     outcome: anyhow::Result<()>,
     key: &str,
-    target: &crate::core::ExplorerTarget,
+    relist_target: &crate::core::ExplorerTarget,
     relist_path: String,
     what: &str,
 ) {
@@ -551,11 +569,11 @@ async fn finish_explorer(
         Ok(()) => {
             let _ = app_tx.send(AppMsg::Status(format!("{what} ok"))).await;
             let _ = action_tx.send(ActionReq::PollNow);
-            if let Ok(entries) = list_for(target, &relist_path).await {
+            if let Ok(entries) = list_for(relist_target, &relist_path).await {
                 let _ = app_tx
                     .send(AppMsg::ExplorerDir {
                         key: key.to_string(),
-                        target: target.clone(),
+                        target: relist_target.clone(),
                         path: relist_path,
                         entries,
                     })
@@ -1131,6 +1149,33 @@ mod tests {
             other => panic!("ExplorerDir expected, got another variant: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A copy's epilogue must re-list the DESTINATION side: with
+    /// `to_container == false` the `dst` is a HOST dir, so the fresh
+    /// listing belongs to the host panel — keying it by the window's
+    /// remote `target` listed the host path inside the container and
+    /// published it to the remote slot, leaving the host list stale.
+    #[test]
+    fn a_copy_relists_its_destination_side() {
+        use crate::core::ExplorerTarget;
+        let container = ExplorerTarget::Container("c1".into());
+        assert_eq!(
+            copy_relist_target(&container, false),
+            ExplorerTarget::Host,
+            "container→host must re-list the HOST dir"
+        );
+        assert_eq!(
+            copy_relist_target(&container, true),
+            container.clone(),
+            "host→container re-lists the remote dir"
+        );
+        let image = ExplorerTarget::Image("sha256:aaa".into());
+        assert_eq!(
+            copy_relist_target(&image, false),
+            ExplorerTarget::Host,
+            "image→host must re-list the HOST dir"
+        );
     }
 
     /// A bogus id must fail into the diagnostics channel (the window's
