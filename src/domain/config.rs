@@ -717,8 +717,16 @@ pub fn column_layout_table_text(key: &str, cfg: &ColumnLayoutCfg) -> String {
 /// shares that helper's behaviour: the block *and one trailing blank line* are
 /// replaced, and everything else — comments, ordering, other tables — is
 /// untouched.
+///
+/// It recognizes BOTH styles the app itself writes: this inline block, and
+/// the `[[column_layouts.<key>.layout]]` array-of-tables that
+/// [`TvdockerConfig::save`] (`to_string_pretty`) emits — a full save runs
+/// before this line-edit more often than not, and missing the serializer's
+/// style used to APPEND a second definition, corrupting the file (startup:
+/// `Config parse error … duplicate key`).
 pub fn replace_column_layout_block(text: &str, key: &str, cfg: &ColumnLayoutCfg) -> String {
     let parent = format!("[column_layouts.{}]", toml_key(key));
+    let array_parent = format!("[[column_layouts.{}.layout]]", toml_key(key));
     let had_trailing_nl = text.is_empty() || text.ends_with('\n');
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
     if had_trailing_nl && lines.last().is_some_and(|l| l.is_empty()) {
@@ -731,7 +739,7 @@ pub fn replace_column_layout_block(text: &str, key: &str, cfg: &ColumnLayoutCfg)
         let t = line.trim_start();
         if t.starts_with('[') {
             let head = t.find(']').map(|i| &t[..=i]).unwrap_or("");
-            let ours = head == parent;
+            let ours = head == parent || t.trim_end() == array_parent;
             if ours && insert_at.is_none() {
                 insert_at.get_or_insert(kept.len());
             }
@@ -1665,6 +1673,108 @@ mod tests {
             "nothing written"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// `TvdockerConfig::save` (`to_string_pretty`) writes layouts as
+    /// `[[column_layouts.<key>.layout]]` array-of-tables. A column change
+    /// after such a full save must REPLACE those entries — the old code
+    /// only recognized the `[column_layouts.<key>]` header, found none, and
+    /// appended a SECOND definition, so the next startup reported
+    /// `Config parse error: TOML parse error at line 148` (the user
+    /// report: file written entirely by the app).
+    #[test]
+    fn a_column_change_after_a_full_save_replaces_instead_of_duplicating() {
+        let mut cfg = TvdockerConfig::default();
+        cfg.column_layouts.insert(
+            "containers".into(),
+            ColumnLayoutCfg {
+                layout: vec![layout_entry(0, 0, 54), layout_entry(1, 1, 28)],
+            },
+        );
+        cfg.column_layouts.insert(
+            "explorer.host".into(),
+            ColumnLayoutCfg {
+                layout: vec![layout_entry(0, 0, 45)],
+            },
+        );
+        let saved = cfg.to_toml().expect("serialize");
+        assert!(
+            saved.contains("[[column_layouts.containers.layout]]"),
+            "the full save uses the array-of-tables style: {saved}"
+        );
+
+        let path = tmpfile(&saved);
+        let resized = ColumnLayoutCfg {
+            layout: vec![layout_entry(0, 0, 41)],
+        };
+        TvdockerConfig::set_column_layout_in_file(&path, "containers", &resized).expect("write");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let (back, err) = TvdockerConfig::load_from(&path);
+        assert_eq!(err, None, "the file still parses: {after}");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            back.column_layout("containers").expect("containers").layout,
+            resized.layout,
+            "the resized layout is the one kept"
+        );
+        assert_eq!(
+            after
+                .matches("[[column_layouts.containers.layout]]")
+                .count(),
+            0,
+            "the stale array-of-tables entries are gone, not duplicated"
+        );
+        assert_eq!(
+            back.column_layout("explorer.host").expect("host").layout,
+            cfg.column_layouts["explorer.host"].layout,
+            "the untouched key keeps its entries and style"
+        );
+    }
+
+    /// The user's actual corruption shape: a full save's
+    /// `[[column_layouts.containers.layout]]` entries AND a previously
+    /// appended `[column_layouts.containers]` block in the SAME file. A
+    /// column change must collapse both into ONE canonical block (newest
+    /// values win) and leave every other key untouched.
+    #[test]
+    fn a_column_change_repairs_a_file_that_already_has_both_styles() {
+        let text = "mouse = true\n\n\
+            [[column_layouts.containers.layout]]\ncolumn = 0\norder = 0\nwidth = 54\nflex = 0\nfixed = true\nhidden = false\n\n\
+            [[column_layouts.\"explorer.host\".layout]]\ncolumn = 0\norder = 0\nwidth = 45\nflex = 0\nfixed = true\nhidden = false\n\n\
+            [themes]\n\n\
+            [column_layouts.containers]\nlayout = [\n  { column = 0, order = 0, width = 41, flex = 0, fixed = true, hidden = false },\n]\n";
+        let path = tmpfile(text);
+        let resized = ColumnLayoutCfg {
+            layout: vec![layout_entry(0, 0, 41), layout_entry(1, 1, 12)],
+        };
+        TvdockerConfig::set_column_layout_in_file(&path, "containers", &resized).expect("write");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let (back, err) = TvdockerConfig::load_from(&path);
+        assert_eq!(err, None, "the file parses again: {after}");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            after.matches("column_layouts.containers").count(),
+            1,
+            "exactly one containers layout block remains: {after}"
+        );
+        assert_eq!(
+            back.column_layout("containers").expect("containers").layout,
+            resized.layout,
+            "the newest layout is kept"
+        );
+        assert_eq!(
+            back.column_layout("explorer.host")
+                .expect("host")
+                .layout
+                .len(),
+            1,
+            "the other key's array-of-tables block survives"
+        );
+        assert!(after.contains("[themes]"), "themes untouched");
     }
 
     #[test]
