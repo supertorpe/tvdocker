@@ -79,6 +79,12 @@ Opening an item already on screen focuses it instead of duplicating it, windows 
 
 The **Help** menu also carries **Check for updates…** — a GitHub release lookup against this repository (`src/domain/update.rs`). When the release has an asset for your platform, the dialog offers to download and install it: the archive is fetched, unpacked, and the running binary is replaced on disk — restart tvdocker to apply. Without a matching asset the dialog points at the release page instead. The optional startup check (`check_updates = true`) only latches a status-line notice; it never installs.
 
+## Clipboard
+
+Drag with the left mouse button to select exact characters in the read-only text of **Logs**, **Details** and **Diagnostics**; the selection is highlighted and **Copy** publishes it as the system clipboard (or an in-memory fallback when headless). The top-level **Edit** menu and every approved window context menu (right-click or `Shift+F10`) carry **Cut / Copy / Paste**, grayed when the focused view cannot perform them.
+
+In a read-only text view `Ctrl+C` copies the selection (`Ctrl+Insert`, `Shift+Insert` and `Shift+Delete` also copy). In a **filter field** `Ctrl+X` / `Ctrl+C` / `Ctrl+V` cut, copy and paste the whole field. Dialog fields such as the settings editor keep tvision's default `word_star` keymap — use the **Edit** menu there (or `Ctrl+Insert` to copy, `Shift+Insert` to paste, `Shift+Delete` to cut). The shell accepts pasted text via `Ctrl+Insert` or `Shift+Insert` (or the Edit menu); there `Ctrl+C` stays `SIGINT` and is never intercepted. Copy yields **display text only**: ANSI colours and any line tail beyond `MAX_LINE_BYTES` are not recoverable.
+
 ## Releasing
 
 Push a version tag and the `release` workflow does the rest:

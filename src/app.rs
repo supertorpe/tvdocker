@@ -7,8 +7,9 @@ use std::rc::Rc;
 use tokio::sync::{broadcast, mpsc};
 use tv::status::StatusItemsBuilder;
 use tv::{
-    Command, CrosstermBackend, Key, KeyEvent, KeyModifiers, Menu, MenuBar, MessageBoxButtons,
-    MessageBoxKind, Program, Rect, StatusDef, StatusLine, SystemClock, View, alt,
+    Command, CrosstermBackend, HelpCtx, Key, KeyEvent, KeyModifiers, Menu, MenuBar, MenuItem,
+    MessageBoxButtons, MessageBoxKind, Program, Rect, StatusDef, StatusLine, SystemClock, View,
+    alt,
 };
 
 use crate::core::{ActionReq, AppCore, AppMsg, TaskReq};
@@ -195,25 +196,23 @@ pub fn about_text() -> String {
 /// bindings. `run_program`'s `CMD_HELP` handler renders this text, and the
 /// `f1_help_documents_the_table_sort_keys` gate test asserts both that F1
 /// opens the box and that this content documents the sort keys.
+// `message_box` grows one row per 33 chars (h = chars/33 + 7) and its static
+// text gets h-5 rows. Keep this body in [594, 626] chars AND within 20 wrapped
+// rows, or the clipboard lines fall off an 80×25 screen. The F1 test asserts
+// the last line is actually rendered.
 pub const SHORTCUTS_TEXT: &str = "\
-    Tables: ←/→ cycle the sort column, Shift+←/→ flip\n\
-    its direction, Space selects a row;\n\
-    Ctrl-A selects all; Ctrl+O columns;\n\
-    Shift+F10 opens the row menu.\n\n\
-    Containers: F2 Logs · F4 Shell · Ctrl+E Explorer ·\n\
-    Enter Details · Del Delete (confirm);\n\
-    F7 pauses log follow.\n\n\
-    Images: F2 Run · Ctrl+E Explorer · Ctrl+L Layers · Del Remove ·\n\
-    menu: dangling/prune.\n\n\
-    Networks: Del Delete.\n\
-    Volumes: Enter Explorer · Del Delete.\n\
-    Explorer: Tab panels · / filter · n/N new · r rename · X copy · Del delete.\n\n\
-    Diagnose: right-click a container →\n\
-    Diagnose…, one per container.\n\n\
-    Settings: Options → Settings… edits\n\
-    tvdocker.toml; F2 saves + reloads.\n\n\
-    Esc closes menus/dialogs; in a shell window\n\
-    Esc, Tab, arrows and Ctrl-keys go to the terminal.";
+    Tables: ←/→ cycle the sort column, Shift+←/→ flip dir; Space row;\n\
+    Ctrl-A selects all; Ctrl+O columns; Shift+F10 opens menu.\n\
+    Cont: F2 Logs, F4 Shell, Ctrl+E Explorer, Enter Details, Del,\n\
+    F7 pauses log follow.\n\
+    Img: F2 Run, Ctrl+E Explorer, Ctrl+L Layers, dangling/prune.\n\
+    Net: Del. Vol: Enter Explorer, Del.\n\
+    Explorer: Tab, / filter, n/N new, r rename, X copy, Del.\n\
+    Diagnose: right-click → Diagnose…\n\
+    Edit: Ctrl+X/C/V cut/copy/paste; drag Logs/Details/Diagnostics;\n\
+    shell keeps Ctrl+C (SIGINT); Ctrl+Ins / Shift+Ins paste.\n\
+    Settings: Options → Settings…; F2 saves + reloads.\n\
+    Esc closes; shell keeps Esc/Tab.";
 
 /// A `Ctrl`-chord `KeyEvent`.
 fn ctrl_chord(k: Key) -> KeyEvent {
@@ -483,7 +482,7 @@ pub(crate) fn init_status_line_with(r: Rect, kb: &Keybindings) -> Option<StatusL
     Some(StatusLine::new(r, defs))
 }
 
-/// Menu bar : File / Docker / Windows / Options / Help — no disabled
+/// Menu bar : File / Edit / Docker / Windows / Options / Help — no disabled
 /// stubs. The tree itself lives in [`app_menu`] so tests can inspect
 /// items without a live `MenuBar` (tvision keeps `MenuBar::menu()`
 /// behind its own `cfg(test)`).
@@ -498,6 +497,35 @@ pub fn app_menu() -> Menu {
     Menu::builder()
         .submenu("~F~ile", alt('f'), |m| {
             m.command_key("~E~xit", Command::QUIT, alt('x'), "Alt-X")
+        })
+        // Chord hints are display-only: the focused view owns Ctrl+X/C/V
+        // (the shell keeps Ctrl+C as SIGINT). No global accelerator here, and
+        // no status-line slot — the command set greys these for each focus.
+        .submenu("~E~dit", alt('e'), |m| {
+            m.item(MenuItem::Command {
+                name: "Cu~t~".into(),
+                command: Command::CUT,
+                key_code: None,
+                param: Some("Ctrl+X".into()),
+                help_ctx: HelpCtx::NO_CONTEXT,
+                disabled: false,
+            })
+            .item(MenuItem::Command {
+                name: "~C~opy".into(),
+                command: Command::COPY,
+                key_code: None,
+                param: Some("Ctrl+C".into()),
+                help_ctx: HelpCtx::NO_CONTEXT,
+                disabled: false,
+            })
+            .item(MenuItem::Command {
+                name: "~P~aste".into(),
+                command: Command::PASTE,
+                key_code: None,
+                param: Some("Ctrl+V".into()),
+                help_ctx: HelpCtx::NO_CONTEXT,
+                disabled: false,
+            })
         })
         .submenu("~D~ocker", alt('d'), |m| {
             m.command("~C~ontainers", CMD_OPEN_CONTAINERS)
@@ -975,6 +1003,60 @@ mod tests {
         );
     }
 
+    /// The Edit menu is between File and Docker, carries display-only chord
+    /// labels (no global accelerators, so focused views keep their own key
+    /// meanings), and never steals room on the status line.
+    #[test]
+    fn edit_menu_carries_clipboard_chords_display_only() {
+        use tv::menu::MenuItem;
+        let menu = app_menu();
+        let (name, edit) = match &menu.items[1] {
+            MenuItem::SubMenu { name, menu, .. } => (name, menu),
+            other => panic!("items[1] is the Edit submenu: {other:?}"),
+        };
+        assert_eq!(name, "~E~dit");
+
+        let items: Vec<_> = edit
+            .items
+            .iter()
+            .filter(|it| matches!(it, MenuItem::Command { .. }))
+            .collect();
+        let expected = [
+            (Command::CUT, "Ctrl+X"),
+            (Command::COPY, "Ctrl+C"),
+            (Command::PASTE, "Ctrl+V"),
+        ];
+        assert_eq!(items.len(), expected.len());
+        for (item, (command, label)) in items.iter().zip(expected) {
+            match item {
+                MenuItem::Command {
+                    command: cmd,
+                    key_code,
+                    param,
+                    ..
+                } => {
+                    assert_eq!(*cmd, command);
+                    assert!(key_code.is_none(), "{label} is display-only");
+                    assert_eq!(param.as_deref(), Some(label));
+                }
+                other => panic!("expected a command item: {other:?}"),
+            }
+        }
+
+        for builder in [
+            status_always(StatusItemsBuilder::default(), &Keybindings::default()),
+            status_hidden(StatusItemsBuilder::default(), &Keybindings::default()),
+        ] {
+            assert!(
+                builder
+                    .build()
+                    .iter()
+                    .all(|it| !matches!(it.command, Command::CUT | Command::COPY | Command::PASTE)),
+                "no clipboard command takes a status-line slot"
+            );
+        }
+    }
+
     /// `take_fullscreen` is the single toggle seam: from `Off` it enters
     /// `Desktop` (frameless, fills the desktop); from *either* fullscreen
     /// mode it reverts to `Off` in one press — restoring the framed window
@@ -1325,6 +1407,22 @@ mod tests {
             SHORTCUTS_TEXT.contains("Shift+F10"),
             "the mouse-free context menu is documented: {SHORTCUTS_TEXT}"
         );
+        assert!(
+            SHORTCUTS_TEXT.contains("Ctrl+X/C/V cut/copy/paste"),
+            "the Edit-menu chords are documented: {SHORTCUTS_TEXT}"
+        );
+        assert!(
+            SHORTCUTS_TEXT.contains("drag Logs/Details/Diagnostics"),
+            "mouse selection is documented: {SHORTCUTS_TEXT}"
+        );
+        assert!(
+            SHORTCUTS_TEXT.contains("shell keeps") && SHORTCUTS_TEXT.contains("Ctrl+C (SIGINT)"),
+            "the shell exception is documented: {SHORTCUTS_TEXT}"
+        );
+        assert!(
+            SHORTCUTS_TEXT.contains("Ctrl+Ins / Shift+Ins paste"),
+            "shell paste shortcuts are documented: {SHORTCUTS_TEXT}"
+        );
         for visible in [
             "F1 Help",
             "F3 Close",
@@ -1357,6 +1455,12 @@ mod tests {
             // …and the menu entries that no status bar shows:
             "Options → Settings…",
             "Diagnose…",
+            // Live bindings that must never drop out again when the help
+            // body is edited for the new clipboard chords.
+            "F7 pauses log follow",
+            "dangling/prune",
+            "n/N new",
+            "F2 saves + reloads",
         ] {
             assert!(SHORTCUTS_TEXT.contains(keeps), "keeps {keeps:?}");
         }

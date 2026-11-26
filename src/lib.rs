@@ -4,6 +4,7 @@
 pub mod app;
 pub mod bridge;
 pub mod cli;
+pub mod clipboard;
 pub mod core;
 pub mod domain;
 #[cfg(test)]

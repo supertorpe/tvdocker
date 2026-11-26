@@ -302,7 +302,7 @@ impl LogsWindow {
     /// `anchor` — the right-click point, or the log pane's top-left for
     /// the keyboard route (a log line has no row menu of its own).
     fn context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
-        let menu = Menu::builder()
+        let mut builder = Menu::builder()
             .command(
                 if self.show_timestamps {
                     "Hide timestamps"
@@ -311,8 +311,11 @@ impl LogsWindow {
                 },
                 crate::app::CMD_TOGGLE_TIMESTAMPS,
             )
-            .command("Export…", crate::app::CMD_EXPORT_LOGS)
-            .build();
+            .command("Export…", crate::app::CMD_EXPORT_LOGS);
+        for item in crate::clipboard::context_menu_items(ctx) {
+            builder = builder.item(item);
+        }
+        let menu = builder.build();
         let global = anchor + self.abs_origin;
         popup_menu(global, menu, ctx.owner_size(), ctx);
     }
@@ -347,6 +350,16 @@ impl View for LogsWindow {
                 }
                 self.info.borrow_mut().filter = String::new();
                 self.pull_state();
+                ev.clear();
+                return;
+            }
+            // Selection rung: Esc clears a drag before it is allowed to
+            // close the window (the view's own Esc arm is unreachable —
+            // this window consumes every Esc before delegating).
+            if let Some(log) = self.log_mut()
+                && log.has_selection()
+            {
+                log.clear_selection(ctx);
                 ev.clear();
                 return;
             }
@@ -453,6 +466,8 @@ impl Drop for LogsWindow {
 mod tests {
     use super::*;
     use crate::core::{AppMsg, LOGS_CAP};
+    use tv::event::{KeyEvent, KeyModifiers, MouseButtons};
+    use tv::{Deferred, Point};
 
     fn line(ts: &str, msg: &str) -> LogLine {
         LogLine {
@@ -497,6 +512,45 @@ mod tests {
         assert!(matches!(sync_plan(2, 0, (10, 10)), Rebuild));
         // The forced rebuild marker after a timestamp toggle.
         assert!(matches!(sync_plan(10, 10, (u64::MAX, usize::MAX)), Rebuild));
+    }
+
+    #[test]
+    fn esc_clears_a_mouse_selection_before_it_closes_the_window() {
+        let core = session_core("c1");
+        let mut w = window(core.clone());
+        apply_lines(&core, "c1", vec![line("", "abcdef"), line("", "second")]);
+        w.sync_lines();
+
+        // A left drag inside the log view (view-local coords; hit_test uses
+        // a zero origin) marks characters on the first line.
+        crate::testutil::with_ctx(|ctx| {
+            let log = w.log_mut().expect("view");
+            let at = |x| MouseEvent {
+                position: Point::new(x, 0),
+                buttons: MouseButtons {
+                    left: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut down = Event::MouseDown(at(1));
+            log.handle_event(&mut down, ctx);
+            let mut up = Event::MouseUp(at(4));
+            log.handle_event(&mut up, ctx);
+        });
+        assert!(w.log_mut().expect("view").has_selection());
+
+        // First Esc clears the selection and consumes the key; the window
+        // stays open (the close rung needs a real desktop id — proven
+        // end-to-end in tests/logs.rs).
+        let mut ev = Event::KeyDown(KeyEvent::new(Key::Esc, KeyModifiers::default()));
+        let deferred = crate::testutil::with_ctx_d(|ctx| w.handle_event(&mut ev, ctx));
+        assert!(ev.is_nothing(), "the selection rung consumes Esc");
+        assert!(
+            !deferred.iter().any(|d| matches!(d, Deferred::Close(_))),
+            "Esc with a selection must not close the window"
+        );
+        assert!(!w.log_mut().expect("view").has_selection());
     }
 
     #[test]
@@ -658,5 +712,36 @@ mod tests {
         assert!(w.info.borrow().note.is_none(), "window untouched");
         // A SECOND Esc is the close rung — proven end-to-end in
         // tests/logs.rs (request_close needs the real pipeline).
+    }
+
+    fn assert_clipboard_menu(menus: &[tv::Menu]) {
+        let menu = menus.first().expect("a context menu opened");
+        let labels = crate::testutil::menu_labels(menu);
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
+    }
+
+    #[test]
+    fn log_context_menu_offers_clipboard_actions_by_mouse_and_key() {
+        let mut w = window(session_core("c1"));
+        let right = Event::MouseDown(tv::event::MouseEvent {
+            position: tv::Point::new(5, 2),
+            buttons: tv::event::MouseButtons {
+                right: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_clipboard_menu(&crate::testutil::menus_from_event(&mut w, right));
+
+        let shift_f10 = Event::KeyDown(tv::event::KeyEvent::new(
+            Key::F(10),
+            tv::event::KeyModifiers {
+                shift: true,
+                ..Default::default()
+            },
+        ));
+        assert_clipboard_menu(&crate::testutil::menus_from_event(&mut w, shift_f10));
     }
 }

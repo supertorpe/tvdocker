@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::widgets::{SelectionMode, Separators, Table};
 use tv::{
-    Command, Constraints, Context, HelpCtx, Rect, Role, ScrollBar, Splitter, View, ViewState,
-    Window, delegate,
+    Command, Constraints, Context, DrawCtx, HelpCtx, Rect, Role, ScrollBar, Splitter, StateFlag,
+    View, ViewState, Window, delegate,
 };
 
 /// Help context while a Layers window is focused.
@@ -220,6 +220,8 @@ pub struct LayersWindow {
     /// the sinks against these to detect a typed filter change.
     last_layer_needle: String,
     last_tree_needle: String,
+    /// Cached screen origin for right-click/Shift+F10 → `popup_menu`.
+    abs_origin: tv::Point,
 }
 
 /// One table of the window: a `Table` wired to `bar` (the vertical scroll
@@ -696,6 +698,7 @@ pub fn build(
         last_progress: 0,
         last_layer_needle: String::new(),
         last_tree_needle: String::new(),
+        abs_origin: tv::Point::new(0, 0),
     };
     // The data was mapped by the seed read above; the sync only picks up
     // the progress bookkeeping. `write_summary` so a fresh window renders
@@ -911,6 +914,31 @@ impl LayersWindow {
         } else {
             self.layer_table
         }
+    }
+
+    /// Header clicks belong to the upstream Table's column popup; every
+    /// other right-click opens the shared Edit menu.
+    fn is_table_header(&mut self, p: tv::Point) -> bool {
+        [self.layer_table, self.tree_table, self.inefficient_table]
+            .iter()
+            .filter_map(|id| self.win.child_mut(*id).map(|v| v.state().get_bounds()))
+            .any(|b| p.y == b.a.y && p.x >= b.a.x && p.x < b.b.x)
+    }
+
+    /// The shared Edit actions, anchored at the click (or the window's
+    /// top-left for Shift+F10). No row-specific items here: the three
+    /// tables own their own key/mouse commands.
+    fn context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
+        let mut builder = tv::menu::Menu::builder();
+        for item in crate::clipboard::context_menu_items(ctx) {
+            builder = builder.item(item);
+        }
+        tv::menu::popup_menu(
+            anchor + self.abs_origin,
+            builder.build(),
+            ctx.owner_size(),
+            ctx,
+        );
     }
 
     /// ←/→: step table `id`'s sort to the next/previous VISIBLE column
@@ -1153,6 +1181,23 @@ impl View for LayersWindow {
         self.win.state_mut()
     }
 
+    fn draw(&mut self, ctx: &mut DrawCtx) {
+        self.abs_origin = ctx.origin(); // right-click → global coords
+        self.win.draw(ctx);
+    }
+
+    /// The layer/tree/inefficient-path tables own no clipboard commands, but
+    /// a focused filter bar does. Forward first so the field's policy wins;
+    /// gray all three only when focus is on a table body.
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.win.set_state(flag, enable, ctx);
+        if flag == StateFlag::Focused && enable && !self.filter_focused() {
+            for cmd in [Command::CUT, Command::COPY, Command::PASTE] {
+                ctx.disable_command(cmd);
+            }
+        }
+    }
+
     /// Re-derive the child rects whenever the window size changes (zoom /
     /// Size-Move drag / terminal resize).
     fn change_bounds(&mut self, bounds: Rect) {
@@ -1211,6 +1256,30 @@ impl View for LayersWindow {
             if let Some(t) = self.table_mut(id) {
                 t.handle_event(ev, ctx);
             }
+            ev.clear();
+            return;
+        }
+        // --- Right-click on a TABLE BODY opens the shared Edit menu; a
+        // click on a HEADER row stays the table's own column popup (the
+        // Explorer/Resource convention).
+        if let Event::MouseDown(m) = ev
+            && m.buttons.right
+            && !m.buttons.left
+        {
+            let m = *m;
+            if !self.is_table_header(m.position) {
+                self.context_menu_at(m.position, ctx);
+                ev.clear();
+                return;
+            }
+        }
+        // --- Shift+F10: the mouse-free route to the same menu, anchored at
+        // the window's top-left (the three tables have no row menu of theirs).
+        if let Event::KeyDown(ke) = ev
+            && ke.key == Key::F(10)
+            && ke.modifiers.shift
+        {
+            self.context_menu_at(tv::Point::new(0, 0), ctx);
             ev.clear();
             return;
         }

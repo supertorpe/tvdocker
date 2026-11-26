@@ -53,6 +53,23 @@ fn send(w: &mut ExplorerWindow, key: Key) {
     crate::testutil::send_key(w, key);
 }
 
+#[test]
+fn focused_explorer_window_keeps_edit_commands_with_a_focused_filter() {
+    let (mut w, _core, _rx) = window();
+    crate::testutil::with_ctx(|ctx| {
+        w.win.focus_descendant(w.host.filter, ctx);
+    });
+    let deferred = crate::testutil::with_ctx_d(|ctx| {
+        w.set_state(tv::StateFlag::Focused, true, ctx);
+    });
+    assert!(
+        !deferred
+            .iter()
+            .any(|d| matches!(d, tv::Deferred::DisableCommand(Command::PASTE))),
+        "a focused filter field keeps PASTE enabled"
+    );
+}
+
 /// Deliver a left `MouseDown` at window-local `(x, y)`. `double` sets the
 /// framework double-click flag the pump synthesizes (`m.flags.double_click`).
 fn mouse(w: &mut ExplorerWindow, x: i32, y: i32, double: bool) {
@@ -1294,6 +1311,39 @@ fn command_menus(w: &mut ExplorerWindow, cmd: Command) -> Vec<tv::Menu> {
         w.handle_event(&mut ev, &mut ctx);
     }
     menus_opened(&deferred)
+}
+
+#[test]
+fn explorer_context_menu_offers_clipboard_actions_by_mouse_and_key() {
+    let (mut w, _core, _rx) = window();
+    let menus = mouse_menus(&mut w, 5, 5, true);
+    let labels = menu_labels(menus.first().expect("a context menu opened"));
+    for label in ["Cut", "Copy", "Paste"] {
+        assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+    }
+
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = Event::KeyDown(tv::event::KeyEvent::new(
+            Key::F(10),
+            tv::event::KeyModifiers {
+                shift: true,
+                ..Default::default()
+            },
+        ));
+        w.handle_event(&mut ev, &mut ctx);
+    }
+    let labels = menu_labels(
+        menus_opened(&deferred)
+            .first()
+            .expect("Shift+F10 opened a context menu"),
+    );
+    for label in ["Cut", "Copy", "Paste"] {
+        assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+    }
 }
 
 /// A right-click on a panel's HEADER row opens that table's column

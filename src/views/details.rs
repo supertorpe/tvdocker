@@ -11,7 +11,7 @@ use crate::widgets::LogView;
 use crate::widgets::pane::ScrollWindow;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tv::{Context, Rect, View, ViewState, delegate};
+use tv::{Context, DrawCtx, Rect, View, ViewState, delegate};
 
 /// Window-menu number for Details.
 const WINDOW_NUMBER: i16 = 7;
@@ -29,6 +29,8 @@ pub struct DetailsWindow {
     id: String,
     last_rev: u64,
     open: Rc<RefCell<bool>>,
+    /// Cached screen origin for right-click/Shift+F10 → `popup_menu`.
+    abs_origin: tv::Point,
 }
 
 /// Build the window for one container; primes from the cached payload if
@@ -61,6 +63,7 @@ pub fn build(
         id: id.to_string(),
         last_rev,
         open,
+        abs_origin: tv::Point::new(0, 0),
     }
 }
 
@@ -94,6 +97,23 @@ impl Drop for DetailsWindow {
     }
 }
 
+impl DetailsWindow {
+    /// The shared Edit actions, anchored at window-local `anchor` — the
+    /// right-click point, or the body's top-left for the keyboard route.
+    fn context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
+        let mut builder = tv::menu::Menu::builder();
+        for item in crate::clipboard::context_menu_items(ctx) {
+            builder = builder.item(item);
+        }
+        tv::menu::popup_menu(
+            anchor + self.abs_origin,
+            builder.build(),
+            ctx.owner_size(),
+            ctx,
+        );
+    }
+}
+
 #[delegate(to = win)]
 impl View for DetailsWindow {
     fn state(&self) -> &ViewState {
@@ -103,7 +123,40 @@ impl View for DetailsWindow {
         self.win.state_mut()
     }
 
+    fn draw(&mut self, ctx: &mut DrawCtx) {
+        self.abs_origin = ctx.origin(); // right-click → global coords
+        self.win.draw(ctx);
+    }
+
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut Context) {
+        // --- Right-click: the body is a LogView (left-drag selects text),
+        // so a right press is free for the shared Edit menu.
+        if let tv::event::Event::MouseDown(m) = ev
+            && m.buttons.right
+            && !m.buttons.left
+        {
+            let m = *m;
+            self.context_menu_at(m.position, ctx);
+            ev.clear();
+            return;
+        }
+        // --- Shift+F10: the mouse-free route, anchored at the body's
+        // top-left (a log line has no row menu of its own).
+        if let tv::event::Event::KeyDown(ke) = ev
+            && ke.key == tv::Key::F(10)
+            && ke.modifiers.shift
+        {
+            let body = self.win.ids().body;
+            let anchor = self
+                .win
+                .window_mut()
+                .child_mut(body)
+                .map(|v| v.state().get_bounds().a)
+                .unwrap_or(tv::Point::new(0, 0));
+            self.context_menu_at(anchor, ctx);
+            ev.clear();
+            return;
+        }
         self.win.handle_event(ev, ctx);
         // Re-render when a new inspect lands (or clears to loading).
         let rev = self.core.borrow().details_rev;
@@ -220,6 +273,37 @@ mod tests {
         // No event yet — the build primed from core.
         let out = crate::testutil::text(&crate::testutil::render_view(76, 23, &mut w));
         assert!(out.contains("  web"), "primed at build: {out:?}");
+    }
+
+    #[test]
+    fn context_menu_offers_clipboard_actions_by_mouse_and_key() {
+        let (mut w, _open) = window(core(), "id-web");
+        let right = tv::event::Event::MouseDown(tv::event::MouseEvent {
+            position: tv::Point::new(5, 2),
+            buttons: tv::event::MouseButtons {
+                right: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let menus = crate::testutil::menus_from_event(&mut w, right);
+        let labels = crate::testutil::menu_labels(menus.first().expect("right-click menu"));
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
+
+        let shift_f10 = tv::event::Event::KeyDown(tv::event::KeyEvent::new(
+            tv::Key::F(10),
+            tv::event::KeyModifiers {
+                shift: true,
+                ..Default::default()
+            },
+        ));
+        let menus = crate::testutil::menus_from_event(&mut w, shift_f10);
+        let labels = crate::testutil::menu_labels(menus.first().expect("Shift+F10 menu"));
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
     }
 
     #[test]

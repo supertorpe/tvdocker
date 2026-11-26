@@ -4,6 +4,7 @@ pub mod log_view;
 pub mod pane;
 pub mod pty;
 pub mod resource_table;
+pub mod selection;
 pub mod shared_line;
 pub mod text_pane;
 
@@ -17,5 +18,6 @@ pub use pane::{
     wheel_scrolls_bar,
 };
 pub use resource_table::{Align, Column, RowModel, TableRow, to_spec};
+pub use selection::{TextPos, TextSelection};
 pub use shared_line::SharedLine;
 pub use text_pane::{TextPane, severity_role};

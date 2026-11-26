@@ -376,11 +376,25 @@ mod tests {
 #[cfg(test)]
 mod view_tests {
     use super::*;
-    use crate::testutil::{render_view, send_event, send_key_mods, text};
+    use crate::testutil::{render_view, send_event, send_key_mods, text, with_ctx_d, with_ctx_io};
     use std::cell::RefCell;
     use std::rc::Rc;
     use tv::Rect;
-    use tv::event::MouseEvent;
+    use tv::event::{KeyEvent, MouseEvent};
+
+    fn pty_with_rx() -> (PtyView, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, _resize_rx) = tokio::sync::watch::channel((80u16, 24u16));
+        (
+            PtyView::new(
+                Rect::new(0, 0, 20, 5),
+                scrolled_state(),
+                input_tx,
+                resize_tx,
+            ),
+            input_rx,
+        )
+    }
 
     fn state_with(rows: u16, cols: u16, cursor_seq: &[u8]) -> Rc<RefCell<PtyState>> {
         let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -657,6 +671,99 @@ mod view_tests {
             "live screen after the paste: {out:?}"
         );
     }
+
+    #[test]
+    fn paste_command_reads_the_port_and_rearms_follow() {
+        let (mut v, mut input_rx) = pty_with_rx();
+        send_event(&mut v, refresh());
+        send_key_mods(&mut v, Key::Home, shift());
+        assert!(!v.follow, "parked in history");
+
+        crate::clipboard::put("ls\n");
+        with_ctx_io(|ctx| {
+            let mut ev = Event::Command(Command::PASTE);
+            v.handle_event(&mut ev, ctx);
+            assert!(ev.is_nothing(), "the shell consumes PASTE");
+        });
+        assert!(v.follow, "paste re-arms live follow");
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("the port text reaches the shell"),
+            b"ls\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_sends_sigint_without_reading_the_port() {
+        let (mut v, mut input_rx) = pty_with_rx();
+        crate::clipboard::put("paste me");
+        send_key_mods(
+            &mut v,
+            Key::Char('c'),
+            KeyModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("Ctrl+C is SIGINT"),
+            vec![0x03],
+            "the chord is unchanged"
+        );
+        assert_eq!(
+            crate::clipboard::text().as_deref(),
+            Some("paste me"),
+            "Ctrl+C never consumes the clipboard"
+        );
+    }
+
+    #[test]
+    fn insert_shortcuts_post_paste_instead_of_sending_ansi() {
+        let (mut v, mut input_rx) = pty_with_rx();
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        for (key, mods) in [
+            (Key::Insert, shift()),
+            (Key::Insert, ctrl),
+            (Key::Delete, shift()),
+        ] {
+            crate::clipboard::put("from the port");
+            let (events, _) = with_ctx_io(|ctx| {
+                let mut ev = Event::KeyDown(KeyEvent::new(key, mods));
+                v.handle_event(&mut ev, ctx);
+                assert!(ev.is_nothing(), "{key:?} with modifiers is consumed");
+            });
+            assert!(
+                matches!(events.as_slice(), [Event::Command(Command::PASTE)]),
+                "the shortcut becomes a paste command: {events:?}"
+            );
+        }
+        assert!(
+            input_rx.try_recv().is_err(),
+            "no raw Insert/Delete sequence reaches the shell"
+        );
+    }
+
+    #[test]
+    fn focus_offers_paste_but_never_cut_or_copy_in_the_shell() {
+        let (mut v, _rx) = pty_with_rx();
+        let deferred = with_ctx_d(|ctx| v.set_state(StateFlag::Focused, true, ctx));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, tv::Deferred::EnableCommand(Command::PASTE))),
+            "the shell accepts pastes"
+        );
+        assert!(
+            [Command::CUT, Command::COPY].iter().all(|cmd| deferred
+                .iter()
+                .any(|d| matches!(d, tv::Deferred::DisableCommand(c) if c == cmd))),
+            "the shell never cuts or copies"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +965,18 @@ impl PtyView {
     /// Shift + navigation → viewport movement. Returns whether the key was a
     /// scroll key, so the caller consumes it instead of typing it into the
     /// shell.
+    /// Shared raw-byte path for `Event::Paste` and `Command::PASTE`. The
+    /// shell receives the exact pasted bytes; no bracketed-paste framing is
+    /// added (the app's OSC 52 clipboard protocol carries plain text).
+    fn paste_text(&mut self, s: &str, ctx: &mut Context) {
+        if self.state.borrow().phase.is_finished() {
+            ctx.post(Command::CLOSE);
+            return;
+        }
+        self.resume(ctx);
+        let _ = self.input_tx.send(s.as_bytes().to_vec());
+    }
+
     fn scroll_key(&mut self, key: Key, ctx: &mut Context) -> bool {
         match key {
             Key::Up => self.scroll_by(-1, ctx),
@@ -943,6 +1062,16 @@ impl View for PtyView {
         self.st.set_flag(flag, enable);
         if flag != StateFlag::Focused {
             self.scroller.set_state(flag, enable, ctx);
+            return;
+        }
+        if enable {
+            ctx.enable_command(Command::PASTE);
+            ctx.disable_command(Command::CUT);
+            ctx.disable_command(Command::COPY);
+        } else {
+            ctx.disable_command(Command::PASTE);
+            ctx.disable_command(Command::CUT);
+            ctx.disable_command(Command::COPY);
         }
     }
 
@@ -987,6 +1116,19 @@ impl View for PtyView {
                     ev.clear();
                     return;
                 }
+                // Insert/Delete with modifiers are paste shortcuts. Post the
+                // command rather than sending their ANSI sequences; Ctrl+C,
+                // Ctrl+X and Ctrl+V keep their shell meanings (SIGINT etc.).
+                let paste_shortcut = match key {
+                    Key::Insert => mods.ctrl || mods.shift,
+                    Key::Delete => mods.shift,
+                    _ => false,
+                };
+                if paste_shortcut {
+                    ctx.post(Command::PASTE);
+                    ev.clear();
+                    return;
+                }
                 if let Some(bytes) = key_to_ansi(key, mods) {
                     // Writing while parked in history pulls the viewport back
                     // to the live screen first (resume, above).
@@ -996,14 +1138,13 @@ impl View for PtyView {
                 }
             }
             Event::Paste(s) => {
-                let bytes = s.as_bytes().to_vec();
-                if exited {
-                    ctx.post(Command::CLOSE);
-                    ev.clear();
-                    return;
+                self.paste_text(s, ctx);
+                ev.clear();
+            }
+            Event::Command(Command::PASTE) => {
+                if let Some(text) = crate::clipboard::text() {
+                    self.paste_text(&text, ctx);
                 }
-                self.resume(ctx);
-                let _ = self.input_tx.send(bytes);
                 ev.clear();
             }
             Event::MouseWheel(m) => {

@@ -39,6 +39,8 @@ pub struct DiagnosticsWindow {
     playbook_lines: Rc<RefCell<Vec<String>>>,
     /// The two pane ids (filled by the body closure) — for initial focus.
     pane_ids: Rc<RefCell<Option<(ViewId, ViewId)>>>,
+    /// Cached screen origin for right-click/Shift+F10 → `popup_menu`.
+    abs_origin: tv::Point,
 }
 
 /// Build one container's Diagnostics window; primes from the cached run if
@@ -95,6 +97,7 @@ pub fn build(
         analysis_lines,
         playbook_lines,
         pane_ids,
+        abs_origin: tv::Point::new(0, 0),
     };
     window.refresh_from_core(); // prime (reopen while current, or fresh run)
     window
@@ -114,6 +117,29 @@ impl DiagnosticsWindow {
         *self.status.borrow_mut() = phase_label(&phase);
         *self.analysis_lines.borrow_mut() = split_lines(&analysis);
         *self.playbook_lines.borrow_mut() = split_lines(&playbook);
+        self.invalidate_pane_selections();
+    }
+
+    /// The revision refresh replaces both shared vectors wholesale, so any
+    /// drag endpoints into the old lines are stale. Reach the panes through
+    /// the window → splitter body → ViewId path used by the resize tests.
+    fn invalidate_pane_selections(&mut self) {
+        let body = self.win.ids().body;
+        let Some(ids) = *self.pane_ids.borrow() else {
+            return;
+        };
+        for id in [ids.0, ids.1] {
+            let pane = self
+                .win
+                .window_mut()
+                .child_mut(body)
+                .and_then(|body| body.find_mut(id))
+                .and_then(|pane| pane.as_any_mut())
+                .and_then(|pane| pane.downcast_mut::<TextPane>());
+            if let Some(pane) = pane {
+                pane.invalidate_selection();
+            }
+        }
     }
 
     /// The analysis pane's id, once the body closure has run (initial focus).
@@ -125,6 +151,21 @@ impl DiagnosticsWindow {
     /// [`analysis_pane`](Self::analysis_pane) for focus assertions).
     pub fn playbook_pane(&self) -> Option<ViewId> {
         self.pane_ids.borrow().map(|(_, p)| p)
+    }
+
+    /// The shared Edit actions, anchored at window-local `anchor` — the
+    /// right-click point, or the body's top-left for the keyboard route.
+    fn context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
+        let mut builder = tv::menu::Menu::builder();
+        for item in crate::clipboard::context_menu_items(ctx) {
+            builder = builder.item(item);
+        }
+        tv::menu::popup_menu(
+            anchor + self.abs_origin,
+            builder.build(),
+            ctx.owner_size(),
+            ctx,
+        );
     }
 
     /// Ask the pump to focus the ANALYSIS pane once wired in — a non-modal
@@ -161,10 +202,39 @@ impl View for DiagnosticsWindow {
         self.win.state_mut()
     }
     fn draw(&mut self, ctx: &mut DrawCtx) {
+        self.abs_origin = ctx.origin(); // right-click → global coords
         self.win.draw(ctx);
     }
 
     fn handle_event(&mut self, ev: &mut tv::event::Event, ctx: &mut Context) {
+        // --- Right-click: both panes are TextPanes (left-drag selects text),
+        // so a right press is free for the shared Edit menu.
+        if let tv::event::Event::MouseDown(m) = ev
+            && m.buttons.right
+            && !m.buttons.left
+        {
+            let m = *m;
+            self.context_menu_at(m.position, ctx);
+            ev.clear();
+            return;
+        }
+        // --- Shift+F10: the mouse-free route, anchored at the body's
+        // top-left (the two panes have no row menu of their own).
+        if let tv::event::Event::KeyDown(ke) = ev
+            && ke.key == tv::Key::F(10)
+            && ke.modifiers.shift
+        {
+            let body = self.win.ids().body;
+            let anchor = self
+                .win
+                .window_mut()
+                .child_mut(body)
+                .map(|v| v.state().get_bounds().a)
+                .unwrap_or(tv::Point::new(0, 0));
+            self.context_menu_at(anchor, ctx);
+            ev.clear();
+            return;
+        }
         self.win.handle_event(ev, ctx);
         let rev = self.core.borrow().diagnostics_rev;
         if rev != self.last_rev {
@@ -197,6 +267,114 @@ mod tests {
 
     fn tick(w: &mut DiagnosticsWindow) {
         crate::testutil::send_key(w, tv::Key::Down);
+    }
+
+    fn pane_mut(w: &mut DiagnosticsWindow, id: ViewId) -> &mut TextPane {
+        let body = w.win.ids().body;
+        w.win
+            .window_mut()
+            .child_mut(body)
+            .expect("splitter body")
+            .find_mut(id)
+            .expect("pane id")
+            .as_any_mut()
+            .expect("pane any")
+            .downcast_mut::<TextPane>()
+            .expect("TextPane")
+    }
+
+    fn mouse(position: tv::Point) -> tv::event::MouseEvent {
+        tv::event::MouseEvent {
+            position,
+            buttons: tv::event::MouseButtons {
+                left: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn select_line_range(pane: &mut TextPane) {
+        crate::testutil::with_ctx_io(|ctx| {
+            for ev in [
+                tv::Event::MouseDown(mouse(tv::Point::new(2, 1))),
+                tv::Event::MouseMove(mouse(tv::Point::new(6, 1))),
+                tv::Event::MouseUp(mouse(tv::Point::new(6, 1))),
+            ] {
+                let mut ev = ev;
+                pane.handle_event(&mut ev, ctx);
+            }
+        });
+    }
+
+    fn copy_from(pane: &mut TextPane) -> Vec<tv::Deferred> {
+        let (_, deferred) = crate::testutil::with_ctx_io(|ctx| {
+            let mut ev = tv::Event::Command(tv::Command::COPY);
+            pane.handle_event(&mut ev, ctx);
+        });
+        deferred
+    }
+
+    #[test]
+    fn a_revision_refresh_invalidates_both_pane_selections() {
+        let (core, run) = core_with("id-web");
+        let text = "header\nabc def\nthird".to_string();
+        core.borrow_mut().apply(AppMsg::DiagnosticsAnalysis {
+            id: "id-web".into(),
+            run,
+            text: text.clone(),
+        });
+        core.borrow_mut().apply(AppMsg::DiagnosticsPlaybook {
+            id: "id-web".into(),
+            run,
+            text,
+        });
+        let (core_ref, _run) = (core.clone(), run);
+        let (mut w, _open) = window(core_ref, "id-web");
+        let _ = crate::testutil::render_view(76, 23, &mut w);
+        let (analysis, playbook) = (
+            w.analysis_pane().expect("analysis id"),
+            w.playbook_pane().expect("playbook id"),
+        );
+
+        select_line_range(pane_mut(&mut w, analysis));
+        select_line_range(pane_mut(&mut w, playbook));
+        let copied = copy_from(pane_mut(&mut w, analysis));
+        assert!(
+            copied
+                .iter()
+                .any(|d| matches!(d, tv::Deferred::SetClipboard(s) if s == "c de")),
+            "a live selection copies before the refresh"
+        );
+
+        // A new analysis result replaces both vectors wholesale.
+        core.borrow_mut().apply(AppMsg::DiagnosticsAnalysis {
+            id: "id-web".into(),
+            run,
+            text: "fresh\nlines".into(),
+        });
+        core.borrow_mut().apply(AppMsg::DiagnosticsPlaybook {
+            id: "id-web".into(),
+            run,
+            text: "new\nplaybook".into(),
+        });
+        tick(&mut w); // rev moves → refresh_from_core → invalidate both panes
+
+        crate::clipboard::put("sentinel");
+        for id in [analysis, playbook] {
+            let deferred = copy_from(pane_mut(&mut w, id));
+            assert!(
+                deferred
+                    .iter()
+                    .all(|d| !matches!(d, tv::Deferred::SetClipboard(_))),
+                "a stale selection must not copy after a refresh"
+            );
+        }
+        assert_eq!(
+            crate::clipboard::text().as_deref(),
+            Some("sentinel"),
+            "the clipboard is untouched by stale endpoints"
+        );
     }
 
     #[test]
@@ -357,6 +535,38 @@ mod tests {
     /// Pinned instead by the integration test
     /// `tab_switches_which_pane_the_scroll_keys_reach`, which drives the
     /// real pump.
+    #[test]
+    fn context_menu_offers_clipboard_actions_by_mouse_and_key() {
+        let (core, _run) = core_with("id-web");
+        let (mut w, _open) = window(core, "id-web");
+        let right = tv::event::Event::MouseDown(tv::event::MouseEvent {
+            position: tv::Point::new(5, 2),
+            buttons: tv::event::MouseButtons {
+                right: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let menus = crate::testutil::menus_from_event(&mut w, right);
+        let labels = crate::testutil::menu_labels(menus.first().expect("right-click menu"));
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
+
+        let shift_f10 = tv::event::Event::KeyDown(tv::event::KeyEvent::new(
+            tv::Key::F(10),
+            tv::event::KeyModifiers {
+                shift: true,
+                ..Default::default()
+            },
+        ));
+        let menus = crate::testutil::menus_from_event(&mut w, shift_f10);
+        let labels = crate::testutil::menu_labels(menus.first().expect("Shift+F10 menu"));
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
+    }
+
     #[test]
     fn tab_switching_is_covered_by_the_integration_pump() {
         // The window builds with exactly two selectable panes, so the

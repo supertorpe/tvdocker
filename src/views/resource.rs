@@ -17,7 +17,7 @@ use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
 use tv::widgets::table::TableModel;
 use tv::widgets::{RowKey, SelectionMode, Separators, SortKey, Table};
-use tv::{Command, Context, DrawCtx, HelpCtx, Rect, Role, View, ViewState, delegate};
+use tv::{Command, Context, DrawCtx, HelpCtx, Rect, Role, StateFlag, View, ViewState, delegate};
 
 /// A resource's context-menu builder: the window's core and the clicked
 /// row's id in, the menu items out.
@@ -326,6 +326,16 @@ impl ResourceWindow {
             .and_then(|v| v.as_any_mut().and_then(|a| a.downcast_mut::<FilterBar>()))
     }
 
+    /// Whether the filter field holds focus — then the blanket table-body
+    /// disable must not clobber the policy the field just published.
+    fn filter_focused(&mut self) -> bool {
+        let id = self.pane.ids().filter;
+        self.pane
+            .window_mut()
+            .child_mut(id)
+            .is_some_and(|v| v.state().state.focused)
+    }
+
     /// Select exactly the filtered set (Ctrl+A). Both delivery
     /// paths converge here — the `KeyDown` arm below and the
     /// pre-route's `Event::Command(CMD_SELECT_ALL)`. The model already
@@ -463,20 +473,20 @@ impl ResourceWindow {
     /// Open the row context menu at window-local `anchor`, built from
     /// the row the table just focused.
     fn open_context_menu_at(&mut self, anchor: tv::Point, ctx: &mut Context) {
-        let Some(menu) = self.spec.context_menu else {
-            return;
-        };
-        let id = self.open_target().into_iter().next().unwrap_or_default();
-        if id.is_empty() {
-            return;
-        }
-        let items = menu(&self.core.borrow(), &id);
-        if items.is_empty() {
-            return;
-        }
         let mut builder = Menu::builder();
-        for (label, command) in items {
-            builder = builder.command(label, command);
+        // Row-specific items stay first and keep their existing composition;
+        // a window with no row menu (or no target row) still gets the shared
+        // Edit tail, so every resource table has a context menu.
+        if let Some(menu) = self.spec.context_menu {
+            let id = self.open_target().into_iter().next().unwrap_or_default();
+            if !id.is_empty() {
+                for (label, command) in menu(&self.core.borrow(), &id) {
+                    builder = builder.command(label, command);
+                }
+            }
+        }
+        for item in crate::clipboard::context_menu_items(ctx) {
+            builder = builder.item(item);
         }
         let global = anchor + self.abs_origin;
         popup_menu(global, builder.build(), ctx.owner_size(), ctx);
@@ -508,6 +518,19 @@ impl View for ResourceWindow {
     fn draw(&mut self, ctx: &mut DrawCtx) {
         self.abs_origin = ctx.origin(); // right-click → global coords
         self.pane.draw(ctx);
+    }
+
+    /// The table owns no clipboard commands, but the filter field does.
+    /// Forward the flag to the embedded pane first so a focused filter bar
+    /// publishes its own policy; only gray the three Edit actions when focus
+    /// lands on the table/scrollbar rather than the field.
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.pane.set_state(flag, enable, ctx);
+        if flag == StateFlag::Focused && enable && !self.filter_focused() {
+            for cmd in [Command::CUT, Command::COPY, Command::PASTE] {
+                ctx.disable_command(cmd);
+            }
+        }
     }
 
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
@@ -824,9 +847,64 @@ impl Drop for ResourceWindow {
 mod tests {
     use super::*;
     use crate::core::{AppMsg, Connection};
-    use crate::testutil::{render_view, send_event, send_key, send_key_mods, text};
+    use crate::testutil::{
+        render_view, send_event, send_key, send_key_mods, text, with_ctx, with_ctx_d,
+    };
     use tv::event::{Key, KeyModifiers};
     use tv::widgets::SortDir;
+
+    #[test]
+    fn focused_resource_window_disables_all_edit_commands() {
+        let core = core_with(&["alpha"]);
+        let mut w = window(demo_spec(), core);
+        let deferred = with_ctx_d(|ctx| w.set_state(tv::StateFlag::Focused, true, ctx));
+        for cmd in [Command::CUT, Command::COPY, Command::PASTE] {
+            assert!(
+                deferred
+                    .iter()
+                    .any(|d| matches!(d, tv::Deferred::DisableCommand(c) if *c == cmd)),
+                "a focused table window grays {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_resource_window_keeps_edit_commands_with_a_focused_filter() {
+        let mut w = window(demo_spec(), core_with(&["alpha"]));
+        // A filter that already holds focus publishes PASTE itself; the
+        // window's table-body gray must not overwrite it on activation.
+        with_ctx(|ctx| {
+            w.filter_mut()
+                .expect("filter")
+                .set_state(tv::StateFlag::Focused, true, ctx);
+        });
+        let deferred = with_ctx_d(|ctx| w.set_state(tv::StateFlag::Focused, true, ctx));
+        assert!(
+            !deferred
+                .iter()
+                .any(|d| matches!(d, tv::Deferred::DisableCommand(Command::PASTE))),
+            "a focused filter field keeps PASTE enabled"
+        );
+    }
+
+    #[test]
+    fn resource_context_menu_offers_clipboard_actions_without_a_row_menu() {
+        let mut w = window(demo_spec(), core_with(&["alpha"]));
+        let table_bounds = w.table_mut().expect("a table").state().get_bounds();
+        let right = Event::MouseDown(tv::event::MouseEvent {
+            position: tv::Point::new(table_bounds.a.x + 2, table_bounds.a.y + 1),
+            buttons: tv::event::MouseButtons {
+                right: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let menus = crate::testutil::menus_from_event(&mut w, right);
+        let labels = crate::testutil::menu_labels(menus.first().expect("clipboard-only menu"));
+        for label in ["Cut", "Copy", "Paste"] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
+    }
 
     /// A spec built from scratch proves the window is generic: any
     /// `fn(&AppCore) -> Vec<TableRow>` source drives it.

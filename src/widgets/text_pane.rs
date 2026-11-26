@@ -6,7 +6,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Event, Key, MouseWheel};
-use tv::{Context, DrawCtx, Options, Point, Rect, Role, Scroller, View, ViewState};
+use tv::{
+    Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, StateFlag, TrackMask, View,
+    ViewState,
+};
+
+use super::selection::{TextPos, TextSelection};
 
 /// Map one analysis line to a theme role. Ordering
 /// matters: an error line that also says "ok" stays an error.
@@ -33,6 +38,12 @@ pub struct TextPane {
     scroller: Scroller,
     lines: Rc<RefCell<Vec<String>>>,
     severity: bool,
+    /// Mouse-drag endpoints into the shared display lines.
+    selection: TextSelection,
+    /// Absolute screen origin cached by the last `draw`, used only as the
+    /// capture origin for `start_mouse_track` (the router localizes events).
+    abs_origin: Point,
+    tracking: bool,
 }
 
 impl TextPane {
@@ -50,7 +61,59 @@ impl TextPane {
             scroller: Scroller::new(bounds, None, None),
             lines,
             severity,
+            selection: TextSelection::default(),
+            abs_origin: Point::new(0, 0),
+            tracking: false,
         }
+    }
+
+    /// Drop a selection whose endpoints no longer refer to the displayed
+    /// content (a wholesale line replacement by the owning window).
+    pub fn invalidate_selection(&mut self) {
+        self.selection.clear();
+        self.tracking = false;
+    }
+
+    /// Mouse positions arrive already localized to this view (both
+    /// `Group::deliver` and the mouse-track capture subtract the origin), so
+    /// the hit test uses a zero origin. The column is snapped to a grapheme
+    /// boundary of the displayed line before it becomes a byte offset.
+    fn hit(&self, position: Point) -> Option<TextPos> {
+        let lines = self.lines.borrow();
+        let mut pos = super::selection::hit_test(
+            Point::new(0, 0),
+            position,
+            self.scroll_offset(),
+            lines.len(),
+        )?;
+        if let Some(line) = lines.get(pos.line) {
+            let column = pos.byte.min(i32::MAX as usize) as i32;
+            pos.byte = super::selection::column_to_byte(line, column);
+        }
+        Some(pos)
+    }
+
+    fn update_commands(&self, ctx: &mut Context) {
+        if self.selection.is_empty() {
+            ctx.disable_command(Command::COPY);
+        } else {
+            ctx.enable_command(Command::COPY);
+        }
+        ctx.disable_command(Command::CUT);
+        ctx.disable_command(Command::PASTE);
+    }
+
+    fn copy_selection(&mut self, ctx: &mut Context) {
+        let text = self
+            .selection
+            .selected_text(self.lines.borrow().iter().map(String::as_str));
+        if text.is_empty() {
+            return;
+        }
+        ctx.set_clipboard(text.clone());
+        crate::clipboard::put(&text);
+        self.selection.clear();
+        self.update_commands(ctx);
     }
 
     /// Current scroll offset (first visible line) — the window's/tests'
@@ -93,9 +156,13 @@ impl View for TextPane {
     }
 
     fn draw(&mut self, ctx: &mut DrawCtx) {
+        // Cache the absolute origin for the mouse-track capture. Mouse events
+        // are delivered view-local, so hit_test does NOT subtract this again.
+        self.abs_origin = ctx.origin();
         let normal = ctx.style(Role::ListNormal);
         ctx.fill(self.st.get_extent(), ' ', normal);
         let off = self.scroller.delta.y.max(0) as usize;
+        let selected = ctx.style(Role::ListSelected);
         let lines = self.lines.borrow();
         for (i, line) in lines
             .iter()
@@ -108,15 +175,108 @@ impl View for TextPane {
             } else {
                 normal
             };
-            ctx.put_str(0, i as i32, line, style);
+            // Selection wins over severity styling on the selected spans.
+            let mut x = 0usize;
+            for (a, b, in_selection) in self.selection.segments_for_line(off + i, line) {
+                let piece = &line[a..b];
+                if piece.is_empty() {
+                    continue;
+                }
+                let seg_style = if in_selection { selected } else { style };
+                ctx.put_str(x as i32, i as i32, piece, seg_style);
+                x += tv::text::width(piece);
+            }
+        }
+    }
+
+    /// Mirror PtyView: our own flags track focus (the hardware cursor is not
+    /// relevant here, but broadcast state must still be correct), while the
+    /// embedded Scroller gets every flag except `Focused`.
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.st.set_flag(flag, enable);
+        if flag != StateFlag::Focused {
+            self.scroller.set_state(flag, enable, ctx);
+            return;
+        }
+        if enable {
+            self.update_commands(ctx);
+        } else {
+            ctx.disable_command(Command::COPY);
+            ctx.disable_command(Command::CUT);
+            ctx.disable_command(Command::PASTE);
         }
     }
 
     fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         match ev {
+            Event::Command(Command::COPY) => {
+                self.copy_selection(ctx);
+                ev.clear();
+            }
+            Event::Command(Command::CUT | Command::PASTE) => {
+                // Read-only pane: never mutate the lines or consume the
+                // system clipboard into them.
+                ev.clear();
+            }
+            Event::MouseDown(m) if m.buttons.left => {
+                if let Some(pos) = self.hit(m.position) {
+                    self.selection.begin(pos);
+                    self.tracking = true;
+                    if let Some(id) = self.st.id() {
+                        ctx.start_mouse_track(
+                            id,
+                            self.abs_origin,
+                            TrackMask {
+                                mouse_move: true,
+                                mouse_auto: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                ev.clear();
+            }
+            Event::MouseMove(m) | Event::MouseAuto(m) if self.tracking => {
+                if let Some(pos) = self.hit(m.position) {
+                    self.selection.extend(pos);
+                }
+                ev.clear();
+            }
+            Event::MouseUp(m) if self.tracking => {
+                if let Some(pos) = self.hit(m.position) {
+                    self.selection.extend(pos);
+                }
+                self.tracking = false;
+                let text = self
+                    .selection
+                    .selected_text(self.lines.borrow().iter().map(String::as_str));
+                if !text.is_empty() {
+                    ctx.set_primary(text);
+                }
+                self.update_commands(ctx);
+                ev.clear();
+            }
             Event::KeyDown(ke) => {
                 let key = ke.key;
+                let mods = ke.modifiers;
                 match key {
+                    Key::Esc if !self.selection.is_empty() => {
+                        self.selection.clear();
+                        self.update_commands(ctx);
+                        ev.clear();
+                    }
+                    Key::Char('c') if mods.ctrl => {
+                        ctx.post(Command::COPY);
+                        ev.clear();
+                    }
+                    Key::Insert if mods.ctrl || mods.shift => {
+                        ctx.post(Command::COPY);
+                        ev.clear();
+                    }
+                    Key::Delete if mods.shift => {
+                        ctx.post(Command::COPY);
+                        ev.clear();
+                    }
                     Key::Up => {
                         self.scroll_by(-1, ctx);
                         ev.clear();
@@ -182,7 +342,226 @@ impl View for TextPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tv::Role;
+    use crate::testutil::{render_view, styled_text, with_ctx_d, with_ctx_io};
+    use tv::event::{KeyEvent, KeyModifiers, MouseButtons, MouseEvent};
+    use tv::{Command, Deferred, StateFlag, Theme};
+
+    fn sample() -> (TextPane, Rc<RefCell<Vec<String>>>) {
+        let lines = Rc::new(RefCell::new(vec![
+            "header".to_string(),
+            "abc def".to_string(),
+            "third".to_string(),
+            "fourth".to_string(),
+            "fifth".to_string(),
+        ]));
+        let pane = TextPane::new(Rect::new(0, 0, 20, 5), Rc::clone(&lines), false);
+        (pane, lines)
+    }
+
+    fn mouse_at(position: Point) -> MouseEvent {
+        MouseEvent {
+            position,
+            buttons: MouseButtons {
+                left: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn drag(pane: &mut TextPane, from: Point, to: Point) -> Vec<Deferred> {
+        let (_, deferred) = with_ctx_io(|ctx| {
+            for ev in [
+                Event::MouseDown(mouse_at(from)),
+                Event::MouseMove(mouse_at(to)),
+                Event::MouseUp(mouse_at(to)),
+            ] {
+                let mut ev = ev;
+                pane.handle_event(&mut ev, ctx);
+            }
+        });
+        deferred
+    }
+
+    fn selected(pane: &TextPane) -> String {
+        pane.selection
+            .selected_text(pane.lines.borrow().iter().map(String::as_str))
+    }
+
+    #[test]
+    fn dragging_selects_exact_characters_and_publishes_primary() {
+        let (mut pane, _) = sample();
+        let deferred = drag(&mut pane, Point::new(2, 1), Point::new(6, 1));
+        assert_eq!(selected(&pane), "c de", "exact characters, not whole lines");
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::SetPrimary(s) if s == "c de")),
+            "mouse selection is published as PRIMARY"
+        );
+    }
+
+    #[test]
+    fn reverse_drag_and_copy_use_visual_order_then_clear() {
+        let (mut pane, _) = sample();
+        drag(&mut pane, Point::new(6, 1), Point::new(2, 1));
+        assert_eq!(
+            selected(&pane),
+            "c de",
+            "a backwards drag selects forward text"
+        );
+
+        let (events, _) = with_ctx_io(|ctx| {
+            let mut ev = Event::KeyDown(KeyEvent::new(
+                Key::Char('c'),
+                KeyModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            pane.handle_event(&mut ev, ctx);
+            assert!(ev.is_nothing(), "Ctrl+C is consumed in a read-only pane");
+        });
+        assert!(
+            matches!(events.as_slice(), [Event::Command(Command::COPY)]),
+            "the chord is translated to a command: {events:?}"
+        );
+
+        let (_, deferred) = with_ctx_io(|ctx| {
+            let mut ev = Event::Command(Command::COPY);
+            pane.handle_event(&mut ev, ctx);
+        });
+        assert_eq!(crate::clipboard::text().as_deref(), Some("c de"));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::SetClipboard(s) if s == "c de")),
+            "the OS/OSC-52 route gets the same text"
+        );
+        assert!(pane.selection.is_empty(), "copy consumes the selection");
+    }
+
+    #[test]
+    fn esc_clear_and_invalidation_discard_a_selection() {
+        let (mut pane, _) = sample();
+        drag(&mut pane, Point::new(2, 1), Point::new(6, 1));
+        assert!(!pane.selection.is_empty());
+        with_ctx_io(|ctx| {
+            let mut ev = Event::KeyDown(KeyEvent::new(Key::Esc, KeyModifiers::default()));
+            pane.handle_event(&mut ev, ctx);
+        });
+        assert!(pane.selection.is_empty(), "Esc clears an active selection");
+
+        drag(&mut pane, Point::new(2, 1), Point::new(6, 1));
+        pane.invalidate_selection();
+        assert!(
+            pane.selection.is_empty(),
+            "explicit invalidation clears it too"
+        );
+    }
+
+    #[test]
+    fn selected_cells_use_the_list_selected_role() {
+        let (mut pane, _) = sample();
+        drag(&mut pane, Point::new(2, 1), Point::new(6, 1));
+        let cells = styled_text(&render_view(20, 5, &mut pane));
+        let theme = Theme::classic_blue();
+        // The drag is on screen row 1 ("abc def"), so index = 20 + column.
+        assert_eq!(
+            cells[20 + 1].1,
+            theme.style(Role::ListNormal),
+            "cell 'b' is normal"
+        );
+        assert_eq!(
+            cells[20 + 2].1,
+            theme.style(Role::ListSelected),
+            "cell 'c' is selected"
+        );
+        assert_eq!(
+            cells[20 + 5].1,
+            theme.style(Role::ListSelected),
+            "cell 'e' is selected"
+        );
+        assert_eq!(
+            cells[20 + 6].1,
+            theme.style(Role::ListNormal),
+            "cell 'f' is normal"
+        );
+    }
+
+    #[test]
+    fn focus_gates_the_edit_commands() {
+        let (mut pane, _) = sample();
+        let deferred = with_ctx_d(|ctx| {
+            pane.set_state(StateFlag::Focused, true, ctx);
+        });
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::DisableCommand(Command::COPY))),
+            "COPY is grayed on focus until characters are selected"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::DisableCommand(Command::CUT))),
+            "CUT stays disabled in a read-only pane"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::DisableCommand(Command::PASTE))),
+            "PASTE stays disabled in a read-only pane"
+        );
+
+        drag(&mut pane, Point::new(2, 1), Point::new(6, 1));
+        let deferred = with_ctx_d(|ctx| {
+            pane.set_state(StateFlag::Focused, true, ctx);
+        });
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::EnableCommand(Command::COPY))),
+            "a selection enables COPY while focused"
+        );
+
+        let deferred = with_ctx_d(|ctx| {
+            pane.set_state(StateFlag::Focused, false, ctx);
+        });
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::DisableCommand(Command::COPY))),
+            "losing focus disables COPY"
+        );
+    }
+
+    #[test]
+    fn invalidating_after_a_wholesale_line_replacement_copies_nothing() {
+        let lines = Rc::new(RefCell::new(vec![
+            "header".to_string(),
+            "abc def".to_string(),
+            "third".to_string(),
+        ]));
+        let mut pane = TextPane::new(Rect::new(0, 0, 20, 4), Rc::clone(&lines), false);
+        drag(&mut pane, Point::new(2, 1), Point::new(6, 1));
+        assert_eq!(selected(&pane), "c de");
+
+        // The window replaces the shared vector wholesale; the stale
+        // endpoints must not copy text out of the new content.
+        *lines.borrow_mut() = vec!["brand".to_string(), "new".to_string()];
+        pane.invalidate_selection();
+        with_ctx_io(|ctx| {
+            let mut ev = Event::Command(Command::COPY);
+            pane.handle_event(&mut ev, ctx);
+        });
+        assert!(
+            !crate::clipboard::text()
+                .as_deref()
+                .is_some_and(|s| s.contains("c de")),
+            "no stale text reaches the clipboard"
+        );
+    }
 
     /// Review Focus #2.
     #[test]

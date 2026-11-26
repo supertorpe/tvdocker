@@ -199,6 +199,13 @@ fn f1_help_documents_the_table_sort_keys() {
         text.contains("←/→ cycle the sort column") && text.contains("Shift+←/→"),
         "F1 body documents the table sort keys: {text:?}"
     );
+    // Guard the fit: message_box sizes its body by char count and clips what
+    // does not fit, so assert the LAST line (including the clipboard notes)
+    // is actually on screen at 80x25 — not just present in the constant.
+    assert!(
+        text.contains("Esc closes; shell keeps Esc/Tab"),
+        "the whole F1 body renders inside the box: {text:?}"
+    );
 }
 
 #[test]

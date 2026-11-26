@@ -1,7 +1,13 @@
 //! Tail-following log viewport with hard memory caps .
 use std::collections::VecDeque;
+use tv::TrackMask;
 use tv::event::{Event, Key, MouseWheel};
-use tv::{Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, View, ViewId, delegate};
+use tv::{
+    Command, Context, DrawCtx, Options, Point, Rect, Role, Scroller, StateFlag, View, ViewId,
+    delegate,
+};
+
+use super::selection::{TextPos, TextSelection};
 
 /// Max stored bytes per line (/ deviation #3); longer lines are
 /// cut on a char boundary and suffixed with `…`.
@@ -105,6 +111,12 @@ pub struct LogView {
     follow: bool,
     highlight: Option<String>,
     v_bar: Option<ViewId>,
+    /// Mouse-drag endpoints into the display lines.
+    selection: TextSelection,
+    /// Absolute screen origin cached by the last `draw`, used only as the
+    /// capture origin for `start_mouse_track` (the router localizes events).
+    abs_origin: Point,
+    tracking: bool,
 }
 
 impl LogView {
@@ -126,6 +138,9 @@ impl LogView {
             follow: true,
             highlight: None,
             v_bar,
+            selection: TextSelection::default(),
+            abs_origin: Point::new(0, 0),
+            tracking: false,
         }
     }
 
@@ -164,6 +179,65 @@ impl LogView {
     /// into an empty view instead — Task 6).
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.selection.clear();
+        self.tracking = false;
+    }
+
+    /// Mouse positions arrive already localized to this view (both
+    /// `Group::deliver` and the mouse-track capture subtract the origin), so
+    /// the hit test uses a zero origin. The column is snapped to a grapheme
+    /// boundary of the *displayed* line before it becomes a byte offset.
+    fn hit(&self, position: Point) -> Option<TextPos> {
+        let mut pos = super::selection::hit_test(
+            Point::new(0, 0),
+            position,
+            self.scroll_offset(),
+            self.lines.len(),
+        )?;
+        if let Some(line) = self.lines.get(pos.line) {
+            let column = pos.byte.min(i32::MAX as usize) as i32;
+            pos.byte = super::selection::column_to_byte(line, column);
+        }
+        Some(pos)
+    }
+
+    /// Whether a mouse selection is active (the window's Esc chain needs
+    /// this to clear it before it closes the window).
+    pub fn has_selection(&self) -> bool {
+        !self.selection.is_empty()
+    }
+
+    /// Drop just the selection — not the lines. Re-publishes the command
+    /// policy so Copy grays out again.
+    pub fn clear_selection(&mut self, ctx: &mut Context) {
+        if !self.selection.is_empty() {
+            self.selection.clear();
+            self.update_commands(ctx);
+        }
+    }
+
+    /// Gray the Edit menu from the focused view's current selection state.
+    fn update_commands(&self, ctx: &mut Context) {
+        if self.selection.is_empty() {
+            ctx.disable_command(Command::COPY);
+        } else {
+            ctx.enable_command(Command::COPY);
+        }
+        ctx.disable_command(Command::CUT);
+        ctx.disable_command(Command::PASTE);
+    }
+
+    fn copy_selection(&mut self, ctx: &mut Context) {
+        let text = self
+            .selection
+            .selected_text(self.lines.iter().map(String::as_str));
+        if text.is_empty() {
+            return;
+        }
+        ctx.set_clipboard(text.clone());
+        crate::clipboard::put(&text);
+        self.selection.clear();
+        self.update_commands(ctx);
     }
     /// How many stored lines contain `needle` (ASCII-case-insensitive).
     pub fn count_matching(&self, needle: &str) -> usize {
@@ -206,32 +280,54 @@ impl LogView {
 #[delegate(to = scroller)]
 impl View for LogView {
     fn draw(&mut self, ctx: &mut DrawCtx) {
+        // Cache the absolute origin for the mouse-track capture. Mouse events
+        // are delivered view-local, so hit_test does NOT subtract this again.
+        self.abs_origin = ctx.origin();
         let normal = ctx.style(Role::ScrollerNormal);
         ctx.fill(self.scroller.state().get_extent(), ' ', normal);
         let w = self.scroller.state().size.x.max(0) as usize;
         let vis = self.visible();
         let off = self.scroller.delta.y.max(0) as usize;
         let selected = ctx.style(Role::ScrollerSelected);
+        let needle = self.highlight.as_deref().unwrap_or("");
         for (i, line) in self.lines.iter().skip(off).take(vis).enumerate() {
             let shown = truncate_to(line, w);
-            match &self.highlight {
-                None => {
-                    ctx.put_str(0, i as i32, &shown, normal);
+            // Split at the selection endpoints first: the selected spans win
+            // over search highlighting (both paint ScrollerSelected).
+            let mut x = 0usize;
+            for (a, b, in_selection) in self.selection.segments_for_line(off + i, &shown) {
+                let piece = &shown[a..b];
+                if piece.is_empty() {
+                    continue;
                 }
-                Some(needle) => {
-                    let mut x = 0;
-                    for (seg, is_match) in split_highlight(&shown, needle) {
-                        if x >= w {
-                            break;
+                if in_selection {
+                    ctx.put_str(x as i32, i as i32, piece, selected);
+                    x += tv::text::width(piece);
+                } else {
+                    for (frag, is_match) in split_highlight(piece, needle) {
+                        if frag.is_empty() {
+                            continue;
                         }
-                        let room = w - x;
-                        let piece: String = seg.chars().take(room).collect();
                         let style = if is_match { selected } else { normal };
-                        ctx.put_str(x as i32, i as i32, &piece, style);
-                        x += piece.chars().count();
+                        ctx.put_str(x as i32, i as i32, frag, style);
+                        x += tv::text::width(frag);
                     }
                 }
             }
+        }
+    }
+
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.scroller.set_state(flag, enable, ctx);
+        if flag != StateFlag::Focused {
+            return;
+        }
+        if enable {
+            self.update_commands(ctx);
+        } else {
+            ctx.disable_command(Command::COPY);
+            ctx.disable_command(Command::CUT);
+            ctx.disable_command(Command::PASTE);
         }
     }
 
@@ -253,9 +349,75 @@ impl View for LogView {
             return;
         }
         match ev {
+            Event::Command(Command::COPY) => {
+                self.copy_selection(ctx);
+                ev.clear();
+            }
+            Event::Command(Command::CUT | Command::PASTE) => {
+                // Read-only view: never mutate the buffer, never consume the
+                // system clipboard into it.
+                ev.clear();
+            }
+            Event::MouseDown(m) if m.buttons.left => {
+                if let Some(pos) = self.hit(m.position) {
+                    self.selection.begin(pos);
+                    self.tracking = true;
+                    self.follow = false;
+                    if let Some(id) = self.scroller.state().id() {
+                        ctx.start_mouse_track(
+                            id,
+                            self.abs_origin,
+                            TrackMask {
+                                mouse_move: true,
+                                mouse_auto: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                ev.clear();
+            }
+            Event::MouseMove(m) | Event::MouseAuto(m) if self.tracking => {
+                if let Some(pos) = self.hit(m.position) {
+                    self.selection.extend(pos);
+                }
+                ev.clear();
+            }
+            Event::MouseUp(m) if self.tracking => {
+                if let Some(pos) = self.hit(m.position) {
+                    self.selection.extend(pos);
+                }
+                self.tracking = false;
+                let text = self
+                    .selection
+                    .selected_text(self.lines.iter().map(String::as_str));
+                if !text.is_empty() {
+                    ctx.set_primary(text);
+                }
+                self.update_commands(ctx);
+                ev.clear();
+            }
             Event::KeyDown(ke) => {
                 let key = ke.key;
+                let mods = ke.modifiers;
                 match key {
+                    Key::Esc if !self.selection.is_empty() => {
+                        self.selection.clear();
+                        self.update_commands(ctx);
+                        ev.clear();
+                    }
+                    Key::Char('c') if mods.ctrl => {
+                        ctx.post(Command::COPY);
+                        ev.clear();
+                    }
+                    Key::Insert if mods.ctrl || mods.shift => {
+                        ctx.post(Command::COPY);
+                        ev.clear();
+                    }
+                    Key::Delete if mods.shift => {
+                        ctx.post(Command::COPY);
+                        ev.clear();
+                    }
                     Key::Up => {
                         self.scroll_by(-1, ctx);
                         ev.clear();
@@ -324,10 +486,51 @@ impl View for LogView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{render_view, send_key, text};
+    use crate::testutil::{render_view, send_key, styled_text, text, with_ctx_io};
+    use tv::event::{KeyEvent, KeyModifiers, MouseButtons, MouseEvent};
+    use tv::{Deferred, Theme};
 
     fn view(h: i32) -> LogView {
         LogView::new(Rect::new(0, 0, 30, h), None)
+    }
+
+    fn mouse_at(position: Point) -> MouseEvent {
+        MouseEvent {
+            position,
+            buttons: MouseButtons {
+                left: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn send(log: &mut LogView, ev: Event, ctx: &mut Context) {
+        let mut ev = ev;
+        log.handle_event(&mut ev, ctx);
+    }
+
+    /// A left press at `from`, a move to `to`, then a release — the real
+    /// capture would deliver the last two localized by `abs_origin`.
+    fn drag(log: &mut LogView, from: Point, to: Point) -> Vec<Deferred> {
+        let (_, deferred) = with_ctx_io(|ctx| {
+            send(log, Event::MouseDown(mouse_at(from)), ctx);
+            send(log, Event::MouseMove(mouse_at(to)), ctx);
+            send(log, Event::MouseUp(mouse_at(to)), ctx);
+        });
+        deferred
+    }
+
+    fn sample(log: &mut LogView) {
+        log.abs_origin = Point::new(0, 0);
+        for line in ["header", "abc def", "third", "fourth", "fifth"] {
+            log.push_line(line);
+        }
+    }
+
+    fn selected(log: &LogView) -> String {
+        log.selection
+            .selected_text(log.lines.iter().map(String::as_str))
     }
 
     #[test]
@@ -536,5 +739,126 @@ mod tests {
         view.clear();
         assert_eq!(view.len(), 0);
         assert!(view.is_empty());
+    }
+
+    #[test]
+    fn dragging_selects_exact_characters_and_publishes_primary() {
+        let mut log = view(5);
+        sample(&mut log);
+        let deferred = drag(&mut log, Point::new(2, 1), Point::new(6, 1));
+        assert_eq!(
+            selected(&log),
+            "c de",
+            "exact display characters, not whole lines"
+        );
+        assert!(!log.follows(), "a mouse selection pauses tail-follow");
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::SetPrimary(s) if s == "c de")),
+            "mouse selection is published as PRIMARY"
+        );
+    }
+
+    #[test]
+    fn reverse_drag_and_copy_use_visual_order_then_clear() {
+        let mut log = view(5);
+        sample(&mut log);
+        drag(&mut log, Point::new(6, 1), Point::new(2, 1));
+        assert_eq!(
+            selected(&log),
+            "c de",
+            "a backwards drag selects forward text"
+        );
+
+        let (events, _) = with_ctx_io(|ctx| {
+            let mut ev = Event::KeyDown(KeyEvent::new(
+                Key::Char('c'),
+                KeyModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            log.handle_event(&mut ev, ctx);
+            assert!(ev.is_nothing(), "Ctrl+C is consumed in a read-only view");
+        });
+        assert!(
+            matches!(events.as_slice(), [Event::Command(Command::COPY)]),
+            "the chord is translated to a command: {events:?}"
+        );
+
+        let (_, deferred) = with_ctx_io(|ctx| {
+            send(&mut log, Event::Command(Command::COPY), ctx);
+        });
+        assert_eq!(crate::clipboard::text().as_deref(), Some("c de"));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::SetClipboard(s) if s == "c de")),
+            "the OS/OSC-52 route gets the same text"
+        );
+        assert!(log.selection.is_empty(), "copy consumes the selection");
+    }
+
+    #[test]
+    fn esc_and_clear_discard_a_selection() {
+        let mut log = view(5);
+        sample(&mut log);
+        drag(&mut log, Point::new(2, 1), Point::new(6, 1));
+        assert!(!log.selection.is_empty());
+        with_ctx_io(|ctx| {
+            send(
+                &mut log,
+                Event::KeyDown(KeyEvent::new(Key::Esc, KeyModifiers::default())),
+                ctx,
+            );
+        });
+        assert!(log.selection.is_empty(), "Esc clears an active selection");
+
+        drag(&mut log, Point::new(2, 1), Point::new(6, 1));
+        log.clear();
+        assert!(log.selection.is_empty(), "clear() clears a selection too");
+    }
+
+    #[test]
+    fn selected_cells_use_the_scroller_selected_role() {
+        let mut log = view(3);
+        sample(&mut log);
+        drag(&mut log, Point::new(2, 1), Point::new(6, 1));
+        let cells = styled_text(&render_view(30, 3, &mut log));
+        let theme = Theme::classic_blue();
+        // The drag is on screen row 1 ("abc def"), so cell index = 30 + column.
+        assert_eq!(
+            cells[30 + 1].1,
+            theme.style(Role::ScrollerNormal),
+            "cell 'b' is normal"
+        );
+        assert_eq!(
+            cells[30 + 2].1,
+            theme.style(Role::ScrollerSelected),
+            "cell 'c' is selected"
+        );
+        assert_eq!(
+            cells[30 + 5].1,
+            theme.style(Role::ScrollerSelected),
+            "cell 'e' is selected"
+        );
+        assert_eq!(
+            cells[30 + 6].1,
+            theme.style(Role::ScrollerNormal),
+            "cell 'f' is normal"
+        );
+    }
+
+    #[test]
+    fn cut_and_paste_commands_are_no_ops_in_a_read_only_view() {
+        let mut log = view(5);
+        sample(&mut log);
+        drag(&mut log, Point::new(2, 1), Point::new(6, 1));
+        with_ctx_io(|ctx| {
+            send(&mut log, Event::Command(Command::CUT), ctx);
+            send(&mut log, Event::Command(Command::PASTE), ctx);
+        });
+        assert_eq!(selected(&log), "c de", "read-only view keeps its selection");
     }
 }

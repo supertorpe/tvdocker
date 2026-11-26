@@ -23,7 +23,9 @@ use tokio::sync::mpsc;
 use tv::event::{Event, Key};
 use tv::menu::{Menu, popup_menu};
 use tv::widgets::{ScrollBar, SelectionMode, Separators, Table};
-use tv::{Command, Context, DrawCtx, FieldValue, Rect, Role, View, ViewState, Window, delegate};
+use tv::{
+    Command, Context, DrawCtx, FieldValue, Rect, Role, StateFlag, View, ViewState, Window, delegate,
+};
 
 /// Help context while an Explorer window is focused .
 pub const HELP_CTX: tv::HelpCtx = tv::HelpCtx::custom("tvdocker.explorer");
@@ -640,6 +642,18 @@ impl View for ExplorerWindow {
         self.win.draw(ctx);
     }
 
+    /// Both panels are tables: no Edit action applies on a table, but a
+    /// focused filter bar does own them. Forward first so that field's policy
+    /// wins; only gray the three Edit actions when focus is not in a field.
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.win.set_state(flag, enable, ctx);
+        if flag == StateFlag::Focused && enable && !self.filter_focused() {
+            for cmd in [Command::CUT, Command::COPY, Command::PASTE] {
+                ctx.disable_command(cmd);
+            }
+        }
+    }
+
     /// Re-derive the child rects whenever the window size changes (zoom /
     /// Size-Move drag / terminal resize — every path now goes through this
     /// method). Without it the children keep their BUILD-time rects.
@@ -1186,6 +1200,9 @@ impl ExplorerWindow {
         let mut builder = Menu::builder();
         for (label, command) in self.context_menu_items() {
             builder = builder.command(label, command);
+        }
+        for item in crate::clipboard::context_menu_items(ctx) {
+            builder = builder.item(item);
         }
         popup_menu(
             anchor + self.abs_origin,

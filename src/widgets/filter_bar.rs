@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use tv::event::{Event, Key};
-use tv::{Context, DrawCtx, Options, Rect, Role, View, ViewState};
+use tv::{Command, Context, DrawCtx, Options, Rect, Role, StateFlag, View, ViewState};
 
 /// One-line editable filter that mirrors its text into a shared sink.
 pub struct FilterBar {
@@ -74,6 +74,40 @@ impl FilterBar {
         self.text.pop();
         self.sync();
     }
+
+    /// Append pasted scalars, dropping control characters (newlines, tabs,
+    /// ESC sequences) and respecting the same hard cap as typed input.
+    fn insert_paste(&mut self, text: &str) {
+        let room = Self::MAX_LEN.saturating_sub(self.text.chars().count());
+        let mut added = 0;
+        for c in text.chars() {
+            if c.is_control() {
+                continue;
+            }
+            if added >= room {
+                break;
+            }
+            self.text.push(c);
+            added += 1;
+        }
+        if added > 0 {
+            self.sync();
+        }
+    }
+
+    /// Mirror tvision `InputLine`: CUT/COPY need text to act on, PASTE is
+    /// always available while the field is focused.
+    fn update_commands(&self, ctx: &mut Context) {
+        let has_text = !self.text.is_empty();
+        for cmd in [Command::CUT, Command::COPY] {
+            if has_text {
+                ctx.enable_command(cmd);
+            } else {
+                ctx.disable_command(cmd);
+            }
+        }
+        ctx.enable_command(Command::PASTE);
+    }
 }
 
 impl View for FilterBar {
@@ -100,12 +134,65 @@ impl View for FilterBar {
         }
     }
 
-    fn handle_event(&mut self, ev: &mut Event, _ctx: &mut Context) {
+    fn set_state(&mut self, flag: StateFlag, enable: bool, ctx: &mut Context) {
+        self.st.set_flag(flag, enable);
+        if flag != StateFlag::Focused {
+            return;
+        }
+        if enable {
+            self.update_commands(ctx);
+        } else {
+            ctx.disable_command(Command::CUT);
+            ctx.disable_command(Command::COPY);
+            ctx.disable_command(Command::PASTE);
+        }
+    }
+
+    fn handle_event(&mut self, ev: &mut Event, ctx: &mut Context) {
         match ev {
+            Event::Paste(text) => {
+                self.insert_paste(text);
+                ev.clear();
+            }
+            Event::Command(Command::COPY) => {
+                let text = self.text.clone();
+                if !text.is_empty() {
+                    ctx.set_clipboard(text.clone());
+                    crate::clipboard::put(&text);
+                }
+                ev.clear();
+            }
+            Event::Command(Command::CUT) => {
+                let text = self.text.clone();
+                if !text.is_empty() {
+                    ctx.set_clipboard(text.clone());
+                    crate::clipboard::put(&text);
+                    self.clear();
+                }
+                ev.clear();
+            }
+            Event::Command(Command::PASTE) => {
+                if let Some(text) = crate::clipboard::text() {
+                    self.insert_paste(&text);
+                }
+                ev.clear();
+            }
             Event::KeyDown(ke) => {
                 let (key, ctrl) = (ke.key, ke.modifiers.ctrl);
                 if ctrl {
                     match key {
+                        Key::Char('c') | Key::Char('C') => {
+                            ctx.post(Command::COPY);
+                            ev.clear();
+                        }
+                        Key::Char('x') | Key::Char('X') => {
+                            ctx.post(Command::CUT);
+                            ev.clear();
+                        }
+                        Key::Char('v') | Key::Char('V') => {
+                            ctx.post(Command::PASTE);
+                            ev.clear();
+                        }
                         Key::Char('u') | Key::Char('U') => {
                             self.clear();
                             ev.clear();
@@ -159,8 +246,23 @@ impl View for FilterBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{render_view, send_key, send_key_mods, text};
-    use tv::event::{Key, KeyModifiers};
+    use crate::testutil::{render_view, send_key, send_key_mods, text, with_ctx_d, with_ctx_io};
+    use tv::event::{Key, KeyEvent, KeyModifiers};
+    use tv::{Command, Deferred, StateFlag};
+
+    fn type_text(fb: &mut FilterBar, s: &str) {
+        for c in s.chars() {
+            send_key(fb, Key::Char(c));
+        }
+    }
+
+    fn deliver(fb: &mut FilterBar, ev: Event) -> (Vec<Event>, Vec<Deferred>) {
+        with_ctx_io(|ctx| {
+            let mut ev = ev;
+            fb.handle_event(&mut ev, ctx);
+            assert!(ev.is_nothing(), "the filter consumes this event");
+        })
+    }
 
     fn bar() -> (FilterBar, std::rc::Rc<std::cell::RefCell<String>>) {
         let sink = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
@@ -331,5 +433,143 @@ mod tests {
             fb.handle_event(&mut ev, ctx);
             assert!(ev.is_nothing(), "click on the bar is consumed");
         });
+    }
+
+    #[test]
+    fn paste_event_keeps_only_printable_scalars_and_mirrors_the_sink() {
+        let (mut fb, sink) = bar();
+        type_text(&mut fb, "pre");
+        deliver(&mut fb, Event::Paste("a\nbc".into()));
+        assert_eq!(fb.value(), "preabc", "control characters are dropped");
+        assert_eq!(*sink.borrow(), "preabc");
+        assert_eq!(fb.state().cursor.x, 7, "caret follows the inserted text");
+    }
+
+    #[test]
+    fn paste_stops_at_max_len() {
+        let (mut fb, sink) = bar();
+        type_text(&mut fb, &"a".repeat(FilterBar::MAX_LEN - 2));
+        deliver(&mut fb, Event::Paste("XYZ123".into()));
+        assert_eq!(fb.value().chars().count(), FilterBar::MAX_LEN);
+        assert_eq!(
+            fb.value(),
+            format!("{}XY", "a".repeat(FilterBar::MAX_LEN - 2))
+        );
+        assert_eq!(
+            *sink.borrow(),
+            fb.value(),
+            "the sink mirrors the capped text"
+        );
+    }
+
+    #[test]
+    fn copy_cut_and_paste_commands_round_trip_through_the_port() {
+        let (mut fb, sink) = bar();
+        type_text(&mut fb, "abc");
+
+        let (_, deferred) = deliver(&mut fb, Event::Command(Command::COPY));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::SetClipboard(s) if s == "abc")),
+            "COPY publishes the whole field via OSC 52"
+        );
+        assert_eq!(crate::clipboard::text().as_deref(), Some("abc"));
+
+        crate::clipboard::put("xyz");
+        deliver(&mut fb, Event::Command(Command::PASTE));
+        assert_eq!(fb.value(), "abcxyz", "PASTE reads the port and appends");
+        assert_eq!(*sink.borrow(), "abcxyz");
+
+        let (_, deferred) = deliver(&mut fb, Event::Command(Command::CUT));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::SetClipboard(s) if s == "abcxyz")),
+            "CUT copies before clearing"
+        );
+        assert_eq!(crate::clipboard::text().as_deref(), Some("abcxyz"));
+        assert_eq!(fb.value(), "", "CUT clears the field");
+        assert_eq!(*sink.borrow(), "");
+    }
+
+    #[test]
+    fn ctrl_c_x_v_post_the_edit_commands() {
+        let (mut fb, _sink) = bar();
+        for (ch, command) in [
+            ('c', Command::COPY),
+            ('x', Command::CUT),
+            ('v', Command::PASTE),
+        ] {
+            let (events, _) = with_ctx_io(|ctx| {
+                let mut ev = Event::KeyDown(KeyEvent::new(
+                    Key::Char(ch),
+                    KeyModifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                ));
+                fb.handle_event(&mut ev, ctx);
+                assert!(
+                    ev.is_nothing(),
+                    "Ctrl+{} is consumed",
+                    ch.to_ascii_uppercase()
+                );
+            });
+            assert!(
+                matches!(events.as_slice(), [Event::Command(cmd)] if *cmd == command),
+                "Ctrl+{} posts {command:?}: {events:?}",
+                ch.to_ascii_uppercase()
+            );
+        }
+    }
+
+    #[test]
+    fn focus_gates_the_edit_commands() {
+        let (mut fb, _sink) = bar();
+        let deferred = with_ctx_d(|ctx| fb.set_state(StateFlag::Focused, true, ctx));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::DisableCommand(Command::CUT))),
+            "an empty field cannot cut"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::DisableCommand(Command::COPY))),
+            "an empty field cannot copy"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::EnableCommand(Command::PASTE))),
+            "a writable field can always paste"
+        );
+
+        type_text(&mut fb, "x");
+        let deferred = with_ctx_d(|ctx| fb.set_state(StateFlag::Focused, true, ctx));
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::EnableCommand(Command::CUT))),
+            "a non-empty field can cut"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|d| matches!(d, Deferred::EnableCommand(Command::COPY))),
+            "a non-empty field can copy"
+        );
+
+        let deferred = with_ctx_d(|ctx| fb.set_state(StateFlag::Focused, false, ctx));
+        assert!(
+            [Command::CUT, Command::COPY, Command::PASTE]
+                .iter()
+                .all(|cmd| deferred
+                    .iter()
+                    .any(|d| matches!(d, Deferred::DisableCommand(c) if c == cmd))),
+            "losing focus disables all three commands"
+        );
     }
 }

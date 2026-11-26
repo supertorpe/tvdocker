@@ -732,6 +732,23 @@ fn tab_toggles_between_the_two_tables_and_lets_a_filter_escape() {
     );
 }
 
+#[test]
+fn focused_layers_window_keeps_edit_commands_with_a_focused_filter() {
+    let mut win = window_with(analysis());
+    crate::testutil::with_ctx(|ctx| {
+        win.win.focus_descendant(win.layer_filter, ctx);
+    });
+    let deferred = crate::testutil::with_ctx_d(|ctx| {
+        win.set_state(tv::StateFlag::Focused, true, ctx);
+    });
+    assert!(
+        !deferred
+            .iter()
+            .any(|d| matches!(d, tv::Deferred::DisableCommand(Command::PASTE))),
+        "a focused filter field keeps PASTE enabled"
+    );
+}
+
 /// The layer area and the tree area are separated by a tvision-rs
 /// `Splitter`: a vertical divider runs at x=32 for an 80×24 window — the
 /// old layout's blank gap column — for every row of the middle region
@@ -1088,6 +1105,39 @@ fn command_menus(win: &mut LayersWindow, cmd: tv::Command) -> Vec<tv::Menu> {
         win.handle_event(&mut ev, &mut ctx);
     }
     testutil::menus_opened(&deferred)
+}
+
+#[test]
+fn layers_context_menu_offers_clipboard_actions_by_mouse_and_key() {
+    let mut win = window_with(analysis());
+    let bounds = win
+        .win
+        .child_mut(win.layer_table)
+        .expect("layer table")
+        .state()
+        .get_bounds();
+    let menus = right_click_menus(&mut win, bounds.a.x + 2, bounds.a.y + 2);
+    let labels = menu_labels(menus.first().expect("a context menu opened"));
+    for label in ["Cut", "Copy", "Paste"] {
+        assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+    }
+
+    let mut out = std::collections::VecDeque::new();
+    let mut timers = tv::TimerQueue::new();
+    let mut deferred: Vec<tv::Deferred> = Vec::new();
+    {
+        let mut ctx = tv::Context::new(&mut out, &mut timers, 0, &mut deferred);
+        let mut ev = tv::event::Event::KeyDown(KeyEvent::new(Key::F(10), shift()));
+        win.handle_event(&mut ev, &mut ctx);
+    }
+    let labels = menu_labels(
+        testutil::menus_opened(&deferred)
+            .first()
+            .expect("Shift+F10 opened a context menu"),
+    );
+    for label in ["Cut", "Copy", "Paste"] {
+        assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+    }
 }
 
 /// A right-click on ANY of the three tables' header rows opens that
