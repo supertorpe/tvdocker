@@ -78,13 +78,13 @@ jobs:
             cross: false # Fixed: Native build on ARM runner instead of cross-compiling via Docker
 
           # macOS
-          - os: macos-14
+          - os: macos-15
             build: macos-x64
             target: x86_64-apple-darwin
             ext: ''
             archive: tar.gz
             cross: false
-          - os: macos-14
+          - os: macos-15
             build: macos-aarch64
             target: aarch64-apple-darwin
             ext: ''
@@ -183,7 +183,7 @@ jobs:
 
   package-macos-universal:
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
